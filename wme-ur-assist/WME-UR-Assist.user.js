@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.04.04
+// @version      2026.10.05.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, and Next-UR tracking.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -32,6 +32,16 @@
   const SCRIPT_NAME = 'UR Assist';
   const VERSION = GM_info.script.version;
   const LOG = (...a) => console.log(`[${SCRIPT_NAME}]`, ...a);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Markers other scripts can read on <html>: data-ua-api, data-ua-open-ur, data-ua-next-ur (see OPEN-NEXT API below)
+  const publish = (name, value) => {
+    try {
+      const v = value ? String(value) : '';
+      if (document.documentElement.dataset[name] !== v) document.documentElement.dataset[name] = v;
+    } catch { /* ignore */ }
+  };
+  // Event details must be copied into the page on Firefox so another userscript can read them
+  const toPageObj = o => (typeof cloneInto === 'function' ? cloneInto(o, unsafeWindow) : o);
  
   // ===== SETTINGS (Tampermonkey storage, shared by beta and production) =====
   const DEFAULT_SHEET_ID = '15cyUyhrIuQHYcJ62lpn9MvGLWxPBZBb6dFfYpEmcfRg';
@@ -467,6 +477,8 @@
  
   async function onUrOpened({ updateRequestId: id }) {
     Next.onOpen(id);
+    publish('uaOpenUr', id);
+    OpenNext.noteOpened(id);
     Header.urId = id;
     Header.comments = [];
     Header.loadedId = null;
@@ -1280,9 +1292,40 @@ ${list}`;
     pos: null,       // key (UR-MP row id) of the row you last used
     snapshot: [],    // UR-MP row keys when you last used a row, so the next one is still found after rows disappear
     nextKey: null,   // key of the row "]" would open (null = pass "]" through to WME)
+    recent: [],      // recent UR-MP row orders [{ t, rows: [{ key, urId }] }], so "next after UR x" still works once x has left the list
+    lastSig: '',
+
+    // Remember the row order whenever it changes (an empty list, e.g. mid-redraw, is not remembered)
+    record(rows) {
+      if (!rows.length) return;
+      const sig = rows.map(r => `${r.key}:${r.urId}`).join('|');
+      if (sig === this.lastSig) return;
+      this.lastSig = sig;
+      const now = Date.now();
+      this.recent.push({ t: now, rows: rows.map(r => ({ key: r.key, urId: r.urId })) });
+      this.recent = this.recent.filter(s => now - s.t < 120e3).slice(-12);
+    },
+
+    // The live row that follows UR `id` in the remembered order (newest order first). Never "the next of the current".
+    afterId(id) {
+      const live = new Map(URMP.rows().map(r => [r.key, r]));
+      let known = false;
+      for (let i = this.recent.length - 1; i >= 0; i--) {
+        const snap = this.recent[i].rows;
+        const at = snap.findIndex(x => x.urId === id);
+        if (at < 0) continue;
+        known = true;
+        for (const x of snap.slice(at + 1)) {
+          const r = live.get(x.key);
+          if (r && r.urId === x.urId && r.urId !== id) return { row: r };
+        }
+      }
+      return { row: null, reason: known ? 'no next row in UR-MP list' : 'closed UR not in UR-MP list' };
+    },
  
     onOpen(id) {
       this.openId = id;
+      this.record(URMP.rows());
       if (this.context === 'urmp') {
         const rows = URMP.rows();
         const row = rows.find(r => r.urId === id);
@@ -1317,6 +1360,8 @@ ${list}`;
         }
       }
       this.nextKey = next;
+      this.record(URMP.rows());
+      publish('uaNextUr', this.row()?.urId || '');
       Strip.update();
     },
  
@@ -1359,6 +1404,99 @@ ${list}`;
     URMP.open(row);
   }, true);
  
+  // ===== OPEN-NEXT API (for other scripts, e.g. WME Rapid UR Reply's F9) =====
+  // Detect:  <html data-ua-api="1">  (set once UR Assist is ready)
+  // Markers: <html data-ua-open-ur="id"> = UR whose panel is showing ("" if none), data-ua-next-ur = UR a "]" would open
+  // Ask:     document.dispatchEvent(new CustomEvent('ua:open-next', { detail: { closedUrId } }))
+  // Answer:  exactly one event on document, within about 2 s:
+  //            ua:next-opened  detail { urId, closedUrId }
+  //            ua:next-failed  detail { reason, closedUrId }
+  // UR-MP context: opens the row that followed closedUrId (found by UR id, never "the next of the current"), retries the SAME row.
+  // Tracker context: one plain "]" key for WME's own Next (never a click on its button), no retry.
+  // The same closedUrId within 30 s is ignored silently. There is no auto-jump: only this event starts one.
+  const OPEN_NEXT_TOTAL_MS = 2000, OPEN_NEXT_LOOKUP_MS = 800, OPEN_NEXT_WAIT_MS = 600, OPEN_NEXT_TRIES = 3, OPEN_NEXT_DEDUPE_MS = 30e3;
+  const OpenNext = {
+    seen: new Map(),   // closedUrId -> time handled
+    busy: false,
+    waiting: null,     // { match(id) -> bool, resolve }
+
+    noteOpened(id) {
+      if (this.waiting && this.waiting.match(id)) this.waiting.resolve(id);
+    },
+    // Resolves with the opened id, or null after ms
+    waitOpen(match, ms) {
+      return new Promise(resolve => {
+        const t = setTimeout(() => { this.waiting = null; resolve(null); }, Math.max(0, ms));
+        this.waiting = { match, resolve: id => { clearTimeout(t); this.waiting = null; resolve(id); } };
+      });
+    },
+    answer(name, detail) {
+      try { document.dispatchEvent(new CustomEvent(name, { detail: toPageObj(detail) })); } catch (e) { LOG('Could not answer', name, e.message); }
+    },
+    fail(closedUrId, reason) {
+      LOG(`open-next for UR ${closedUrId}: ${reason}`);
+      this.answer('ua:next-failed', { reason, closedUrId });
+    },
+
+    async handle(e) {
+      let closedUrId = null;
+      try { closedUrId = Number(e.detail && e.detail.closedUrId) || null; } catch { /* detail not readable */ }
+      if (!closedUrId) { this.fail(null, 'no closedUrId in the request'); return; }
+      const now = Date.now();
+      for (const [k, t] of this.seen) if (now - t > OPEN_NEXT_DEDUPE_MS) this.seen.delete(k);
+      if (this.seen.has(closedUrId)) return;   // duplicate: stay silent so the first answer stands
+      if (this.busy) { this.fail(closedUrId, 'busy with another request'); return; }
+      this.seen.set(closedUrId, now);
+      this.busy = true;
+      try {
+        if (Next.context === 'tracker') await this.viaTracker(closedUrId);
+        else await this.viaList(closedUrId, now);
+      } catch (err) {
+        this.fail(closedUrId, `error: ${err.message}`);
+      } finally {
+        this.busy = false;
+      }
+    },
+
+    async viaTracker(closedUrId) {
+      const opened = this.waitOpen(id => id !== closedUrId, OPEN_NEXT_TOTAL_MS);
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ']', code: 'BracketRight', keyCode: 221, which: 221, bubbles: true, cancelable: true }));
+      const id = await opened;
+      if (id) this.answer('ua:next-opened', { urId: id, closedUrId });
+      else this.fail(closedUrId, 'tracker: nothing opened');
+    },
+
+    async viaList(closedUrId, t0) {
+      const deadline = t0 + OPEN_NEXT_TOTAL_MS;
+      // 1. Find the target row. UR-MP may be redrawing, so keep looking for a moment
+      let target = null, reason = '';
+      for (;;) {
+        const found = Next.afterId(closedUrId);
+        if (found.row) { target = found.row.urId; break; }
+        reason = found.reason;
+        if (reason === 'closed UR not in UR-MP list' || Date.now() - t0 >= OPEN_NEXT_LOOKUP_MS) break;
+        await sleep(100);
+      }
+      if (!target) { this.fail(closedUrId, reason); return; }
+      // 2. Click that one row (retrying the same UR id) until WME opens it
+      const before = { pos: Next.pos, snapshot: Next.snapshot };
+      for (let i = 0; i < OPEN_NEXT_TRIES && deadline - Date.now() > 250; i++) {
+        const row = URMP.rows().find(r => r.urId === target);
+        if (row) {
+          const opened = this.waitOpen(id => id === target, Math.min(OPEN_NEXT_WAIT_MS, deadline - Date.now()));
+          URMP.open(row);
+          if (await opened) { this.answer('ua:next-opened', { urId: target, closedUrId }); return; }
+        } else {
+          await sleep(100);
+        }
+      }
+      // Failed: put the position back so a hand-pressed "]" doesn't skip this row
+      if (Next.openId !== target) { Next.pos = before.pos; Next.snapshot = before.snapshot; Next.refresh(); }
+      this.fail(closedUrId, `UR ${target} did not open`);
+    },
+  };
+  document.addEventListener('ua:open-next', e => OpenNext.handle(e));
+
   // ===== DUPLICATES =====
   // Likely duplicates: open URs from the same reporter (same username if both have one; otherwise identical
   // phone, vehicle, language and route settings) that are either
@@ -1555,6 +1693,7 @@ ${list}`;
     ensure() {
       const card = document.querySelector('wz-card.mapUpdateRequest');
       const sub = card?.querySelector('[data-testid="issue-panel-header-subtitle"]');
+      publish('uaOpenUr', sub && Next.openId ? Next.openId : '');
       if (!sub || !Next.openId) { Note.close(); Seen.stop(); return; }
       let bar = card.querySelector('.ua-hdr');
       if (!bar || bar.dataset.ur !== String(Next.openId)) {
@@ -1940,6 +2079,7 @@ ${list}`;
     UrmpBL.start();
  
     sdk.Events.on({ eventName: 'wme-update-request-panel-opened', eventHandler: onUrOpened });
+    publish('uaApi', '1'); // ready: other scripts can now use the open-next API
     setInterval(() => Next.refresh(), 1000);
     setInterval(() => Header.ensure(), 300);
  
