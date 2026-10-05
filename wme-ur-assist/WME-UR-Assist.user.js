@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.05.01
+// @version      2026.10.05.02
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, and Next-UR tracking.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1420,14 +1420,33 @@ ${list}`;
     busy: false,
     waiting: null,     // { match(id) -> bool, resolve }
 
+    // WME may hand the id over as text or as a number, so every comparison here is on numbers
     noteOpened(id) {
-      if (this.waiting && this.waiting.match(id)) this.waiting.resolve(id);
+      const n = Number(id);
+      if (this.waiting && n && this.waiting.match(n)) this.waiting.resolve(n);
     },
-    // Resolves with the opened id, or null after ms
+    // Resolves the moment match(id) is true for an opened UR, or with null after ms.
+    // Besides WME's panel-opened event it also watches the open-UR value itself (what data-ua-open-ur is published from) every 50 ms,
+    // so a missed or differently typed event cannot make a UR that really opened look like a failure.
     waitOpen(match, ms) {
       return new Promise(resolve => {
-        const t = setTimeout(() => { this.waiting = null; resolve(null); }, Math.max(0, ms));
-        this.waiting = { match, resolve: id => { clearTimeout(t); this.waiting = null; resolve(id); } };
+        const start = Number(Next.openId) || 0;
+        let timer = null, poll = null;
+        const w = {
+          match,
+          resolve: id => {
+            clearTimeout(timer);
+            clearInterval(poll);
+            if (this.waiting === w) this.waiting = null;
+            resolve(id);
+          }
+        };
+        this.waiting = w;
+        timer = setTimeout(() => w.resolve(null), Math.max(0, ms));
+        poll = setInterval(() => {
+          const n = Number(Next.openId) || 0;
+          if (n && n !== start && match(n)) w.resolve(n);
+        }, 50);
       });
     },
     answer(name, detail) {
@@ -1459,7 +1478,7 @@ ${list}`;
     },
 
     async viaTracker(closedUrId) {
-      const opened = this.waitOpen(id => id !== closedUrId, OPEN_NEXT_TOTAL_MS);
+      const opened = this.waitOpen(id => id !== closedUrId, OPEN_NEXT_TOTAL_MS);  // ids are numbers (see noteOpened)
       document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ']', code: 'BracketRight', keyCode: 221, which: 221, bubbles: true, cancelable: true }));
       const id = await opened;
       if (id) this.answer('ua:next-opened', { urId: id, closedUrId });
@@ -1485,13 +1504,17 @@ ${list}`;
         if (row) {
           const opened = this.waitOpen(id => id === target, Math.min(OPEN_NEXT_WAIT_MS, deadline - Date.now()));
           URMP.open(row);
-          if (await opened) { this.answer('ua:next-opened', { urId: target, closedUrId }); return; }
+          if (await opened) {
+            LOG(`open-next for UR ${closedUrId}: opened UR ${target} in ${Date.now() - t0} ms`);
+            this.answer('ua:next-opened', { urId: target, closedUrId });
+            return;
+          }
         } else {
           await sleep(100);
         }
       }
       // Failed: put the position back so a hand-pressed "]" doesn't skip this row
-      if (Next.openId !== target) { Next.pos = before.pos; Next.snapshot = before.snapshot; Next.refresh(); }
+      if (Number(Next.openId) !== target) { Next.pos = before.pos; Next.snapshot = before.snapshot; Next.refresh(); }
       this.fail(closedUrId, `UR ${target} did not open`);
     },
   };
