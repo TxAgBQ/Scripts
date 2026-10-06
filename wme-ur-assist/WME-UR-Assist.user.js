@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.05.02
+// @version      2026.10.06.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, and Next-UR tracking.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1672,18 +1672,74 @@ ${list}`;
     return card.querySelector('.new-comment-text')?.shadowRoot?.querySelector('textarea') || null;
   }
  
-  function fillCommentBox(card, text, state) {
-    const host = card.querySelector('.new-comment-text');
-    const ta = commentBox(card);
-    if (!ta) return false;
-    ta.value = text;
-    if (host && 'value' in host) host.value = text;
-    ta.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    ta.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    if (state === 'not-identified' || state === 'solved') card.querySelector(`input[value="${state}"]`)?.click();
-    return true;
+  // WME's Send button, found by its label. Not found (WME changed, other language) = we can't tell, so we assume it's fine.
+  function sendReady(card) {
+    const b = [...card.querySelectorAll('wz-button, button')].find(x => /^\s*send\s*$/i.test(x.textContent));
+    return !b || !(b.disabled || b.hasAttribute('disabled') || b.getAttribute('aria-disabled') === 'true');
   }
- 
+  async function waitSendReady(card, ms) {
+    const end = Date.now() + ms;
+    for (;;) {
+      if (sendReady(card)) return true;
+      if (Date.now() >= end) return false;
+      await sleep(50);
+    }
+  }
+
+  // Put text in WME's comment box and make sure WME really took it (Send enabled). WME only notices some kinds of input,
+  // so try the plain way first, then a paste-like event, then the browser's own typing, stopping at the first that works.
+  async function fillCommentBox(card, text, state) {
+    const prevFocus = document.activeElement;
+    const methods = [
+      (host, ta) => {   // 1. set the value and fire input + change
+        ta.value = text;
+        if (host && 'value' in host) host.value = text;
+        ta.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      },
+      (host, ta) => {   // 2. like a paste
+        ta.focus();
+        ta.value = text;
+        ta.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertFromPaste', data: text }));
+      },
+      (host, ta) => {   // 3. like typing: the browser's own insert
+        ta.focus();
+        ta.select();
+        document.execCommand('insertText', false, text);
+      },
+    ];
+    const apply = i => {
+      const ta = commentBox(card);
+      if (!ta) return false;
+      methods[i](card.querySelector('.new-comment-text'), ta);
+      return true;
+    };
+    let used = -1;
+    for (let i = 0; i < methods.length && used < 0; i++) {
+      if (!apply(i)) return false;
+      if (await waitSendReady(card, 400)) used = i;
+    }
+    if (used < 0) {
+      LOG('The reply is in the comment box but WME kept Send disabled — re-paste it or press Space then Backspace in the box');
+    } else if (used > 0) {
+      LOG(`WME only enabled Send with fill method ${used + 1}`);
+    }
+    if (state === 'not-identified' || state === 'solved') {
+      card.querySelector(`input[value="${state}"]`)?.click();
+      // Picking a status can redraw the box; if Send went grey again, put the text back the same way
+      if (used >= 0 && !(await waitSendReady(card, 400))) {
+        apply(used);
+        if (!(await waitSendReady(card, 400))) LOG('Send went disabled after selecting the status');
+      }
+    }
+    try {   // leave the cursor where it was, so keys like "]" still work right after
+      const ta = commentBox(card);
+      if (prevFocus && prevFocus !== document.body && prevFocus.focus) prevFocus.focus();
+      else { ta?.blur(); card.querySelector('.new-comment-text')?.blur?.(); }
+    } catch { /* ignore */ }
+    return used >= 0;
+  }
+
   // ===== WME INTERNAL HOOK (not SDK — the reporter's user number isn't in the SDK) =====
   // Extra UR fields WME keeps (phone, vehicle, language, user number). Used for duplicates and the user number.
   function wmeExtra(id) {
