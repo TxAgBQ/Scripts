@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.06.01
+// @version      2026.10.08.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, and Next-UR tracking.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1677,30 +1677,41 @@ ${list}`;
     const b = [...card.querySelectorAll('wz-button, button')].find(x => /^\s*send\s*$/i.test(x.textContent));
     return !b || !(b.disabled || b.hasAttribute('disabled') || b.getAttribute('aria-disabled') === 'true');
   }
-  async function waitSendReady(card, ms) {
+  // WME sends what its own comment field (the host element) holds, which can be empty while the box on screen shows text
+  function boxTaken(card, text) {
+    const h = card.querySelector('.new-comment-text');
+    return !!h && String(h.value || '').trim() === text.trim();
+  }
+  async function waitFilled(card, text, ms) {
     const end = Date.now() + ms;
     for (;;) {
-      if (sendReady(card)) return true;
+      if (boxTaken(card, text) && sendReady(card)) return true;
       if (Date.now() >= end) return false;
       await sleep(50);
     }
   }
 
-  // Put text in WME's comment box and make sure WME really took it (Send enabled). WME only notices some kinds of input,
-  // so try the plain way first, then a paste-like event, then the browser's own typing, stopping at the first that works.
+  // Put text in WME's comment box and make sure WME really took it. Picking a status makes WME redraw the comment field and
+  // forget earlier text, so the status goes first. WME only notices some kinds of input, so try a paste-like event first,
+  // then the plain way, then the browser's own typing, stopping at the first that works.
   async function fillCommentBox(card, text, state) {
     const prevFocus = document.activeElement;
+    if (state === 'not-identified' || state === 'solved') {
+      card.querySelector(`input[value="${state}"]`)?.click();
+      await sleep(150);
+    }
+    for (let n = 0; n < 10 && !commentBox(card); n++) await sleep(50);
     const methods = [
-      (host, ta) => {   // 1. set the value and fire input + change
+      (host, ta) => {   // 1. like a paste
+        ta.focus();
+        ta.value = text;
+        ta.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertFromPaste', data: text }));
+      },
+      (host, ta) => {   // 2. set the value and fire input + change
         ta.value = text;
         if (host && 'value' in host) host.value = text;
         ta.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
         ta.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-      },
-      (host, ta) => {   // 2. like a paste
-        ta.focus();
-        ta.value = text;
-        ta.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertFromPaste', data: text }));
       },
       (host, ta) => {   // 3. like typing: the browser's own insert
         ta.focus();
@@ -1717,25 +1728,22 @@ ${list}`;
     let used = -1;
     for (let i = 0; i < methods.length && used < 0; i++) {
       if (!apply(i)) return false;
-      if (await waitSendReady(card, 400)) used = i;
+      if (await waitFilled(card, text, 400)) used = i;
     }
     if (used < 0) {
-      LOG('The reply is in the comment box but WME kept Send disabled — re-paste it or press Space then Backspace in the box');
-    } else if (used > 0) {
-      LOG(`WME only enabled Send with fill method ${used + 1}`);
-    }
-    if (state === 'not-identified' || state === 'solved') {
-      card.querySelector(`input[value="${state}"]`)?.click();
-      // Picking a status can redraw the box; if Send went grey again, put the text back the same way
-      if (used >= 0 && !(await waitSendReady(card, 400))) {
+      LOG('The reply is in the comment box but WME did not take it — re-paste it or press Space then Backspace in the box');
+    } else {
+      if (used > 0) LOG(`WME only took the reply with fill method ${used + 1}`);
+      // A late redraw can still wipe it: check once more and put it back the same way
+      await sleep(300);
+      if (!boxTaken(card, text)) {
         apply(used);
-        if (!(await waitSendReady(card, 400))) LOG('Send went disabled after selecting the status');
+        LOG((await waitFilled(card, text, 400)) ? 'WME forgot the reply after it was filled; put it back' : 'WME forgot the reply after it was filled and would not take it again');
       }
     }
     try {   // leave the cursor where it was, so keys like "]" still work right after
-      const ta = commentBox(card);
       if (prevFocus && prevFocus !== document.body && prevFocus.focus) prevFocus.focus();
-      else { ta?.blur(); card.querySelector('.new-comment-text')?.blur?.(); }
+      else { commentBox(card)?.blur(); card.querySelector('.new-comment-text')?.blur?.(); }
     } catch { /* ignore */ }
     return used >= 0;
   }
