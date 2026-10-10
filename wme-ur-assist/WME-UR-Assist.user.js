@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.10.01
+// @version      2026.10.10.02
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1984,7 +1984,6 @@ ${list}`;
   function syncSection() {
     ui.syncLine = el('div', { class: 'ua-muted' }, Sync.enabled() ? 'Waiting for first sync…' : 'Not set up yet.');
     ui.blLine = el('div', { class: 'ua-muted' }, 'UR-MP blacklist: waiting for UR-MP to load…');
-    ui.autoLine = el('div', { class: 'ua-muted' }, 'Auto-send camera reports: starting…');
     const urlInput = el('input', { value: settings.syncUrl, placeholder: 'https://script.google.com/macros/s/…/exec', style: 'width:100%' });
     const secretInput = el('input', { type: 'password', value: settings.syncSecret, placeholder: 'Same secret word as in the Apps Script', style: 'width:100%' });
     return el('details', { class: 'ua-settings' },
@@ -2004,8 +2003,7 @@ ${list}`;
         }),
         el('button', { textContent: 'Sync now', onclick: () => Sync.run() })),
       ui.syncLine,
-      ui.blLine,
-      ui.autoLine);
+      ui.blLine);
   }
  
   function backupSection() {
@@ -2035,6 +2033,7 @@ ${list}`;
   function buildUi(pane) {
     pane.classList.add('urassist');
     ui.statusLine = el('div', { class: 'ua-status' });
+    ui.autoLine = el('div', { class: 'ua-muted' }, 'Auto-send camera reports: starting…');
     ui.sheetLine = el('div', { class: 'ua-muted' }, 'Loading replies…');
     const sheetInput = el('input', { value: settings.sheetId, style: 'width:100%' });
     const keyInput = el('input', { type: 'password', value: settings.aiKey, placeholder: 'sk-…', style: 'width:100%' });
@@ -2045,7 +2044,7 @@ ${list}`;
       el('div', {}, icon('watching', POPCORN_AUTO_TITLE), ' Popcorn also turns on by itself when another editor replied and you never have'),
       el('div', {}, icon('blacklist', BL_TITLE), ' Blacklisted in UR-MP – shown automatically, hides the red X. Blacklisting in UR-MP also syncs to your other laptop.'),
       el('div', {}, icon('xRed', X_TITLE), ` Automatic: no Wazer reply in ${NO_REPLY_HOURS} h (Map Team counts). Hidden by map work, popcorn and UR-MP blacklist.`),
-      el('div', {}, icon('camera', ''), ' ', icon('train', ''), ' ', icon('stopsign', ''), ' Camera / train / stop sign report: standard reply goes in with Not identified (you review and Send)'),
+      el('div', {}, icon('camera', ''), ' ', icon('train', ''), ' ', icon('stopsign', ''), ' Camera report: answered and closed as Not identified automatically (setting below). Train / stop sign report: standard reply goes in with Not identified (you review and Send)'),
       el('div', {}, icon('dupe', ''), ` Duplicates are also found automatically: same reporter, and within ${DUPE_METERS} m / ${DUPE_HOURS} h, or back-to-back reports (numbers ${SEQ_ID_GAP} or fewer apart, within ${SEQ_MINUTES} min and ${SEQ_MIN_METERS} m or more, growing with the time between them)`),
       el('div', {}, icon('closure', ''), ' + ', icon('xRed', ''), ' Red closure sign, the report says it was a closure, only Map Team has commented, and the red X is showing: your Event closure reply goes in with Not identified when you open it (never for the amber sign)'),
       el('div', {}, icon('noteOn', 'Note'), ' Has a note'));
@@ -2055,6 +2054,7 @@ ${list}`;
       el('div', { class: 'ua-muted' }, 'Set statuses and notes from the icons in the UR panel header. They show in a column at the right of the UR-MP list.'),
       legend,
       ui.statusLine,
+      ui.autoLine,
       syncSection(),
       backupSection(),
       el('div', { class: 'ua-settings' },
@@ -2187,12 +2187,25 @@ ${list}`;
       const rule = AUTO_RULES.find(r => r.test(reportCode(desc), String(desc)));
       return !!rule && rule.id === 'camera';
     },
-    skipFor(id, ms) { this.later.set(id, Date.now() + ms); },
+    why: new Map(),     // urId -> short reason it is being left alone (shown in the status line)
+    known: new Set(),   // camera reports seen on the last look
+    skipFor(id, ms, why) { this.later.set(id, Date.now() + ms); if (why) this.why.set(id, why); },
     skipped(id) { return (this.later.get(id) || 0) > Date.now() || this.done[id]?.stage === 'done'; },
     warnOnce(key, msg) { if (!this.warned.has(key)) { this.warned.add(key); LOG(`Auto-send: ${msg}`); } },
+    // One line for the sidebar: what was found, and why anything is being left alone
+    summary() {
+      const now = Date.now(), why = {};
+      for (const id of this.known) {
+        if (this.done[id]?.stage === 'done') continue;
+        if ((this.later.get(id) || 0) > now) { const w = this.why.get(id) || 'waiting'; why[w] = (why[w] || 0) + 1; }
+      }
+      const parts = Object.entries(why).map(([w, n]) => `${n} ${w}`);
+      return `${this.known.size} camera report(s) open${parts.length ? ` · ${parts.join(' · ')}` : ''}`;
+    },
     status(msg) {
       this.lastText = msg;
-      if (ui.autoLine) ui.autoLine.textContent = `Auto-send camera reports: ${this.enabled() ? 'on' : 'off'}${this.count ? ` · ${this.count} sent this session` : ''}${msg ? ` · ${msg}` : ''}`;
+      const state = !this.enabled() ? 'off' : !myName ? 'waiting for your user name' : !replies.list.length ? 'waiting for your URC-E sheet replies' : 'on';
+      if (ui.autoLine) ui.autoLine.textContent = `Auto-send camera reports: ${state}${this.count ? ` · ${this.count} sent this session` : ''}${this.enabled() ? ` · ${this.summary()}` : ''}${msg ? ` · ${msg}` : ''}`;
     },
     save() {
       const cutoff = Date.now() - 60 * 864e5;
@@ -2218,12 +2231,16 @@ ${list}`;
           for (const u of await sdk.DataModel.MapUpdateRequests.getAll()) if (u.isOpen && this.isCamera(u.description)) ids.add(u.id);
         } catch (e) { LOG('Auto-send: could not list URs:', e.message); }
         for (const r of URMP.rows()) if (this.isCamera(URMP.description(r.urId))) ids.add(r.urId);
+        this.known = ids;
         const list = [...ids].filter(id => !this.skipped(id));
         for (let i = list.length - 1; i > 0; i--) {   // shuffled, so two laptops don't walk the list in step
           const j = Math.floor(Math.random() * (i + 1));
           [list[i], list[j]] = [list[j], list[i]];
         }
         this.queue = list;
+        const line = this.summary() + ` · ${list.length} to look at`;
+        if (line !== this.lastLog) { this.lastLog = line; LOG(`Auto-send: ${line}`); }
+        this.status(this.lastText);
       } finally {
         this.refreshing = false;
       }
@@ -2241,11 +2258,12 @@ ${list}`;
       try {
         await this.handle(id);
       } catch (e) {
-        this.skipFor(id, 60 * 60e3);
+        this.skipFor(id, 60 * 60e3, 'send failed (see console)');
         LOG(`Auto-send: UR ${id} failed – ${e.message}`);
         this.status(`UR ${id} failed: ${e.message}`);
       } finally {
         this.busy = false;
+        this.status(this.lastText);
       }
     },
 
@@ -2261,11 +2279,11 @@ ${list}`;
     },
 
     async handle(id) {
-      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3); return; }   // you're looking at it
+      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return; }   // you're looking at it
       const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
-      if (!ur) { this.skipFor(id, 10 * 60e3); return; }
-      if (!ur.isOpen) { this.skipFor(id, 24 * 3600e3); return; }
-      if (!this.isCamera(ur.description)) { this.skipFor(id, 24 * 3600e3); return; }
+      if (!ur) { this.skipFor(id, 10 * 60e3, 'not loaded in WME'); return; }
+      if (!ur.isOpen) { this.skipFor(id, 24 * 3600e3, 'already closed'); return; }
+      if (!this.isCamera(ur.description)) { this.skipFor(id, 24 * 3600e3, 'not a camera type'); return; }
 
       // Commented but not yet closed (e.g. the close failed last time): just finish the close
       if (this.done[id]?.stage === 'commented') {
@@ -2275,34 +2293,34 @@ ${list}`;
       }
 
       const wait = AUTO_SEND_MIN_AGE_MIN * 60e3 - (Date.now() - ur.reportedOn);
-      if (wait > 0) { this.skipFor(id, wait + 1000); return; }
+      if (wait > 0) { this.skipFor(id, wait + 1000, `too new (under ${AUTO_SEND_MIN_AGE_MIN} min)`); return; }
       if (UrmpBL.has(id) || Dupes.closeOf.has(id) || ['mapwork', 'watching', 'dupe'].some(f => urInfo(id).flags.includes(f))) {
-        this.skipFor(id, 30 * 60e3);
+        this.skipFor(id, 30 * 60e3, 'blacklisted/duplicate/flagged');
         return;
       }
 
       const rule = AUTO_RULES.find(r => r.id === 'camera');
       const reply = findReply(...rule.sheetKeys);
-      if (!reply) { this.warnOnce('noreply', 'no reply with "camera" or "flock" in its title in your URC-E sheet, so nothing is sent'); this.skipFor(id, 30 * 60e3); return; }
-      if (this.usesSelection(reply.text)) { this.warnOnce('selvars', 'the camera reply uses a selected-road or place variable, so it can\'t be sent automatically'); this.skipFor(id, 30 * 60e3); return; }
+      if (!reply) { this.warnOnce('noreply', 'no reply with "camera" or "flock" in its title in your URC-E sheet, so nothing is sent'); this.skipFor(id, 30 * 60e3, 'no camera reply in your sheet'); return; }
+      if (this.usesSelection(reply.text)) { this.warnOnce('selvars', 'the camera reply uses a selected-road or place variable, so it can\'t be sent automatically'); this.skipFor(id, 30 * 60e3, 'camera reply needs a map selection'); return; }
 
       let { comments } = await this.details(id);
       let st = autoState(ur.description, comments);
-      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3); return; }   // the reporter added something, or an editor already replied: yours
+      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3, st ? 'reporter commented (yours)' : 'someone already replied (yours)'); return; }   // the reporter added something, or an editor already replied: yours
 
       const filled = await fillVars(reply.text, buildContext(ur, { comments }));
       if (!filled.text || filled.unresolved.length) {
         this.warnOnce('unresolved', `the camera reply still has ${filled.unresolved.join(' ')} after filling in, so nothing is sent`);
-        this.skipFor(id, 30 * 60e3);
+        this.skipFor(id, 30 * 60e3, 'reply has unfilled variables');
         return;
       }
 
       // Last look right before posting (a short random wait helps two laptops not both post it)
       await sleep(Math.random() * 1500);
-      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3); return; }
+      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return; }
       ({ comments } = await this.details(id));
       st = autoState(ur.description, comments);
-      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3); return; }
+      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3, 'someone replied first (yours)'); return; }
 
       await sdk.DataModel.MapUpdateRequests.addComment({ mapUpdateRequestId: id, text: filled.text });
       this.done[id] = { t: Date.now(), stage: 'commented' };
@@ -2314,7 +2332,7 @@ ${list}`;
       } catch (e) {
         LOG(`Auto-send: UR ${id} was replied to but marking it Not identified failed – ${e.message}. Will try again.`);
         this.status(`UR ${id}: replied, but Not identified failed`);
-        this.skipFor(id, 2 * 60e3);
+        this.skipFor(id, 2 * 60e3, 'close failed, retrying');
       }
     },
 
