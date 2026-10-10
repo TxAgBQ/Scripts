@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.10.02
+// @version      2026.10.10.03
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -495,6 +495,7 @@
       Header.comments = (details?.comments || []).map(c => ({ role: commentRole(c.userName, c.text), time: c.createdOn }));
       Header.loadedId = id;
       Dupes.scan();
+      AutoSend.onOpened(id);
     } catch (e) {
       LOG(`Could not read conversation for UR ${id}: ${e.message}`);
     }
@@ -1915,7 +1916,10 @@ ${list}`;
       let rule = null;
       if (!kind && this.loadedId === id) {
         const a = autoState(this.desc, this.comments);
-        if (a && (a.state === 'auto' || force)) { kind = 'auto'; rule = a.rule; }
+        if (a && (a.state === 'auto' || force)) {
+          if (!force && a.rule.id === 'camera' && AutoSend.covers(id, this.desc, this.reportedOn, this.comments)) return;   // auto-send answers these itself
+          kind = 'auto'; rule = a.rule;
+        }
         else if (closureReplyDue(id, this.desc, this.type, this.comments, this.reportedOn)) kind = 'closure';
       }
       if (!kind) return;
@@ -2044,7 +2048,7 @@ ${list}`;
       el('div', {}, icon('watching', POPCORN_AUTO_TITLE), ' Popcorn also turns on by itself when another editor replied and you never have'),
       el('div', {}, icon('blacklist', BL_TITLE), ' Blacklisted in UR-MP – shown automatically, hides the red X. Blacklisting in UR-MP also syncs to your other laptop.'),
       el('div', {}, icon('xRed', X_TITLE), ` Automatic: no Wazer reply in ${NO_REPLY_HOURS} h (Map Team counts). Hidden by map work, popcorn and UR-MP blacklist.`),
-      el('div', {}, icon('camera', ''), ' ', icon('train', ''), ' ', icon('stopsign', ''), ' Camera report: answered and closed as Not identified automatically (setting below). Train / stop sign report: standard reply goes in with Not identified (you review and Send)'),
+      el('div', {}, icon('camera', ''), ' ', icon('train', ''), ' ', icon('stopsign', ''), ' Camera report: open it and it is answered, closed as Not identified, and the next row opens (setting below). Train / stop sign report: standard reply goes in with Not identified (you review and Send)'),
       el('div', {}, icon('dupe', ''), ` Duplicates are also found automatically: same reporter, and within ${DUPE_METERS} m / ${DUPE_HOURS} h, or back-to-back reports (numbers ${SEQ_ID_GAP} or fewer apart, within ${SEQ_MINUTES} min and ${SEQ_MIN_METERS} m or more, growing with the time between them)`),
       el('div', {}, icon('closure', ''), ' + ', icon('xRed', ''), ' Red closure sign, the report says it was a closure, only Map Team has commented, and the red X is showing: your Event closure reply goes in with Not identified when you open it (never for the amber sign)'),
       el('div', {}, icon('noteOn', 'Note'), ' Has a note'));
@@ -2064,7 +2068,7 @@ ${list}`;
           'Use ] for the next row in UR-MP (after you click in UR-MP). After you click in the Issue Tracker, WME’s own ] is used.'),
         el('label', { class: 'ua-row' },
           el('input', { type: 'checkbox', checked: settings.autoSendCameras, onchange: e => { settings.autoSendCameras = e.target.checked; AutoSend.status(''); Strip.update(); if (e.target.checked) AutoSend.refresh(); } }),
-          `Answer camera reports automatically: post your sheet's camera reply and mark them Not identified (${AUTO_SEND_MIN_AGE_MIN}+ minutes old, only when nobody but Map Team has commented). Uncheck to stop.`),
+          `Answer camera reports automatically: when you open one, post your sheet's camera reply, mark it Not identified and open the next row (${AUTO_SEND_MIN_AGE_MIN}+ minutes old, only when nobody but Map Team has commented). Uncheck to stop.`),
         el('label', { class: 'ua-row' },
           el('input', { type: 'checkbox', checked: settings.ageHours, onchange: e => { settings.ageHours = e.target.checked; Strip.update(); } }),
           `Show hours (up to ${AGE_HOURS_UP_TO} h) instead of days in UR-MP's age column`),
@@ -2158,27 +2162,36 @@ ${list}`;
   `);
  
   // ===== AUTO-SEND CAMERA REPORTS (SDK) =====
-  // Camera reports (the same ones that get the camera/Flock icon) are answered and closed for you:
-  // your URC-E sheet's camera reply is posted and the report is marked Not identified. Only when ALL of these are true:
-  //   the setting is on · the report is a camera report · only Map Team has commented (the reporter said nothing, no editor replied) ·
-  //   it was reported at least AUTO_SEND_MIN_AGE_MIN minutes ago (gives the reporter time to answer Map Team) ·
-  //   it is not the UR you have open · it isn't blacklisted in UR-MP, a duplicate, or flagged map work / popcorn ·
+  // Camera reports (the ones that get the camera icon) are answered and closed for you: your URC-E sheet's camera reply is
+  // posted and the report is marked Not identified. Two ways it starts:
+  //   1. YOU OPEN ONE (the main way): it replies, closes it, then opens the next row in the list; if that one is a camera
+  //      report too it does the same, and so on until it reaches one that isn't. (Closing needs the report loaded in WME,
+  //      which opening it does.)
+  //   2. In the background, for camera reports WME already has loaded, a few seconds apart.
+  // Only when ALL of these are true:
+  //   the setting is on · only Map Team has commented (the reporter said nothing, no editor replied) · it was reported at least
+  //   AUTO_SEND_MIN_AGE_MIN minutes ago · it isn't blacklisted in UR-MP, a duplicate, or flagged map work / popcorn ·
   //   your sheet has a camera reply and it needs nothing from the map (no selected-road or place variables).
-  // One reply every few seconds, at most AUTO_SEND_MAX_PER_HOUR an hour. Anything else is left for you.
+  // At most AUTO_SEND_MAX_PER_HOUR an hour. Anything else is left for you (and the reply goes in the box for review as before).
   const AUTO_SEND_MIN_AGE_MIN = 10;
   const AUTO_SEND_EVERY_MS = 6000;
   const AUTO_SEND_REFRESH_MS = 30000;
   const AUTO_SEND_MAX_PER_HOUR = 60;
+  const AUTO_SEND_NEXT_DELAY_MS = 700;
   const SELECTION_VARS = /\$(SELSEGS|SELSEGS_WITH_CITY|PLACE_NAME|PLACE_ADDRESS)\$/;
 
   const AutoSend = {
     queue: [],
-    later: new Map(),   // urId -> time before which it isn't looked at again
+    later: new Map(),   // urId -> time before which the background pass doesn't look at it again
+    why: new Map(),     // urId -> short reason it is being left alone (shown in the status line)
+    known: new Set(),   // camera reports seen on the last look
+    working: new Set(), // URs being answered right now
     busy: false,
     refreshing: false,
     sentTimes: [],
     count: 0,
     lastText: '',
+    lastLog: '',
     warned: new Set(),
     done: GM_getValue('autoSent', {}),   // urId -> { t, stage: 'commented' | 'done' } so nothing is ever answered twice
 
@@ -2187,11 +2200,10 @@ ${list}`;
       const rule = AUTO_RULES.find(r => r.test(reportCode(desc), String(desc)));
       return !!rule && rule.id === 'camera';
     },
-    why: new Map(),     // urId -> short reason it is being left alone (shown in the status line)
-    known: new Set(),   // camera reports seen on the last look
     skipFor(id, ms, why) { this.later.set(id, Date.now() + ms); if (why) this.why.set(id, why); },
     skipped(id) { return (this.later.get(id) || 0) > Date.now() || this.done[id]?.stage === 'done'; },
     warnOnce(key, msg) { if (!this.warned.has(key)) { this.warned.add(key); LOG(`Auto-send: ${msg}`); } },
+
     // One line for the sidebar: what was found, and why anything is being left alone
     summary() {
       const now = Date.now(), why = {};
@@ -2221,7 +2233,33 @@ ${list}`;
       return false;
     },
 
-    // Every open camera report we can see: the loaded map data, plus whatever UR-MP is listing
+    // null = go ahead. Otherwise { why, ms }: the reason to leave it alone, and how long before looking again.
+    check(id, desc, reportedOn, comments) {
+      if (!this.isCamera(desc)) return { why: 'not a camera type', ms: 24 * 3600e3 };
+      if (this.done[id]?.stage === 'done') return { why: 'already answered', ms: 24 * 3600e3 };
+      const wait = AUTO_SEND_MIN_AGE_MIN * 60e3 - (Date.now() - reportedOn);
+      if (wait > 0) return { why: `too new (under ${AUTO_SEND_MIN_AGE_MIN} min)`, ms: wait + 1000 };
+      if (UrmpBL.has(id) || Dupes.closeOf.has(id) || ['mapwork', 'watching', 'dupe'].some(f => urInfo(id).flags.includes(f))) {
+        return { why: 'blacklisted/duplicate/flagged', ms: 30 * 60e3 };
+      }
+      const reply = findReply(...AUTO_RULES.find(r => r.id === 'camera').sheetKeys);
+      if (!reply) { this.warnOnce('noreply', 'no reply with "camera" or "flock" in its title in your URC-E sheet, so nothing is sent'); return { why: 'no camera reply in your sheet', ms: 30 * 60e3 }; }
+      if (this.usesSelection(reply.text)) { this.warnOnce('selvars', 'the camera reply uses a selected-road or place variable, so it can\'t be sent automatically'); return { why: 'camera reply needs a map selection', ms: 30 * 60e3 }; }
+      const st = autoState(desc, comments);
+      if (!st || st.state !== 'auto') return { why: st ? 'reporter commented (yours)' : 'someone already replied (yours)', ms: 6 * 3600e3 };
+      if (this.sentTimes.filter(t => Date.now() - t < 3600e3).length >= AUTO_SEND_MAX_PER_HOUR) return { why: `hourly limit (${AUTO_SEND_MAX_PER_HOUR})`, ms: 5 * 60e3 };
+      return null;
+    },
+
+    // For the comment box: true = auto-send has this one (or already did), so don't also fill the box for review
+    covers(id, desc, reportedOn, comments) {
+      if (!this.enabled() || !this.isCamera(desc)) return false;
+      if (this.working.has(id) || this.done[id]) return true;
+      if ((this.later.get(id) || 0) > Date.now()) return false;
+      return this.check(id, desc, reportedOn, comments) === null;
+    },
+
+    // Every open camera report WME has loaded, plus whatever UR-MP is listing (the unloaded ones wait until you open them)
     async refresh() {
       if (!this.enabled() || this.refreshing || !sdk) return;
       this.refreshing = true;
@@ -2249,22 +2287,45 @@ ${list}`;
     async tick() {
       if (!this.enabled()) { this.queue = []; return; }
       if (this.busy || !sdk || !myName || !replies.list.length) return;
-      const now = Date.now();
-      this.sentTimes = this.sentTimes.filter(t => now - t < 3600e3);
-      if (this.sentTimes.length >= AUTO_SEND_MAX_PER_HOUR) { this.status(`paused – ${AUTO_SEND_MAX_PER_HOUR} an hour is the limit`); return; }
       const id = this.queue.shift();
-      if (!id || this.skipped(id)) return;
+      if (!id || this.skipped(id) || this.working.has(id)) return;
       this.busy = true;
+      this.working.add(id);
       try {
-        await this.handle(id);
+        await this.handle(id, false);
       } catch (e) {
         this.skipFor(id, 60 * 60e3, 'send failed (see console)');
         LOG(`Auto-send: UR ${id} failed – ${e.message}`);
         this.status(`UR ${id} failed: ${e.message}`);
       } finally {
+        this.working.delete(id);
         this.busy = false;
         this.status(this.lastText);
       }
+    },
+
+    // You opened UR `id`: if it's an eligible camera report, answer and close it, then move on to the next row
+    async onOpened(id) {
+      if (!this.enabled() || !sdk || !myName || !replies.list.length) return;
+      if (this.working.has(id)) return;
+      this.later.delete(id);   // you opened it: the background pass's "open on screen" wait no longer applies
+      this.working.add(id);
+      let sent = false;
+      try {
+        for (let i = 0; i < 50 && this.busy; i++) await sleep(100);   // let a background reply finish first
+        sent = await this.handle(id, true);
+      } catch (e) {
+        this.skipFor(id, 60 * 60e3, 'send failed (see console)');
+        LOG(`Auto-send: UR ${id} failed – ${e.message}`);
+        this.status(`UR ${id} failed: ${e.message}`);
+      } finally {
+        this.working.delete(id);
+        this.status(this.lastText);
+      }
+      if (!sent) return;
+      await sleep(AUTO_SEND_NEXT_DELAY_MS);   // give UR-MP a moment to drop the closed row
+      if (Number(Next.openId) !== id) return;   // you moved on yourself
+      OpenNext.handle({ detail: { closedUrId: id } });
     },
 
     async details(id) {
@@ -2278,61 +2339,53 @@ ${list}`;
       this.save();
     },
 
-    async handle(id) {
-      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return; }   // you're looking at it
+    // Returns true when the report was answered and closed
+    async handle(id, opened) {
+      if (!opened && Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return false; }   // you're looking at it: open it again to answer it
       const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
-      if (!ur) { this.skipFor(id, 10 * 60e3, 'not loaded in WME'); return; }
-      if (!ur.isOpen) { this.skipFor(id, 24 * 3600e3, 'already closed'); return; }
-      if (!this.isCamera(ur.description)) { this.skipFor(id, 24 * 3600e3, 'not a camera type'); return; }
+      if (!ur) { this.skipFor(id, 10 * 60e3, 'not loaded in WME (answered when you open it)'); return false; }
+      if (!ur.isOpen) { this.skipFor(id, 24 * 3600e3, 'already closed'); return false; }
 
       // Commented but not yet closed (e.g. the close failed last time): just finish the close
       if (this.done[id]?.stage === 'commented') {
         await this.close(id);
         this.finished(id, 'closed (finishing an earlier reply)');
-        return;
+        return true;
       }
-
-      const wait = AUTO_SEND_MIN_AGE_MIN * 60e3 - (Date.now() - ur.reportedOn);
-      if (wait > 0) { this.skipFor(id, wait + 1000, `too new (under ${AUTO_SEND_MIN_AGE_MIN} min)`); return; }
-      if (UrmpBL.has(id) || Dupes.closeOf.has(id) || ['mapwork', 'watching', 'dupe'].some(f => urInfo(id).flags.includes(f))) {
-        this.skipFor(id, 30 * 60e3, 'blacklisted/duplicate/flagged');
-        return;
-      }
-
-      const rule = AUTO_RULES.find(r => r.id === 'camera');
-      const reply = findReply(...rule.sheetKeys);
-      if (!reply) { this.warnOnce('noreply', 'no reply with "camera" or "flock" in its title in your URC-E sheet, so nothing is sent'); this.skipFor(id, 30 * 60e3, 'no camera reply in your sheet'); return; }
-      if (this.usesSelection(reply.text)) { this.warnOnce('selvars', 'the camera reply uses a selected-road or place variable, so it can\'t be sent automatically'); this.skipFor(id, 30 * 60e3, 'camera reply needs a map selection'); return; }
 
       let { comments } = await this.details(id);
-      let st = autoState(ur.description, comments);
-      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3, st ? 'reporter commented (yours)' : 'someone already replied (yours)'); return; }   // the reporter added something, or an editor already replied: yours
+      let bad = this.check(id, ur.description, ur.reportedOn, comments);
+      if (bad) { this.skipFor(id, bad.ms, bad.why); return false; }
 
+      const reply = findReply(...AUTO_RULES.find(r => r.id === 'camera').sheetKeys);
       const filled = await fillVars(reply.text, buildContext(ur, { comments }));
       if (!filled.text || filled.unresolved.length) {
         this.warnOnce('unresolved', `the camera reply still has ${filled.unresolved.join(' ')} after filling in, so nothing is sent`);
         this.skipFor(id, 30 * 60e3, 'reply has unfilled variables');
-        return;
+        return false;
       }
 
-      // Last look right before posting (a short random wait helps two laptops not both post it)
-      await sleep(Math.random() * 1500);
-      if (Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return; }
+      // Last look right before posting (in the background, a short random wait helps two laptops not both post it)
+      if (!opened) await sleep(Math.random() * 1500);
+      if (!opened && Number(Next.openId) === id) { this.skipFor(id, 2 * 60e3, 'open on screen'); return false; }
       ({ comments } = await this.details(id));
-      st = autoState(ur.description, comments);
-      if (!st || st.state !== 'auto') { this.skipFor(id, 6 * 3600e3, 'someone replied first (yours)'); return; }
+      bad = this.check(id, ur.description, ur.reportedOn, comments);
+      if (bad) { this.skipFor(id, bad.ms, bad.why); return false; }
 
       await sdk.DataModel.MapUpdateRequests.addComment({ mapUpdateRequestId: id, text: filled.text });
       this.done[id] = { t: Date.now(), stage: 'commented' };
       this.save();
       this.sentTimes.push(Date.now());
+      if (Header.urId === id) Header.inserted = id;   // the open panel must not also fill its box for review
       try {
         await this.close(id);
         this.finished(id, 'replied and marked Not identified');
+        return true;
       } catch (e) {
         LOG(`Auto-send: UR ${id} was replied to but marking it Not identified failed – ${e.message}. Will try again.`);
         this.status(`UR ${id}: replied, but Not identified failed`);
         this.skipFor(id, 2 * 60e3, 'close failed, retrying');
+        return false;
       }
     },
 
@@ -2350,6 +2403,52 @@ ${list}`;
       setInterval(() => this.tick(), AUTO_SEND_EVERY_MS);
     },
   };
+
+  // ===== QUESTION MARK WHEN YOU REPLY =====
+  // The moment you press Send on a reply that leaves the UR open, it gets the purple "?" (I asked a question – waiting on
+  // the Wazer) in place of the open circle. A reply that closes it (Solved / Not identified) gets nothing: it's done.
+  // If the reply turns out not to have gone through, the "?" is taken off again.
+  const Asked = {
+    set(id) {
+      const cur = urInfo(id);
+      if (cur.flags.includes('asked')) return false;
+      saveUrInfo(id, { ...cur, flags: [...cur.flags, 'asked'] });
+      return true;
+    },
+    unset(id) {
+      const cur = urInfo(id);
+      if (cur.flags.includes('asked')) saveUrInfo(id, { ...cur, flags: cur.flags.filter(f => f !== 'asked') });
+    },
+    async verify(id, before, added) {
+      await sleep(4000);
+      try {
+        const { comments } = await AutoSend.details(id);
+        const now = comments.filter(c => c.role === 'me').length;
+        if (Number(Next.openId) === id && Header.loadedId === id) Header.comments = comments.map(c => ({ role: c.role, time: c.createdOn }));
+        const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
+        if (!added) return;
+        if (ur && !ur.isOpen) this.unset(id);   // it got closed right after (e.g. Rapid UR Reply's F9): nothing to wait for
+        else if (before !== null && now <= before) {
+          this.unset(id);
+          LOG(`Question mark taken off UR ${id}: your reply doesn't show up on it.`);
+        }
+      } catch { /* leave the mark */ }
+    },
+  };
+  document.addEventListener('click', e => {
+    const btn = e.composedPath().find(n => n && n.matches && n.matches('wz-button.send-button'));
+    if (!btn) return;
+    const card = btn.closest('wz-card.mapUpdateRequest') || document.querySelector('wz-card.mapUpdateRequest');
+    const id = Number(Next.openId);
+    if (!card || !id) return;
+    const text = String(card.querySelector('.new-comment-text')?.value || commentBox(card)?.value || '').trim();
+    if (!text) return;
+    const picked = card.querySelector('input[type="radio"]:checked')?.value;
+    if (picked === 'solved' || picked === 'not-identified') return;   // closing it: nothing to wait for
+    const before = Header.loadedId === id ? Header.comments.filter(c => c.role === 'me').length : null;
+    const added = Asked.set(id);
+    Asked.verify(id, before, added);
+  }, true);
 
   // ===== STARTUP =====
   async function start() {
