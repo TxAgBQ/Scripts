@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.11.02
+// @version      2026.10.11.03
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -597,6 +597,7 @@ ${list}`;
     waiting: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3" fill="none" stroke="#1e66f5" stroke-width="2.4"/></svg>',
     watching: '<svg viewBox="0 0 16 16"><circle cx="5.3" cy="4.9" r="1.8" fill="#ffe082" stroke="#b08d00" stroke-width=".5"/><circle cx="8" cy="3.8" r="2" fill="#ffe082" stroke="#b08d00" stroke-width=".5"/><circle cx="10.7" cy="4.9" r="1.8" fill="#ffe082" stroke="#b08d00" stroke-width=".5"/><path d="M3.4 6.2h9.2l-1.3 8.4H4.7z" fill="#fff" stroke="#d32f2f" stroke-width=".8"/><path d="M5.5 6.2l.6 8.4M8 6.2v8.4M10.5 6.2l-.6 8.4" stroke="#d32f2f" stroke-width="1.2"/></svg>',
     dupe: '<svg viewBox="0 0 16 16"><rect x="1.8" y="1.8" width="8.6" height="8.6" fill="#fff" stroke="#d32f2f" stroke-width="1.8"/><rect x="5.6" y="5.6" width="8.6" height="8.6" fill="#ffcdd2" stroke="#d32f2f" stroke-width="1.8"/></svg>',
+    dupeMaybe: '<svg viewBox="0 0 16 16" opacity=".6"><rect x="1.8" y="1.8" width="8.6" height="8.6" fill="#fff" stroke="#d32f2f" stroke-width="1.4" stroke-dasharray="2 1.6"/><rect x="5.6" y="5.6" width="8.6" height="8.6" fill="#fff" stroke="#d32f2f" stroke-width="1.4" stroke-dasharray="2 1.6"/></svg>',
     camera: '<svg viewBox="0 0 16 16"><rect x="1" y="4.2" width="9.6" height="7.6" rx="1.4" fill="#d32f2f"/><path d="M11.2 7.1L15 4.8v6.4l-3.8-2.3z" fill="#d32f2f"/></svg>',
     train: '<svg viewBox="0 0 16 16"><rect x="3" y="1.3" width="10" height="10.4" rx="2.5" fill="#d32f2f"/><rect x="5" y="3.3" width="6" height="3.2" rx=".6" fill="#fff"/><circle cx="5.7" cy="9.2" r="1" fill="#fff"/><circle cx="10.3" cy="9.2" r="1" fill="#fff"/><path d="M5 12l-1.8 2.8M11 12l1.8 2.8" stroke="#d32f2f" stroke-width="1.4" stroke-linecap="round"/></svg>',
     stopsign: '<svg viewBox="0 0 16 16"><polygon points="5,.8 11,.8 15.2,5 15.2,11 11,15.2 5,15.2 .8,11 .8,5" fill="#d32f2f" stroke="#fff" stroke-width=".8"/><text x="8" y="9.9" text-anchor="middle" font-size="4.6" font-weight="bold" fill="#fff" font-family="Arial,sans-serif">STOP</text></svg>',
@@ -734,10 +735,12 @@ ${list}`;
   // What shows for a UR, in order:
   //   ! priority always first · duplicate, or camera/train, replaces everything else ·
   //   red X replaces the other statuses unless map work, popcorn or a UR-MP blacklist is on · the note always shows last
-  function displayIcons(info, { overdue, dupeOf, auto, popcorn, blacklisted }) {
+  function displayIcons(info, { overdue, dupeOf, auto, popcorn, blacklisted, possibleDupe }) {
     const flags = info?.flags || [];
     const out = [];
     if (flags.includes('priority')) out.push(icon('priority', STATUS_LABEL.priority));
+    // Only a heads-up (from UR-MP's list, reporter not checked): it doesn't replace or hide any other icon
+    if (possibleDupe && !dupeOf && !flags.includes('dupe')) out.push(icon('dupeMaybe', `Possible duplicate of #${possibleDupe} – the reporter hasn't been checked. Bring both reports into view to confirm.`));
     if (dupeOf || flags.includes('dupe')) {
       out.push(icon('dupe', dupeOf ? `Duplicate of #${dupeOf} – close it` : STATUS_LABEL.dupe));
     } else if (auto) {
@@ -1004,6 +1007,18 @@ ${list}`;
           const t = Number(u.data?.driveDate);
           if (t > 0 && !reportedTimes.has(Number(u.id))) reportedTimes.set(Number(u.id), t);
         }
+        // Open reports with a position and time, in report-number order, for the "possible duplicate" heads-up
+        this.cands = [];
+        for (const u of list) {
+          const id = Number(u.id), t = Number(u.data?.driveDate), p = u.data?.open ? urmpLonLat(u) : null;
+          if (id && t > 0 && p) this.cands.push({ id, t, lon: p.lon, lat: p.lat });
+        }
+        this.cands.sort((a, b) => a.id - b.id);
+        if (!this.cands.length && list.some(u => u.data?.open) && !this.warnedPos) {
+          this.warnedPos = true;
+          LOG("Possible-duplicate heads-up is off: couldn't read report positions from UR-MP's list.");
+        }
+        Dupes.findCandidates();
         const present = new Set(list.map(u => Number(u.id)));
         const now = new Set(list.filter(u => u.blackListed).map(u => Number(u.id)));
         const seen = GM_getValue('urmpBlSeen', null); // what UR-MP had last time on this laptop
@@ -1201,10 +1216,11 @@ ${list}`;
         const auto = autoState(URMP.description(r.urId), comments);
         const popcorn = autoPopcorn(comments);
         const blacklisted = UrmpBL.has(r.urId);
-        const key = JSON.stringify([info?.flags || [], info?.note || '', overdue, dupeOf, auto && [auto.rule.id, auto.state], popcorn, blacklisted]);
+        const possibleDupe = Dupes.possible.get(r.urId) || null;
+        const key = JSON.stringify([info?.flags || [], info?.note || '', overdue, dupeOf, auto && [auto.rule.id, auto.state], popcorn, blacklisted, possibleDupe]);
         if (c.dataset.key !== key) {
           c.dataset.key = key;
-          c.replaceChildren(...displayIcons(info, { overdue, dupeOf, auto, popcorn, blacklisted }));
+          c.replaceChildren(...displayIcons(info, { overdue, dupeOf, auto, popcorn, blacklisted, possibleDupe }));
         }
         most = Math.max(most, c.childElementCount);
         const last = r.tr.lastElementChild;
@@ -1541,6 +1557,28 @@ ${list}`;
   const SEQ_MARGIN_METERS = 100;
   const SEQ_MAX_METERS = 5000;  // never allow more than this
   const seqMetersFor = ms => Math.min(SEQ_MAX_METERS, Math.max(SEQ_MIN_METERS, (ms / 1000) * SEQ_SPEED_MPS + SEQ_MARGIN_METERS));
+
+  // Position of a report in UR-MP's saved list (not SDK): [lon, lat] or {lon, lat} / {x, y}, in degrees or Web Mercator meters
+  function urmpLonLat(u) {
+    for (const v of [u.lonlat, u.centroid]) {
+      let lon, lat;
+      if (Array.isArray(v)) [lon, lat] = v;
+      else if (v && typeof v === 'object') { lon = v.lon ?? v.lng ?? v.x; lat = v.lat ?? v.y; }
+      lon = Number(lon); lat = Number(lat);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+      if (Math.abs(lon) > 180 || Math.abs(lat) > 90) {   // Web Mercator meters
+        const R = 6378137;
+        lon = (lon / R) * 180 / Math.PI;
+        lat = (2 * Math.atan(Math.exp(lat / R)) - Math.PI / 2) * 180 / Math.PI;
+      }
+      return { lon, lat };
+    }
+    return null;
+  }
+  function lonLatMeters(a, b) {
+    const r = Math.PI / 180;
+    return Math.hypot((b.lon - a.lon) * r * Math.cos(((a.lat + b.lat) / 2) * r), (b.lat - a.lat) * r) * 6371000;
+  }
   // For now duplicates stay open: the reply goes in the comment box but no status is selected.
   // Set to true later to have Not identified (or your sheet's status for the duplicate reply) selected again.
   const DUPE_SET_STATUS = false;
@@ -1562,6 +1600,29 @@ ${list}`;
     closeOf: new Map(Object.entries(GM_getValue('dupeSticky', {})).map(([k, v]) => [Number(k), v])), // urId -> { keep, keepCoords }
     facts: new Map(),   // urId -> { comments, track, time }
     running: false,
+    possible: new Map(), // urId -> the report it may duplicate (from UR-MP's list; reporter not checked; never saved or synced)
+    loaded: null,        // ids of the URs WME has loaded, as of the last scan
+
+    // Back-to-back reports (same rule as below, minus the reporter check, which WME can't give for a report it hasn't loaded)
+    // where at least one of the two isn't loaded on the map, so the full check can't see the pair. Only a heads-up.
+    findCandidates() {
+      const list = UrmpBL.cands;
+      if (!list || !this.loaded) return;
+      const found = new Map();
+      for (let i = 0; i < list.length; i++) {
+        for (let j = i + 1; j < list.length && list[j].id - list[i].id <= SEQ_ID_GAP; j++) {
+          const a = list[i], b = list[j];
+          if (this.loaded.has(a.id) && this.loaded.has(b.id)) continue;   // both loaded: the full check above decides
+          const apart = Math.abs(a.t - b.t);
+          if (apart > SEQ_MINUTES * 60e3 || lonLatMeters(a, b) > seqMetersFor(apart)) continue;
+          if (!found.has(a.id)) found.set(a.id, b.id);
+          if (!found.has(b.id)) found.set(b.id, a.id);
+        }
+      }
+      const same = found.size === this.possible.size && [...found].every(([k, v]) => this.possible.get(k) === v);
+      this.possible = found;
+      if (!same) Strip.update();
+    },
 
     persist() {
       GM_setValue('dupeSticky', this.sticky);
@@ -1607,6 +1668,7 @@ ${list}`;
         const all = await sdk.DataModel.MapUpdateRequests.getAll();
         const open = all.filter(u => u.isOpen);
         const closedNow = new Set(all.filter(u => !u.isOpen).map(u => u.id));
+        this.loaded = new Set(all.map(u => u.id));
         for (const u of open) reportedTimes.set(u.id, u.reportedOn);
         const parent = new Map(open.map(u => [u.id, u.id]));
         const find = x => (parent.get(x) === x ? x : (parent.set(x, find(parent.get(x))), parent.get(x)));
@@ -1650,6 +1712,7 @@ ${list}`;
         }
         if (flagged) GM_setValue('urData', urStore);
         this.persist();
+        this.findCandidates();
         Strip.update();
       } catch (e) {
         LOG('Duplicate scan failed:', e.message);
@@ -2112,6 +2175,7 @@ ${list}`;
       el('div', {}, icon('xRed', X_TITLE), ` Automatic: no Wazer reply in ${NO_REPLY_HOURS} h (Map Team counts). Hidden by map work, popcorn and UR-MP blacklist.`),
       el('div', {}, icon('camera', ''), ' ', icon('train', ''), ' ', icon('stopsign', ''), ' Camera report: open it and it is answered, closed as Not identified, and the next row opens (setting below). Train / stop sign report: standard reply goes in with Not identified (you review and Send)'),
       el('div', {}, icon('dupe', ''), ` Duplicates are also found automatically: same reporter, and within ${DUPE_METERS} m / ${DUPE_HOURS} h, or back-to-back reports (numbers ${SEQ_ID_GAP} or fewer apart, within ${SEQ_MINUTES} min and ${SEQ_MIN_METERS} m or more, growing with the time between them)`),
+      el('div', {}, icon('dupeMaybe', ''), ` Faded dashed copy: possible duplicate – back-to-back reports (same numbers/time/distance rule) from UR-MP's list where one isn't loaded on the map, so the reporter couldn't be checked. Only a heads-up; bring both into view and the real check decides.`),
       el('div', {}, icon('closure', ''), ' + ', icon('xRed', ''), ' Red closure sign, the report says it was a closure, only Map Team has commented, and the red X is showing: your Event closure reply goes in with Not identified when you open it (never for the amber sign)'),
       el('div', {}, icon('noteOn', 'Note'), ' Has a note'));
  
