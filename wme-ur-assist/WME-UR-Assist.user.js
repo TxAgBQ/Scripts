@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.10.03
+// @version      2026.10.11.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1550,16 +1550,63 @@ ${list}`;
     return Math.hypot((lo2 - lo1) * r * Math.cos(((la1 + la2) / 2) * r), (la2 - la1) * r) * 6371000;
   }
  
+  // A report that has been flagged a duplicate STAYS one - even after the others in its group are closed and it no longer matches
+  // anything (a chain of back-to-back reports breaks apart as its middle links go) - until it is closed or you unflag it.
+  // The first match is remembered, including which report it duplicates. Flagging also sets the Duplicate status button, so
+  // clicking that button off (here or on your other laptop) is the unflag, and it then isn't flagged again by itself.
+  const DUPE_FLAG = 'dupe';
+  const DUPE_MEMORY_DAYS = 30;
   const Dupes = {
-    closeOf: new Map(), // urId -> { keep, keepCoords }
+    sticky: GM_getValue('dupeSticky', {}),   // urId -> { keep, keepCoords, t }
+    ignore: GM_getValue('dupeIgnore', {}),   // urId -> time you unflagged it
+    closeOf: new Map(Object.entries(GM_getValue('dupeSticky', {})).map(([k, v]) => [Number(k), v])), // urId -> { keep, keepCoords }
     facts: new Map(),   // urId -> { comments, track, time }
     running: false,
+
+    persist() {
+      GM_setValue('dupeSticky', this.sticky);
+      GM_setValue('dupeIgnore', this.ignore);
+      this.closeOf = new Map(Object.entries(this.sticky).map(([k, v]) => [Number(k), v]));
+    },
+
+    // Drop remembered duplicates that were closed, got too old, or that you unflagged (here or on your other laptop)
+    reconcile(closed = new Set()) {
+      const now = Date.now(), limit = DUPE_MEMORY_DAYS * 864e5;
+      let changed = false, cleared = false;
+      for (const [k, v] of Object.entries(this.sticky)) {
+        if (closed.has(Number(k))) {   // closed: its automatic flag has done its job
+          const cur = urInfo(k);
+          if (cur.flags.includes(DUPE_FLAG)) {
+            urStore[k] = { flags: cur.flags.filter(f => f !== DUPE_FLAG), note: cur.note || '', updated: Date.now() };
+            Sync.markDirty(k);
+            cleared = true;
+          }
+          delete this.sticky[k]; changed = true;
+        }
+        else if (now - v.t > limit) { delete this.sticky[k]; changed = true; }
+        else if (!urInfo(k).flags.includes(DUPE_FLAG)) { delete this.sticky[k]; this.ignore[k] = now; changed = true; }
+      }
+      for (const [k, t] of Object.entries(this.ignore)) if (now - t > limit) { delete this.ignore[k]; changed = true; }
+      if (cleared) GM_setValue('urData', urStore);
+      if (changed) { this.persist(); Strip.update(); }
+    },
+
+    // You clicked the Duplicate status off: forget it right away and don't flag it again
+    unstick(id) {
+      if (!this.sticky[id]) return;
+      delete this.sticky[id];
+      this.ignore[id] = Date.now();
+      this.persist();
+      Strip.update();
+    },
  
     async scan() {
       if (this.running) return;
       this.running = true;
       try {
-        const open = (await sdk.DataModel.MapUpdateRequests.getAll()).filter(u => u.isOpen);
+        const all = await sdk.DataModel.MapUpdateRequests.getAll();
+        const open = all.filter(u => u.isOpen);
+        const closedNow = new Set(all.filter(u => !u.isOpen).map(u => u.id));
         for (const u of open) reportedTimes.set(u.id, u.reportedOn);
         const parent = new Map(open.map(u => [u.id, u.id]));
         const find = x => (parent.get(x) === x ? x : (parent.set(x, find(parent.get(x))), parent.get(x)));
@@ -1588,7 +1635,21 @@ ${list}`;
           const keep = info[0].u;
           for (const x of info.slice(1)) closeOf.set(x.u.id, { keep: keep.id, keepCoords: keep.geometry.coordinates });
         }
-        this.closeOf = closeOf;
+        // Remember new duplicates (and flag them), forget closed or unflagged ones
+        this.reconcile(closedNow);
+        let flagged = 0;
+        for (const [id, v] of closeOf) {
+          if (this.ignore[id] || closedNow.has(id) || this.sticky[id]) continue;
+          this.sticky[id] = { keep: v.keep, keepCoords: v.keepCoords, t: Date.now() };
+          const cur = urInfo(id);
+          if (!cur.flags.includes(DUPE_FLAG)) {
+            urStore[id] = { flags: [...cur.flags, DUPE_FLAG], note: cur.note || '', updated: Date.now() };
+            Sync.markDirty(id);
+            flagged++;
+          }
+        }
+        if (flagged) GM_setValue('urData', urStore);
+        this.persist();
         Strip.update();
       } catch (e) {
         LOG('Duplicate scan failed:', e.message);
@@ -1828,6 +1889,7 @@ ${list}`;
           const flags = s.id === 'waiting' ? [...new Set([...cur.flags.filter(keepOnClear), SEEN])]
             : cur.flags.includes(s.id) ? cur.flags.filter(f => f !== s.id) : [...cur.flags, s.id];
           saveUrInfo(id, { ...cur, flags });
+          if (s.id === DUPE_FLAG && !flags.includes(DUPE_FLAG)) Dupes.unstick(id);   // you unflagged it
           this.refresh(bar, id);
         });
         bar.append(b);
@@ -2457,7 +2519,7 @@ ${list}`;
     convertWaiting();
     Strip.init();
     GM_addValueChangeListener('urData', (key, oldVal, newVal, remote) => {
-      if (remote) { urStore = newVal || {}; Strip.update(); }
+      if (remote) { urStore = newVal || {}; Dupes.reconcile(); Strip.update(); }
     });
     Sync.run();
     setInterval(() => Sync.run(), 60000);
