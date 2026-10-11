@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.11.01
+// @version      2026.10.11.02
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -2470,6 +2470,9 @@ ${list}`;
   // The moment you press Send on a reply that leaves the UR open, it gets the purple "?" (I asked a question – waiting on
   // the Wazer) in place of the open circle. A reply that closes it (Solved / Not identified) gets nothing: it's done.
   // If the reply turns out not to have gone through, the "?" is taken off again.
+  const ASKED_VERIFY_FIRST_MS = 4000;   // first look at the report after you press Send
+  const ASKED_VERIFY_EVERY_MS = 4000;   // then look again this often
+  const ASKED_VERIFY_MS = 30000;        // give up (and take the "?" off) if your reply hasn't shown up by then
   const Asked = {
     set(id) {
       const cur = urInfo(id);
@@ -2481,20 +2484,33 @@ ${list}`;
       const cur = urInfo(id);
       if (cur.flags.includes('asked')) saveUrInfo(id, { ...cur, flags: cur.flags.filter(f => f !== 'asked') });
     },
+    // WME can take a while to show a reply you just sent, so look again every few seconds for up to
+    // ASKED_VERIFY_MS. The "?" stays as soon as your reply turns up; it only comes off if the report got closed,
+    // or your reply still hasn't shown up when the time runs out.
     async verify(id, before, added) {
-      await sleep(4000);
-      try {
-        const { comments } = await AutoSend.details(id);
-        const now = comments.filter(c => c.role === 'me').length;
-        if (Number(Next.openId) === id && Header.loadedId === id) Header.comments = comments.map(c => ({ role: c.role, time: c.createdOn }));
-        const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
-        if (!added) return;
-        if (ur && !ur.isOpen) this.unset(id);   // it got closed right after (e.g. Rapid UR Reply's F9): nothing to wait for
-        else if (before !== null && now <= before) {
-          this.unset(id);
-          LOG(`Question mark taken off UR ${id}: your reply doesn't show up on it.`);
-        }
-      } catch { /* leave the mark */ }
+      if (!added) return;
+      const started = Date.now();
+      let now = null;   // your comment count at the last successful look (null = never got a look)
+      await sleep(ASKED_VERIFY_FIRST_MS);
+      for (;;) {
+        try {
+          const { comments } = await AutoSend.details(id);
+          now = comments.filter(c => c.role === 'me').length;
+          if (Number(Next.openId) === id && Header.loadedId === id) Header.comments = comments.map(c => ({ role: c.role, time: c.createdOn }));
+          const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
+          if (ur && !ur.isOpen) {   // it got closed right after (e.g. Rapid UR Reply's F9): nothing to wait for
+            this.unset(id);
+            LOG(`Question mark taken off UR ${id}: the report was closed.`);
+            return;
+          }
+          if (before === null || now > before) return;   // your reply is there (or can't be checked): keep the mark
+        } catch (e) { LOG(`Question mark check on UR ${id} failed this time: ${e.message}`); }
+        if (Date.now() - started >= ASKED_VERIFY_MS) break;
+        await sleep(ASKED_VERIFY_EVERY_MS);
+      }
+      if (now === null) { LOG(`Question mark kept on UR ${id}: couldn't check whether your reply went through.`); return; }
+      this.unset(id);
+      LOG(`Question mark taken off UR ${id}: your reply still didn't show up after ${Math.round(ASKED_VERIFY_MS / 1000)} s (your comments: ${before} before, ${now} now).`);
     },
   };
   document.addEventListener('click', e => {
