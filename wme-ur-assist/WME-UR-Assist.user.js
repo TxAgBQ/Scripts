@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.11.03
+// @version      2026.10.12.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -767,7 +767,12 @@ ${list}`;
   const urInfo = id => urStore[id] || { flags: [], note: '' };
  
   // Cleared entries are kept (empty) so a clear also reaches your other laptop through sync
+  // Diagnostics: whenever the purple "?" goes missing from a UR, say which part of the script did it
+  function logAskedLoss(id, before, after, where) {
+    if (before?.flags?.includes('asked') && !after?.flags?.includes('asked')) LOG(`Question mark gone from UR ${id} (${where}).`);
+  }
   function saveUrInfo(id, info) {
+    logAskedLoss(id, urStore[id], info, `saved by ${new Error().stack.split('\n')[2]?.trim() || 'unknown'}`);
     urStore[id] = { flags: info.flags, note: info.note || '', updated: Date.now() };
     GM_setValue('urData', urStore);
     Sync.markDirty(id);
@@ -844,6 +849,7 @@ ${list}`;
           if (!cur || (v.updated || 0) > (cur.updated || 0)) {
             const mark = blMark(v);
             if (mark && mark !== blMark(cur)) blArrived.push(id);
+            logAskedLoss(id, cur, v, 'a newer copy arrived through sync from your other laptop');
             urStore[id] = v;
             n++;
           }
@@ -2533,10 +2539,10 @@ ${list}`;
   // ===== QUESTION MARK WHEN YOU REPLY =====
   // The moment you press Send on a reply that leaves the UR open, it gets the purple "?" (I asked a question – waiting on
   // the Wazer) in place of the open circle. A reply that closes it (Solved / Not identified) gets nothing: it's done.
-  // If the reply turns out not to have gone through, the "?" is taken off again.
-  const ASKED_VERIFY_FIRST_MS = 4000;   // first look at the report after you press Send
+  // It stays until you clear it yourself or the report is closed.
+  const ASKED_VERIFY_FIRST_MS = 4000;   // first look at whether the report got closed after you press Send
   const ASKED_VERIFY_EVERY_MS = 4000;   // then look again this often
-  const ASKED_VERIFY_MS = 30000;        // give up (and take the "?" off) if your reply hasn't shown up by then
+  const ASKED_VERIFY_MS = 30000;        // keep watching for a close this long
   const Asked = {
     set(id) {
       const cur = urInfo(id);
@@ -2551,30 +2557,25 @@ ${list}`;
     // WME can take a while to show a reply you just sent, so look again every few seconds for up to
     // ASKED_VERIFY_MS. The "?" stays as soon as your reply turns up; it only comes off if the report got closed,
     // or your reply still hasn't shown up when the time runs out.
+    // The "?" only comes off when the report gets closed right after you send (e.g. Rapid UR Reply's F9), checked for
+    // ASKED_VERIFY_MS. It is never taken off because your reply "didn't show up": WME can serve old comments for a long
+    // time, which made the "?" vanish on replies that had gone through. If a reply really failed, click the "?" off.
     async verify(id, before, added) {
       if (!added) return;
       const started = Date.now();
-      let now = null;   // your comment count at the last successful look (null = never got a look)
       await sleep(ASKED_VERIFY_FIRST_MS);
       for (;;) {
         try {
-          const { comments } = await AutoSend.details(id);
-          now = comments.filter(c => c.role === 'me').length;
-          if (Number(Next.openId) === id && Header.loadedId === id) Header.comments = comments.map(c => ({ role: c.role, time: c.createdOn }));
           const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
-          if (ur && !ur.isOpen) {   // it got closed right after (e.g. Rapid UR Reply's F9): nothing to wait for
+          if (ur && !ur.isOpen) {
             this.unset(id);
             LOG(`Question mark taken off UR ${id}: the report was closed.`);
             return;
           }
-          if (before === null || now > before) return;   // your reply is there (or can't be checked): keep the mark
         } catch (e) { LOG(`Question mark check on UR ${id} failed this time: ${e.message}`); }
-        if (Date.now() - started >= ASKED_VERIFY_MS) break;
+        if (Date.now() - started >= ASKED_VERIFY_MS) return;
         await sleep(ASKED_VERIFY_EVERY_MS);
       }
-      if (now === null) { LOG(`Question mark kept on UR ${id}: couldn't check whether your reply went through.`); return; }
-      this.unset(id);
-      LOG(`Question mark taken off UR ${id}: your reply still didn't show up after ${Math.round(ASKED_VERIFY_MS / 1000)} s (your comments: ${before} before, ${now} now).`);
     },
   };
   document.addEventListener('click', e => {
@@ -2599,7 +2600,10 @@ ${list}`;
     convertWaiting();
     Strip.init();
     GM_addValueChangeListener('urData', (key, oldVal, newVal, remote) => {
-      if (remote) { urStore = newVal || {}; Dupes.reconcile(); Strip.update(); }
+      if (remote) {
+        for (const [id, v] of Object.entries(urStore)) logAskedLoss(id, v, (newVal || {})[id], 'another WME tab or window saved over it');
+        urStore = newVal || {}; Dupes.reconcile(); Strip.update();
+      }
     });
     Sync.run();
     setInterval(() => Sync.run(), 60000);
