@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026100802
+// @version      2026101201
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -17,8 +17,8 @@
 // @connect      docs.google.com
 // @connect      tigerweb.geo.census.gov
 // @connect      *
-// @downloadURL https://update.greasyfork.org/scripts/597822/WME%20Segment%20Importer.user.js
-// @updateURL https://update.greasyfork.org/scripts/597822/WME%20Segment%20Importer.meta.js
+// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/refs/heads/main/wme-segment-importer/WME-Segment-Importer.user.js
+// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/refs/heads/main/wme-segment-importer/WME-Segment-Importer.user.js
 // ==/UserScript==
 
 /* global getWmeSdk, unsafeWindow, GM_xmlhttpRequest, GM_setValue, GM_getValue, GM_info */
@@ -902,11 +902,13 @@
         savedPos = {};
     }
 
-    // The toolbar can be open, shrunk to a small icon, or closed (reopen it from the sidebar tab). Remembered between sessions.
+    // The toolbar is either open or shrunk to an icon (it can no longer be closed, so it can never stay hidden). Remembered between sessions.
     let toolbarState = { minimized: false, closed: false };
     try {
         toolbarState = { ...toolbarState, ...(JSON.parse(localStorage.getItem(STORAGE_KEY_TOOLBAR)) || {}) };
     } catch (e) { /* use defaults */ }
+    // Older builds could save a closed state, which hid the toolbar for good. It now counts as minimized.
+    if (toolbarState.closed) toolbarState = { minimized: true, closed: false };
 
     // ----- icons (drawn here, so nothing is downloaded) -----
     const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -1067,8 +1069,7 @@
     const separator = document.createElement('span');
     separator.style.cssText = 'width: 1px; height: 22px; background: #dadce0; flex: none;';
     const btnMinimize = makeSmallButton('\u2013', 'Shrink to an icon in the stack of buttons on the right of the map (click the icon to bring the toolbar back)');
-    const btnClose = makeSmallButton('\u00D7', 'Close the toolbar (reopen it from the importer tab in the sidebar)');
-    bar.append(btnScan, btnRoads, btnHouses, btnCleanUp, separator, btnMissing, btnGaps, btnMinimize, btnClose);
+    bar.append(btnScan, btnRoads, btnHouses, btnCleanUp, separator, btnMissing, btnGaps, btnMinimize);
 
     // Messages appear under the toolbar when something happens and go away by themselves, so the bar stays thin.
     const statusWrap = document.createElement('div');
@@ -1202,12 +1203,12 @@
             }
         }
         if (!open) hideStatusStrip();
-        if (sidebarUi && sidebarUi.toolbarBtn) sidebarUi.toolbarBtn.textContent = open ? 'Hide the toolbar' : 'Show the toolbar';
+        if (sidebarUi && sidebarUi.toolbarBtn) sidebarUi.toolbarBtn.textContent = open ? 'Minimize the toolbar' : 'Open the toolbar';
     }
 
-    // mode: 'open', 'min' (docked icon) or 'closed'
+    // mode: 'open' or 'min' (docked icon)
     function setToolbar(mode) {
-        toolbarState = { minimized: mode === 'min', closed: mode === 'closed' };
+        toolbarState = { minimized: mode === 'min', closed: false };
         try {
             localStorage.setItem(STORAGE_KEY_TOOLBAR, JSON.stringify(toolbarState));
         } catch (e) { /* storage unavailable */ }
@@ -1215,7 +1216,6 @@
     }
 
     btnMinimize.addEventListener('click', () => setToolbar('min'));
-    btnClose.addEventListener('click', () => setToolbar('closed'));
 
     // WME rebuilds the whole button stack when you save, and the other overlay scripts put their buttons back at once. So the icon is
     // put back the moment the stack changes (this watches for that), with a slow timer as a backup.
@@ -1666,7 +1666,7 @@
         const toolbarBtn = document.createElement('button');
         toolbarBtn.type = 'button';
         toolbarBtn.style.cssText = 'padding: 6px 10px; margin-bottom: 12px; border: 1px solid #dadce0; border-radius: 6px; background: #ffffff; color: #202124; font-size: 12px; cursor: pointer;';
-        toolbarBtn.addEventListener('click', () => setToolbar(toolbarState.closed || toolbarState.minimized ? 'open' : 'closed'));
+        toolbarBtn.addEventListener('click', () => setToolbar(toolbarState.minimized ? 'open' : 'min'));
         wrap.appendChild(toolbarBtn);
 
         const postalLabel = document.createElement('div');
@@ -4782,11 +4782,15 @@
         }
         let kind = null;
         let detail = GAP_KINDS.none.label;
-        if (!name && !hasCity) kind = shortConnector ? 'city' : 'none';
-        else if (!name && !shortConnector) kind = 'name';
-        else if (!hasCity) kind = 'city';
-        else if (places && gapSettings.cities && primary) {
-            const limits = limitsCityOf(segment, places);
+        // An alternate city needs a street name, so an unnamed segment can only have a city when it lies inside city/CDP limits.
+        // Inside the limits it needs the primary city; outside them (or when the limits are not loaded) only the missing name counts.
+        const limits = places && (!name || primary) ? limitsCityOf(segment, places) : null;
+        if (!name) {
+            const insideLimits = !!(limits && limits.agreed && limits.name);
+            if (insideLimits && !primary) kind = shortConnector ? 'city' : 'none';
+            else if (!shortConnector) kind = 'name';
+        } else if (!hasCity) kind = 'city';
+        if (!kind && limits && gapSettings.cities && primary) {
             if (limits.agreed && !limits.name) {
                 kind = 'badcity';
                 detail = `primary city ${primary}, but it is outside every city and CDP limit`;
@@ -5192,7 +5196,10 @@
             const limitsText = limitsPrimary || 'outside every city and CDP limit';
             let level = 'ok';
             let text;
-            if (!addr.primary && !limitsPrimary) {
+            if (!addr.primary && !limitsPrimary && !addr.name) {
+                text = 'None, which is right: an unnamed segment outside the city and CDP limits has no city (an alternate city needs a street name).';
+            }
+            else if (!addr.primary && !limitsPrimary) {
                 if (addr.alts.length) text = 'None, and the limits say none (outside every city and CDP). It has an alternate city.';
                 else {
                     text = `None, and it lies outside every city and CDP limit. It has no alternate city either, so it has no city at all.${full ? '' : ' Full proposes the postal city.'}`;
@@ -5214,7 +5221,7 @@
         }
 
         // Nearby segments (sanity check)
-        const nearby = full ? ccNearby(segment, addr.name) : { total: 0, top: null, connected: 0 }; // the nearby comparison is part of Full
+        const nearby = full && addr.name ? ccNearby(segment, addr.name) : { total: 0, top: null, connected: 0 }; // the nearby comparison is part of Full
         const mine = ccPostalOf(addr);
         let nearbyCandidate = null;
         if (nearby.total >= 2 && nearby.top && nearby.top.n / nearby.total >= CC_MAJORITY) {
@@ -5229,13 +5236,15 @@
             }
         } else if (nearby.total) {
             result.rows.push({ label: 'Nearby', text: nearby.total < 2 ? `Only ${nearby.total} nearby segment to compare with.` : 'Nearby segments do not agree on one city.', level: 'info' });
-        } else if (full) {
+        } else if (full && addr.name) {
             result.rows.push({ label: 'Nearby', text: 'No nearby segments to compare with.', level: 'info' });
         }
 
         // Alternate city: the same sources and order as an import (Full check only)
         const candidates = [];
-        if (full) {
+        if (full && !addr.name) {
+            result.rows.push({ label: 'Alternate city', text: 'Not needed: an alternate city requires a street name.', level: 'info' });
+        } else if (full) {
             try {
                 const source = await resolveSource({ lon: coords[0][0], lat: coords[0][1] });
                 if (!source) {
