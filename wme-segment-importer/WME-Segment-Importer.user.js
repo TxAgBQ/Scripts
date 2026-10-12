@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101202
+// @version      2026101203
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run, adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4251,8 +4251,10 @@
         const start = Date.now();
         await sleep(300);
         while (Date.now() - start < AREA.SAVE_TIMEOUT_MS) {
+            // WME also shows a .save-popover after a GOOD save ("Saved", with the counts), so only the one titled "Save anyway?" is a stop.
             const pop = document.querySelector('.save-popover');
-            if (pop) {
+            const popTitle = pop && pop.querySelector('.actions-title');
+            if (pop && popTitle && /save anyway/i.test(popTitle.textContent || '')) {
                 const raw = ((pop.querySelector('.error-list') || pop).textContent || '').replace(/\s+/g, ' ').trim();
                 return { ok: false, warnings: true, why: raw.length > 400 ? `${raw.slice(0, 400)}...` : raw };
             }
