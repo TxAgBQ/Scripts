@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101206
+// @version      2026101207
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4526,7 +4526,7 @@
         const what = run.kind === 'roads'
             ? `${run.created} roads imported, ${run.extended} stubs extended, ${run.skipped} skipped`
             : run.kind === 'fix'
-                ? `${run.fixed} flagged segments fixed${run.renamed ? ` (${run.renamed} renamed to the GIS name)` : ''}, ${run.unchanged} unchanged (${run.done} looked at)`
+                ? `${run.fixed} flagged segments fixed${run.renamed ? ` (${run.renamed} renamed to the GIS name)` : ''}, ${run.unchanged} unchanged${run.shortLeft ? `, ${run.shortLeft} short segments with no GIS match left alone` : ''} (${run.done} looked at)`
                 : run.kind === 'check'
                     ? run.text
                     : `${run.done} roads checked for house numbers, ${run.created} got numbers`;
@@ -4766,9 +4766,11 @@
             if (!c || c.length < 2) continue;
             const mid = pointAlongLine(c, 0.5);
             if (!isOnScreen(mid, view) || !areaPointInRing(mid, area.points)) continue;
-            const hit = evaluateSegmentInfo(segment, places);
+            const hit = evaluateSegmentInfo(segment, places, true);
             if (!hit) continue;
-            found.push({ ...hit, coords: c.map((p) => [p[0], p[1]]), mid, draw: `gap-${hit.kind}` });
+            // extra = only flagged because the area runs also look at the short segments the map scan excuses
+            const extra = !evaluateSegmentInfo(segment, places);
+            found.push({ ...hit, extra, coords: c.map((p) => [p[0], p[1]]), mid, draw: `gap-${hit.kind}` });
         }
         return found;
     }
@@ -4836,7 +4838,7 @@
         if (changed) cityCheckCache.clear();
 
         let segment = sdk.DataModel.Segments.getById({ segmentId: id });
-        let after = segment ? evaluateSegmentInfo(segment, places) : null;
+        let after = segment ? evaluateSegmentInfo(segment, places, true) : null;
 
         // the primary was cleared but no city took its place: a segment with no city at all is worse, so put it back
         if (cleared && after && (after.kind === 'city' || after.kind === 'none')) {
@@ -4844,7 +4846,7 @@
             cityCheckCache.clear();
             notes.push(`No postal city was found to take its place, so ${originalPrimary} was put back.`);
             segment = sdk.DataModel.Segments.getById({ segmentId: id });
-            after = segment ? evaluateSegmentInfo(segment, places) : null;
+            after = segment ? evaluateSegmentInfo(segment, places, true) : null;
         }
 
         if (after) {
@@ -4949,6 +4951,12 @@
                         }
                     }
                     const label = t.name || 'Unnamed road';
+                    // a short segment only looked at because of this run, with no GIS road to fill it from: nothing to report
+                    if (t.extra && (result.outcome === 'unchanged' || (result.outcome === 'review' && !result.changed))) {
+                        area.fix.items = area.fix.items.filter((x) => x !== t);
+                        run.shortLeft = (run.shortLeft || 0) + 1;
+                        continue;
+                    }
                     if (result.renamed) {
                         run.renamed++;
                         console.log(`[${SCRIPT_NAME}] Area fix: ${result.message}`);
@@ -4989,7 +4997,7 @@
             if (t.draw === 'ok') return false;
             try {
                 const seg = sdk.DataModel.Segments.getById({ segmentId: t.id });
-                return !!(seg && evaluateSegmentInfo(seg, places));
+                return !!(seg && evaluateSegmentInfo(seg, places, true));
             } catch (err) {
                 return false;
             }
@@ -6033,7 +6041,8 @@
         return result;
     }
 
-    function evaluateSegmentInfo(segment, places) {
+    // thorough = true (the area runs): short unnamed segments are not excused as connectors, so they get looked at too.
+    function evaluateSegmentInfo(segment, places, thorough = false) {
         let address;
         try {
             address = sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
@@ -6050,7 +6059,7 @@
             const pts = segment.geometry.coordinates;
             let meters = 0;
             for (let i = 1; i < pts.length && meters < GAP_SHORT_CONNECTOR_M; i++) meters += distanceMeters(pts[i - 1][1], pts[i - 1][0], pts[i][1], pts[i][0]);
-            shortConnector = meters < GAP_SHORT_CONNECTOR_M;
+            shortConnector = !thorough && meters < GAP_SHORT_CONNECTOR_M;
         }
         let kind = null;
         let detail = GAP_KINDS.none.label;
