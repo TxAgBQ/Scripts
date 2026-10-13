@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101204
+// @version      2026101205
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1804,7 +1804,7 @@
 
         const hint = document.createElement('div');
         hint.style.cssText = 'margin-top: 10px; font-size: 11px; color: #5f6368; line-height: 1.35;';
-        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. The same outline can also fix the existing segments the scan flags: Check flagged counts them, Fix flagged fills in names and cities and corrects primary cities (a name that differs from the GIS is listed for you, never changed). A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere in Texas the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
+        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. The same outline can also fix the existing segments the scan flags: Check flagged counts them, Fix flagged fills in names and cities, corrects primary cities (clearing one and using the postal city as the alternate when the limits call for it) and renames a street to the GIS name when it differs. A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere in Texas the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
         wrap.appendChild(hint);
 
         tabPane.appendChild(wrap);
@@ -4497,7 +4497,7 @@
 
     // ----- runs -----
     function areaNewRun(kind, total) {
-        return { kind, paused: false, stop: false, total, done: 0, created: 0, extended: 0, skipped: 0, saves: 0, sinceSave: 0, needLook: [], startedAt: Date.now(), stopReason: '', fixed: 0, unchanged: 0, found: 0, text: '' };
+        return { kind, paused: false, stop: false, total, done: 0, created: 0, extended: 0, skipped: 0, saves: 0, sinceSave: 0, needLook: [], startedAt: Date.now(), stopReason: '', fixed: 0, renamed: 0, unchanged: 0, found: 0, text: '' };
     }
 
     // Pause and stop are checked between roads; returns false when the run should end.
@@ -4526,7 +4526,7 @@
         const what = run.kind === 'roads'
             ? `${run.created} roads imported, ${run.extended} stubs extended, ${run.skipped} skipped`
             : run.kind === 'fix'
-                ? `${run.fixed} flagged segments fixed, ${run.unchanged} unchanged (${run.done} looked at)`
+                ? `${run.fixed} flagged segments fixed${run.renamed ? ` (${run.renamed} renamed to the GIS name)` : ''}, ${run.unchanged} unchanged (${run.done} looked at)`
                 : run.kind === 'check'
                     ? run.text
                     : `${run.done} roads checked for house numbers, ${run.created} got numbers`;
@@ -4793,14 +4793,19 @@
         return true;
     }
 
-    // Fixes one flagged segment the way the clicks would: the primary city the limits call for (the right-click fix), then the
-    // blanks (name, cities) from the GIS, Google Maps or the address points (the Roads click). A name that differs from the GIS
-    // name is never changed; it is reported. Returns { outcome: 'fixed' | 'review' | 'unchanged', changed, message }.
+    // Fixes one flagged segment: the primary city the limits call for (outside every limit the primary is cleared and the postal city
+    // goes in as the alternate; if no postal city can be found the old primary is put back), then the blanks (name, cities) from the
+    // GIS, Google Maps or the address points as a Roads click does, then the street name (a name that differs from the GIS name is
+    // renamed to the GIS name, as the "Apply: Rename" button does).
+    // Returns { outcome: 'fixed' | 'review' | 'unchanged', changed, renamed, message }.
     async function areaFixSegment(t, places) {
         const id = t.id;
         const notes = [];
         let changed = false;
-        let review = false;
+        let renamed = false;
+        let cleared = false;
+        const before = ccAddressOf(id);
+        const originalPrimary = before ? before.primary : '';
 
         const analysis = await ccAnalyze(id, false);
         const primary = (analysis.proposals || []).find((p) => p.kind === 'primary');
@@ -4808,32 +4813,46 @@
             ccApply(id, primary);
             changed = true;
             notes.push(`${primary.label}.`);
-        } else if (primary && t.kind === 'badcity') {
-            // the only fix would be to clear the primary city: left for you
-            review = true;
-            notes.push(`${t.detail}. The fix would clear the primary city, so it is left for you.`);
+        } else if (primary && t.kind === 'badcity' && originalPrimary) {
+            ccApply(id, primary);
+            changed = true;
+            cleared = true;
+            notes.push(`Cleared the primary city ${originalPrimary} (it is outside every city and CDP limit).`);
         }
 
         const fill = await fillSegmentInfo(id, { continueOnMismatch: true });
-        if (/^Filled in/.test(fill.message)) {
+        const filledSomething = /^Filled in/.test(fill.message);
+        if (filledSomething) {
             changed = true;
             notes.push(fill.message);
         }
+
         if (fill.mismatch) {
-            review = true;
-            notes.push(mismatchText(fill.mismatch.mapped, fill.mismatch.gis));
+            ccApply(id, { kind: 'name', name: fill.mismatch.gis });
+            changed = true;
+            renamed = true;
+            notes.push(`Renamed "${fill.mismatch.mapped}" to "${fill.mismatch.gis}" (GIS).`);
         }
         if (changed) cityCheckCache.clear();
 
-        const segment = sdk.DataModel.Segments.getById({ segmentId: id });
-        const after = segment ? evaluateSegmentInfo(segment, places) : null;
-        if (after) {
-            review = true;
-            notes.push(`Still flagged (${after.detail}). ${/^Filled in/.test(fill.message) ? '' : fill.message}`.trim());
+        let segment = sdk.DataModel.Segments.getById({ segmentId: id });
+        let after = segment ? evaluateSegmentInfo(segment, places) : null;
+
+        // the primary was cleared but no city took its place: a segment with no city at all is worse, so put it back
+        if (cleared && after && (after.kind === 'city' || after.kind === 'none')) {
+            ccApply(id, { kind: 'primary', city: originalPrimary });
+            cityCheckCache.clear();
+            notes.push(`No postal city was found to take its place, so ${originalPrimary} was put back.`);
+            segment = sdk.DataModel.Segments.getById({ segmentId: id });
+            after = segment ? evaluateSegmentInfo(segment, places) : null;
         }
-        if (review) return { outcome: 'review', changed, message: notes.join(' ') };
-        if (changed) return { outcome: 'fixed', changed, message: notes.join(' ') };
-        return { outcome: 'unchanged', changed: false, message: fill.message };
+
+        if (after) {
+            notes.push(`Still flagged (${after.detail}). ${filledSomething ? '' : fill.message}`.trim());
+            return { outcome: 'review', changed, renamed, message: notes.join(' ') };
+        }
+        if (changed) return { outcome: 'fixed', changed, renamed, message: notes.join(' ') };
+        return { outcome: 'unchanged', changed: false, renamed: false, message: fill.message };
     }
 
     // Counts the flagged segments in the outline (changes nothing).
@@ -4929,6 +4948,10 @@
                         }
                     }
                     const label = t.name || 'Unnamed road';
+                    if (result.renamed) {
+                        run.renamed++;
+                        console.log(`[${SCRIPT_NAME}] Area fix: ${result.message}`);
+                    }
                     if (result.outcome === 'fixed') {
                         run.fixed++;
                         t.draw = 'ok';
@@ -5188,7 +5211,7 @@
             const flaggedCount = area.fix.counts ? ` (${area.fix.counts.total})` : '';
             rowOf('Existing segments', [
                 areaButton('Check flagged', areaRunCheck, { title: 'Counts the segments in the outline that the scan flags (no name, no city, primary city outside the limits). Changes nothing.' }),
-                areaButton(`Fix flagged${flaggedCount}`, areaRunFix, { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in the missing street names and cities and corrects primary cities, as the clicks do. A name that differs from the GIS is listed, not changed. Saves every 25.' }),
+                areaButton(`Fix flagged${flaggedCount}`, areaRunFix, { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in missing street names and cities, corrects primary cities (outside every limit it clears the primary and uses the postal city as the alternate) and renames a street to the GIS name when it differs. Saves every 25.' }),
                 areaButton('House numbers', areaRunHouses, { disabled: !!(area.source && !area.source.houseNumbers), title: 'Adds the missing house numbers to the roads inside the outline (roads must be saved first).' })
             ]);
             rowOf('', [areaButton('Redraw', areaStartDrawing), areaButton('Clear', areaClear)]);
