@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101205
+// @version      2026101206
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4917,8 +4917,9 @@
         let failedHard = false;
         let limitHit = false;
         let errorsInRow = 0;
+        let places = null;
         try {
-            const places = await areaPlaces();
+            places = await areaPlaces();
             const handled = new Set();
             await areaSweep(run, async (view) => {
                 for (const t of areaFlaggedInView(view, places, handled)) {
@@ -4983,6 +4984,18 @@
             failedHard = true;
         }
         run.running = false;
+        // fixed segments lose their mark (the green is only for while the run is going); a mark stays only on a segment that is still flagged
+        area.fix.items = area.fix.items.filter((t) => {
+            if (t.draw === 'ok') return false;
+            try {
+                const seg = sdk.DataModel.Segments.getById({ segmentId: t.id });
+                return !!(seg && evaluateSegmentInfo(seg, places));
+            } catch (err) {
+                return false;
+            }
+        });
+        area.fix.counts = null;
+        gapSignature = ''; // forces the scan to redraw its highlights from the segments as they are now
         scheduleGapScan(300);
         if (failedHard) areaFinishRun(run, 'error', run.stopReason);
         else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
