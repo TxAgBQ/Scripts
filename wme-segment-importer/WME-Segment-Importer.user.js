@@ -2,8 +2,8 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101203
-// @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run, adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
+// @version      2026101204
+// @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
 // @match        https://www.google.com/maps
@@ -1804,7 +1804,7 @@
 
         const hint = document.createElement('div');
         hint.style.cssText = 'margin-top: 10px; font-size: 11px; color: #5f6368; line-height: 1.35;';
-        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere in Texas the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
+        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. The same outline can also fix the existing segments the scan flags: Check flagged counts them, Fix flagged fills in names and cities and corrects primary cities (a name that differs from the GIS is listed for you, never changed). A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere in Texas the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
         wrap.appendChild(hint);
 
         tabPane.appendChild(wrap);
@@ -3782,7 +3782,8 @@
         };
     }
 
-    async function fillSegmentInfo(segmentId) {
+    // opts.continueOnMismatch: when the mapped name differs from the GIS name, fill in the cities anyway (the name is left alone) and report it in `mismatch`.
+    async function fillSegmentInfo(segmentId, opts = {}) {
         const segment = sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) return { message: 'Segment not found.', warn: true };
         const coords = segment.geometry.coordinates;
@@ -3803,7 +3804,9 @@
         const gisName = match ? buildStreetName(source.nameParts(props)).name : '';
         const googleName = useGoogle ? buildStreetName({ full: google.rec.name }).name : '';
 
-        if (currentName && gisName && normalizeName(currentName) !== normalizeName(gisName) && !keptNames.has(keptKey(segmentId, gisName))) {
+        const nameClash = !!(currentName && gisName && normalizeName(currentName) !== normalizeName(gisName) && !keptNames.has(keptKey(segmentId, gisName)));
+        const mismatchInfo = nameClash && opts.continueOnMismatch ? { mapped: currentName, gis: gisName } : null;
+        if (nameClash && !mismatchInfo) {
             const rerun = async () => {
                 cityCheckCache.clear();
                 const again = await fillSegmentInfo(segmentId);
@@ -3909,7 +3912,7 @@
         }
 
         if (!filled.length) {
-            return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match };
+            return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match, mismatch: mismatchInfo };
         }
 
         const { country, state } = regionOf(segmentId);
@@ -3932,7 +3935,7 @@
             : useGoogle
                 ? `from Google Maps (${googleNote}).`
                 : `with no GIS road along it${nameFromPoints ? `: the name came from the address points (${pointsInfo.summary})` : ''}.`;
-        return { message: `Filled in ${filled.join(', ')} ${origin}${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, match };
+        return { message: `Filled in ${filled.join(', ')} ${origin}${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, match, mismatch: mismatchInfo };
     }
 
     // Click handler step: fill in the clicked road's missing info and show the result.
@@ -4061,6 +4064,9 @@
         run: null,           // the run in progress, or the last one
         panelOpen: false,
         nowIndex: -1,
+        nowCoords: null,     // the segment or road being worked on (drawn with a yellow halo)
+        roadsDone: false,    // the roads of this outline have been imported
+        fix: { items: [], counts: null },   // flagged existing segments (Check flagged / Fix flagged)
         message: { level: 'info', text: '' },
         lastClick: null
     };
@@ -4134,6 +4140,10 @@
                     { predicate: (p) => p.kind === 'outline', style: { strokeColor: COLOUR_ROADS, strokeWidth: 3, strokeOpacity: 0.95, strokeDashstyle: 'dash' } },
                     { predicate: (p) => p.kind === 'vertex', style: { pointRadius: 5, fillColor: COLOUR_ROADS, fillOpacity: 1, strokeColor: '#ffffff', strokeWidth: 2 } },
                     { predicate: (p) => p.kind === 'halo', style: { strokeColor: AREA_COLOURS.halo, strokeWidth: 16, strokeOpacity: 0.55, strokeLinecap: 'round' } },
+                    ...Object.entries(GAP_KINDS).map(([kind, k]) => ({
+                        predicate: (p) => p.kind === `gap-${kind}`,
+                        style: { strokeColor: k.colour, strokeWidth: 9, strokeOpacity: 0.65, strokeLinecap: 'round' }
+                    })),
                     ...Object.entries(AREA_COLOURS).filter(([k]) => k !== 'halo').map(([kind, colour]) => ({
                         predicate: (p) => p.kind === kind,
                         style: {
@@ -4170,8 +4180,11 @@
         area.roads.forEach((r, i) => {
             features.push({ type: 'Feature', id: `road-${i}`, geometry: { type: 'LineString', coordinates: r.coords }, properties: { kind: r.draw } });
         });
-        const now = area.roads[area.nowIndex];
-        if (now) features.push({ type: 'Feature', id: 'halo', geometry: { type: 'LineString', coordinates: now.coords }, properties: { kind: 'halo' } });
+        area.fix.items.forEach((t, i) => {
+            features.push({ type: 'Feature', id: `fix-${i}`, geometry: { type: 'LineString', coordinates: t.coords }, properties: { kind: t.draw } });
+        });
+        const nowCoords = area.nowCoords || (area.roads[area.nowIndex] && area.roads[area.nowIndex].coords);
+        if (nowCoords) features.push({ type: 'Feature', id: 'halo', geometry: { type: 'LineString', coordinates: nowCoords }, properties: { kind: 'halo' } });
         if (!features.length) return;
         try {
             sdk.Map.addFeaturesToLayer({ layerName: AREA.LAYER, features });
@@ -4397,6 +4410,7 @@
         if (area.points.length < 3 || area.phase === 'previewing' || area.phase === 'running') return;
         area.phase = 'previewing';
         area.roads = [];
+        area.roadsDone = false;
         area.nowIndex = -1;
         area.run = null;
         busy = true;
@@ -4483,7 +4497,7 @@
 
     // ----- runs -----
     function areaNewRun(kind, total) {
-        return { kind, paused: false, stop: false, total, done: 0, created: 0, extended: 0, skipped: 0, saves: 0, sinceSave: 0, needLook: [], startedAt: Date.now(), stopReason: '' };
+        return { kind, paused: false, stop: false, total, done: 0, created: 0, extended: 0, skipped: 0, saves: 0, sinceSave: 0, needLook: [], startedAt: Date.now(), stopReason: '', fixed: 0, unchanged: 0, found: 0, text: '' };
     }
 
     // Pause and stop are checked between roads; returns false when the run should end.
@@ -4511,15 +4525,21 @@
         const time = secs >= 90 ? `${Math.round(secs / 60)} min` : `${secs} s`;
         const what = run.kind === 'roads'
             ? `${run.created} roads imported, ${run.extended} stubs extended, ${run.skipped} skipped`
-            : `${run.done} roads checked for house numbers, ${run.created} got numbers`;
+            : run.kind === 'fix'
+                ? `${run.fixed} flagged segments fixed, ${run.unchanged} unchanged (${run.done} looked at)`
+                : run.kind === 'check'
+                    ? run.text
+                    : `${run.done} roads checked for house numbers, ${run.created} got numbers`;
         const saved = run.sinceSave > 0 ? ` ${run.sinceSave} change(s) since the last save are NOT saved.` : (run.saves ? ` Saved ${run.saves} time(s).` : '');
         const look = run.needLook.length ? ` ${run.needLook.length} need a look (listed below; the scan colours them on the map too).` : '';
         return `${ending} ${what} (${time}).${saved}${look}`;
     }
 
     function areaFinishRun(run, level, ending) {
-        area.phase = 'done';
+        // after roads: done. After anything else: back to where the outline was (so Go is still there when the roads are not imported yet)
+        area.phase = run.kind === 'roads' ? 'done' : area.roads.length ? (area.roadsDone ? 'done' : 'previewed') : 'ready';
         area.nowIndex = -1;
+        area.nowCoords = null;
         area.run = run;
         busy = false;
         areaRunning = false;
@@ -4604,6 +4624,7 @@
             failedHard = true;
         }
         run.running = false;
+        if (run.created || run.extended) area.roadsDone = true;
         if (failedHard) areaFinishRun(run, 'error', run.stopReason);
         else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
         else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
@@ -4631,8 +4652,16 @@
     }
 
     async function areaRunHouses() {
-        if (area.phase !== 'previewed' && area.phase !== 'done') return;
-        if (area.points.length < 3 || !area.source) return;
+        if (area.phase !== 'ready' && area.phase !== 'previewed' && area.phase !== 'done') return;
+        if (area.points.length < 3) return;
+        if (!area.source) {
+            const picked = await areaSourceFor(area.points);
+            if (picked.error) {
+                areaSetMessage('warn', picked.error);
+                return;
+            }
+            area.source = picked.source;
+        }
         if (!area.source.houseNumbers) {
             areaSetMessage('warn', `No address point layer is checked in WME GIS Layers for ${area.source.county || 'this'} County (or statewide), so there are no house numbers to add.`);
             return;
@@ -4718,6 +4747,226 @@
         else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
     }
 
+    // ----- existing segments the scan flags: Check flagged (counts them) and Fix flagged (fixes them) -----
+    async function areaPlaces() {
+        if (!gapSettings.cities) return null;
+        try {
+            return await loadCityBoundaries();
+        } catch (err) {
+            return null; // limits not available: only the missing name / city is checked, as in the scan
+        }
+    }
+
+    // Segments in this view whose midpoint is inside the outline and that the scan would flag (the scan's own rules).
+    function areaFlaggedInView(view, places, handled) {
+        const found = [];
+        for (const segment of sdk.DataModel.Segments.getAll()) {
+            if (handled.has(segment.id) || !isLiveSegment(segment) || !GAP_ROAD_TYPES.has(segment.roadType)) continue;
+            const c = segment.geometry && segment.geometry.coordinates;
+            if (!c || c.length < 2) continue;
+            const mid = pointAlongLine(c, 0.5);
+            if (!isOnScreen(mid, view) || !areaPointInRing(mid, area.points)) continue;
+            const hit = evaluateSegmentInfo(segment, places);
+            if (!hit) continue;
+            found.push({ ...hit, coords: c.map((p) => [p[0], p[1]]), mid, draw: `gap-${hit.kind}` });
+        }
+        return found;
+    }
+
+    // Moves the map across the outline, stop by stop, and calls handler(view) at each stop (WME only holds the segments in view).
+    // Returns false if the handler or the user ended it early.
+    async function areaSweep(run, handler) {
+        const box = areaBox(area.points);
+        areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
+        await areaWaitForData();
+        const centers = areaSweepCenters(box);
+        if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error('the outline is too big for one pass over the map');
+        run.stops = centers.length;
+        for (let s = 0; s < centers.length; s++) {
+            if (!(await areaGate())) return false;
+            run.stopAt = s + 1;
+            areaMoveTo(centers[s].lon, centers[s].lat);
+            await areaWaitForData();
+            renderAreaPanel();
+            if ((await handler(visibleBounds())) === false) return false;
+        }
+        return true;
+    }
+
+    // Fixes one flagged segment the way the clicks would: the primary city the limits call for (the right-click fix), then the
+    // blanks (name, cities) from the GIS, Google Maps or the address points (the Roads click). A name that differs from the GIS
+    // name is never changed; it is reported. Returns { outcome: 'fixed' | 'review' | 'unchanged', changed, message }.
+    async function areaFixSegment(t, places) {
+        const id = t.id;
+        const notes = [];
+        let changed = false;
+        let review = false;
+
+        const analysis = await ccAnalyze(id, false);
+        const primary = (analysis.proposals || []).find((p) => p.kind === 'primary');
+        if (primary && primary.city) {
+            ccApply(id, primary);
+            changed = true;
+            notes.push(`${primary.label}.`);
+        } else if (primary && t.kind === 'badcity') {
+            // the only fix would be to clear the primary city: left for you
+            review = true;
+            notes.push(`${t.detail}. The fix would clear the primary city, so it is left for you.`);
+        }
+
+        const fill = await fillSegmentInfo(id, { continueOnMismatch: true });
+        if (/^Filled in/.test(fill.message)) {
+            changed = true;
+            notes.push(fill.message);
+        }
+        if (fill.mismatch) {
+            review = true;
+            notes.push(mismatchText(fill.mismatch.mapped, fill.mismatch.gis));
+        }
+        if (changed) cityCheckCache.clear();
+
+        const segment = sdk.DataModel.Segments.getById({ segmentId: id });
+        const after = segment ? evaluateSegmentInfo(segment, places) : null;
+        if (after) {
+            review = true;
+            notes.push(`Still flagged (${after.detail}). ${/^Filled in/.test(fill.message) ? '' : fill.message}`.trim());
+        }
+        if (review) return { outcome: 'review', changed, message: notes.join(' ') };
+        if (changed) return { outcome: 'fixed', changed, message: notes.join(' ') };
+        return { outcome: 'unchanged', changed: false, message: fill.message };
+    }
+
+    // Counts the flagged segments in the outline (changes nothing).
+    async function areaRunCheck() {
+        if (area.points.length < 3 || !['ready', 'previewed', 'done'].includes(area.phase)) return;
+        const run = areaNewRun('check', 0);
+        run.running = true;
+        area.run = run;
+        area.phase = 'running';
+        areaRunning = true;
+        busy = true;
+        area.fix = { items: [], counts: null };
+        areaSetMessage('info', 'Looking for flagged segments across the outline...');
+        let failedHard = false;
+        try {
+            const places = await areaPlaces();
+            const handled = new Set();
+            await areaSweep(run, async (view) => {
+                for (const t of areaFlaggedInView(view, places, handled)) {
+                    handled.add(t.id);
+                    area.fix.items.push(t);
+                    run.found++;
+                }
+                drawAreaLayer();
+            });
+            const byKind = {};
+            area.fix.items.forEach((t) => { byKind[t.kind] = (byKind[t.kind] || 0) + 1; });
+            area.fix.counts = { total: area.fix.items.length, byKind };
+            const parts = Object.entries(byKind).map(([k, n]) => `${n} ${GAP_KINDS[k].label}`);
+            run.text = area.fix.items.length
+                ? `${area.fix.items.length} flagged segments (${parts.join('; ')})`
+                : 'No segments in the outline are flagged';
+            if (area.fix.items.length > AREA.MAX_ROADS) run.text += `; that is more than the limit of ${AREA.MAX_ROADS} per run, so Fix flagged takes them in parts`;
+            run.needLook = [];
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Check flagged failed:`, err);
+            run.stop = true;
+            run.stopReason = `Stopped: ${err.message || err}`;
+            failedHard = true;
+        }
+        run.running = false;
+        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
+        else areaFinishRun(run, area.fix.items.length ? 'warn' : 'ok', 'Done.');
+    }
+
+    // Fixes the flagged segments in the outline, one at a time, saving every 25 changes (same rules as the road import).
+    async function areaRunFix() {
+        if (area.points.length < 3 || !['ready', 'previewed', 'done'].includes(area.phase)) return;
+        if (areaHasPending()) {
+            areaSetMessage('warn', 'WME has unsaved edits. Save them first, so the saves during this run only hold the fixes.');
+            return;
+        }
+        const run = areaNewRun('fix', 0);
+        run.running = true;
+        area.run = run;
+        area.phase = 'running';
+        areaRunning = true;
+        busy = true;
+        area.fix = { items: [], counts: null };
+        areaSetMessage('info', 'Fixing the flagged segments...');
+        let failedHard = false;
+        let limitHit = false;
+        let errorsInRow = 0;
+        try {
+            const places = await areaPlaces();
+            const handled = new Set();
+            await areaSweep(run, async (view) => {
+                for (const t of areaFlaggedInView(view, places, handled)) {
+                    if (!(await areaGate())) return false;
+                    if (run.done >= AREA.MAX_ROADS) {
+                        limitHit = true;
+                        return false;
+                    }
+                    handled.add(t.id);
+                    run.done++;
+                    area.fix.items.push(t);
+                    area.nowCoords = t.coords;
+                    drawAreaLayer();
+                    renderAreaPanel();
+                    let result;
+                    try {
+                        result = await areaFixSegment(t, places);
+                        errorsInRow = 0;
+                    } catch (err) {
+                        console.warn(`[${SCRIPT_NAME}] Area fix failed:`, err);
+                        errorsInRow++;
+                        result = { outcome: 'failed', changed: false, message: `${err.message || err}` };
+                        if (errorsInRow >= 3) {
+                            failedHard = true;
+                            run.stop = true;
+                            run.stopReason = `Stopped after 3 errors in a row. The last one: ${err.message || err}`;
+                        }
+                    }
+                    const label = t.name || 'Unnamed road';
+                    if (result.outcome === 'fixed') {
+                        run.fixed++;
+                        t.draw = 'ok';
+                    } else if (result.outcome === 'review') {
+                        t.draw = 'warn';
+                        run.needLook.push({ name: label, message: result.message, level: 'warn', at: t.mid });
+                    } else if (result.outcome === 'failed') {
+                        t.draw = 'fail';
+                        run.needLook.push({ name: label, message: `Error: ${result.message}`, level: 'error', at: t.mid });
+                    } else {
+                        run.unchanged++;
+                        t.draw = 'skip';
+                        run.needLook.push({ name: label, message: `Nothing could be done. ${result.message}`, level: 'warn', at: t.mid });
+                    }
+                    if (failedHard) return false;
+                    if (result.changed && areaHasPending() && ++run.sinceSave >= AREA.SAVE_EVERY && !(await areaPeriodicSave(run))) {
+                        failedHard = true;
+                        return false;
+                    }
+                    await sleep(AREA.PACE_MS);
+                }
+                return true;
+            });
+            if (!run.stop && !failedHard && !(await areaPeriodicSave(run))) failedHard = true;
+        } catch (err) {
+            console.error(`[${SCRIPT_NAME}] Area fix crashed:`, err);
+            run.stop = true;
+            run.stopReason = `Stopped: ${err.message || err}`;
+            failedHard = true;
+        }
+        run.running = false;
+        scheduleGapScan(300);
+        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
+        else if (limitHit) areaFinishRun(run, 'warn', `Reached the limit of ${AREA.MAX_ROADS} segments for one run, so the rest are still flagged: run Fix flagged again.`);
+        else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
+    }
+
     // ----- drawing the outline -----
     function areaStartDrawing() {
         if (area.phase === 'running' || area.phase === 'previewing') return;
@@ -4727,6 +4976,9 @@
         area.roads = [];
         area.run = null;
         area.nowIndex = -1;
+        area.nowCoords = null;
+        area.roadsDone = false;
+        area.fix = { items: [], counts: null };
         area.lastClick = null;
         areaSetMessage('info', 'Click the corners of the area on the map. Double-click the last corner (or press Finish) to close the outline. Escape cancels.');
         drawAreaLayer();
@@ -4756,6 +5008,9 @@
         area.run = null;
         area.source = null;
         area.nowIndex = -1;
+        area.nowCoords = null;
+        area.roadsDone = false;
+        area.fix = { items: [], counts: null };
         area.message = { level: 'info', text: '' };
         drawAreaLayer();
         applyToggleState();
@@ -4889,48 +5144,60 @@
         if (area.phase === 'running' && area.run) {
             const run = area.run;
             const total = run.kind === 'roads' ? run.total : 0;
+            const stopText = `Map stop ${run.stopAt || 0} of ${run.stops || '?'}.`;
             const line = run.kind === 'roads'
                 ? `${run.done} of ${total} roads. ${run.created} imported, ${run.extended} extended, ${run.skipped} skipped, ${run.saves} saves.`
-                : `Map stop ${run.stopAt || 0} of ${run.stops || '?'}. ${run.done} roads checked, ${run.created} got numbers, ${run.saves} saves.`;
+                : run.kind === 'fix'
+                    ? `${stopText} ${run.done} flagged segments looked at, ${run.fixed} fixed, ${run.needLook.length} to review, ${run.saves} saves.`
+                    : run.kind === 'check'
+                        ? `${stopText} ${run.found} flagged so far.`
+                        : `${stopText} ${run.done} roads checked, ${run.created} got numbers, ${run.saves} saves.`;
             const bar = areaEl('div', 'height: 8px; background: #e8eaed; border-radius: 4px; overflow: hidden; margin-bottom: 4px;');
             const frac = run.kind === 'roads' ? (total ? run.done / total : 0) : (run.stops ? (run.stopAt || 0) / run.stops : 0);
             bar.appendChild(areaEl('div', `height: 100%; width: ${Math.round(Math.min(1, frac) * 100)}%; background: ${COLOUR_ROADS};`));
             areaPanel.append(bar, areaEl('div', 'font-size: 11px; color: #5f6368; margin-bottom: 8px;', `${line}${run.paused ? ' PAUSED.' : ''}${run.stop ? ' Stopping...' : ''}`));
         }
 
-        const row = areaEl('div', 'display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;');
         const phase = area.phase;
         const c = areaCounts();
+        const rowOf = (label, buttons) => {
+            const group = areaEl('div', 'margin-bottom: 6px;');
+            if (label) group.appendChild(areaEl('div', 'font-size: 11px; font-weight: bold; color: #5f6368; margin-bottom: 3px;', label));
+            const r = areaEl('div', 'display: flex; flex-wrap: wrap; gap: 6px;');
+            r.append(...buttons);
+            group.appendChild(r);
+            areaPanel.appendChild(group);
+        };
         if (phase === 'idle') {
-            row.appendChild(areaButton('Draw outline', areaStartDrawing, { primary: true }));
+            rowOf('', [areaButton('Draw outline', areaStartDrawing, { primary: true })]);
         } else if (phase === 'drawing') {
-            row.append(
+            rowOf('', [
                 areaButton('Finish', areaFinishDrawing, { primary: true, disabled: area.points.length < 3 }),
                 areaButton('Undo point', () => { area.points.pop(); drawAreaLayer(); renderAreaPanel(); }, { disabled: !area.points.length }),
                 areaButton('Cancel', areaClear)
-            );
-        } else if (phase === 'ready') {
-            row.append(areaButton('Preview', areaPreview, { primary: true }), areaButton('Redraw', areaStartDrawing), areaButton('Clear', areaClear));
+            ]);
         } else if (phase === 'previewing') {
-            row.appendChild(areaButton('Cancel', () => { area.phase = 'ready'; renderAreaPanel(); }));
-        } else if (phase === 'previewed' || phase === 'done') {
+            rowOf('', [areaButton('Cancel', () => { area.phase = 'ready'; renderAreaPanel(); })]);
+        } else if (phase === 'ready' || phase === 'previewed' || phase === 'done') {
             const tooMany = c.todo > AREA.MAX_ROADS;
+            const roadButtons = [areaButton(phase === 'ready' ? 'Preview roads' : 'Preview again', areaPreview, { primary: phase === 'ready' })];
             if (phase === 'previewed') {
-                row.appendChild(areaButton(`Go: import ${c.todo} roads`, areaRunRoads, { primary: true, disabled: !c.todo || tooMany, title: 'Imports one road at a time, saving every 25. Escape stops.' }));
+                roadButtons.push(areaButton(`Go: import ${c.todo} roads`, areaRunRoads, { primary: true, disabled: !c.todo || tooMany, title: 'Imports one road at a time, saving every 25. Escape stops.' }));
             }
-            row.append(
-                areaButton('House numbers', areaRunHouses, { disabled: !!(area.source && !area.source.houseNumbers), title: 'Second run, after the roads are saved: adds the missing house numbers to the roads inside the outline.' }),
-                areaButton('Preview again', areaPreview),
-                areaButton('Redraw', areaStartDrawing),
-                areaButton('Clear', areaClear)
-            );
+            rowOf('New roads', roadButtons);
+            const flaggedCount = area.fix.counts ? ` (${area.fix.counts.total})` : '';
+            rowOf('Existing segments', [
+                areaButton('Check flagged', areaRunCheck, { title: 'Counts the segments in the outline that the scan flags (no name, no city, primary city outside the limits). Changes nothing.' }),
+                areaButton(`Fix flagged${flaggedCount}`, areaRunFix, { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in the missing street names and cities and corrects primary cities, as the clicks do. A name that differs from the GIS is listed, not changed. Saves every 25.' }),
+                areaButton('House numbers', areaRunHouses, { disabled: !!(area.source && !area.source.houseNumbers), title: 'Adds the missing house numbers to the roads inside the outline (roads must be saved first).' })
+            ]);
+            rowOf('', [areaButton('Redraw', areaStartDrawing), areaButton('Clear', areaClear)]);
         } else if (phase === 'running' && area.run) {
-            row.append(
+            rowOf('', [
                 areaButton(area.run.paused ? 'Resume' : 'Pause', () => { area.run.paused = !area.run.paused; renderAreaPanel(); }, { primary: true, disabled: area.run.stop }),
-                areaButton('Stop', () => { area.run.stop = true; renderAreaPanel(); }, { danger: true, disabled: area.run.stop, title: 'Finishes the road in progress, then stops (Escape does the same). Nothing is saved on stop.' })
-            );
+                areaButton('Stop', () => { area.run.stop = true; renderAreaPanel(); }, { danger: true, disabled: area.run.stop, title: 'Finishes the item in progress, then stops (Escape does the same). Nothing is saved on stop.' })
+            ]);
         }
-        areaPanel.appendChild(row);
 
         if (phase === 'previewed') {
             const legend = areaEl('div', 'font-size: 11px; color: #5f6368; line-height: 1.6;');
