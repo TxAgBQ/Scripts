@@ -50,7 +50,7 @@
     // The map pin matches the list icon. Edit the colors here to taste.
     const COLORS = {
         waze: { fill: '#66C3F3', edge: '#2B7BB0' },
-        google: { bands: ['#7E57C2', '#FF9800', '#26A69A'], edge: '#4A3A6B' }
+        google: { bands: ['#EA4335', '#FBBC04', '#34A853'], edge: '#4A3A6B' }
     };
     const GOOGLE_RING_COLOR = '#FF9800'; // only used if the pin graphic can't load
     const DEBUG = true; // logs picks to the console; set to false once it works for you
