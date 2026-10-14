@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME LiveMap Search
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.03
+// @version      2026.10.14.04
 // @description  Adds Waze LiveMap place results (Waze vs Google marked) to the WME search box, ranked by match quality, and centers/zooms the map with a pin on the one you pick.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-livemap-search
@@ -40,12 +40,12 @@
     const PIN_LAYER = 'wme-livemap-search-pin';
     const PIN_IGNORE_SELECTION_MS = 700; // ignore selection changes right after a pick
 
-    // Waze = blue, solid-dot pin. Google = green, ring pin. Map pin = red.
+    // Waze = #0099FF solid-dot pin. Google = green ring pin. The map pin matches the list icon.
     const COLORS = {
-        waze: ['#1E88E5', '#0D47A1'],
-        google: ['#43A047', '#1B5E20'],
-        pin: ['#E53935', '#8E1B1B']
+        waze: ['#0099FF', '#0066B3'],
+        google: ['#43A047', '#1B5E20']
     };
+    const DEBUG = true; // logs each pick to the console; set to false once it works for you
 
     const doc = unsafeWindow.document;
     const hooked = new WeakSet();
@@ -83,8 +83,8 @@
     const ICONS = {
         waze: pinSvg(COLORS.waze, false, true),
         google: pinSvg(COLORS.google, true, true),
-        mapWaze: pinSvg(COLORS.pin, false, false),
-        mapGoogle: pinSvg(COLORS.pin, true, false)
+        mapWaze: pinSvg(COLORS.waze, false, false),
+        mapGoogle: pinSvg(COLORS.google, true, false)
     };
 
     // The page's security policy may block data: images. Test once; fall back to text if so.
@@ -272,18 +272,18 @@
                 styleRules: [
                     {
                         predicate: p => !!p && p.src === 'google',
-                        // fallback if the pin graphic can't load: an open red ring
+                        // fallback if the pin graphic can't load: an open green ring
                         style: Object.assign({
-                            pointRadius: 12, fillColor: COLORS.pin[0], fillOpacity: 0,
-                            strokeColor: COLORS.pin[0], strokeWidth: 4
+                            pointRadius: 12, fillColor: COLORS.google[0], fillOpacity: 0,
+                            strokeColor: COLORS.google[0], strokeWidth: 4
                         }, gfx(ICONS.mapGoogle))
                     },
                     {
                         predicate: p => !!p && p.src === 'waze',
-                        // fallback: a solid red dot
+                        // fallback: a solid blue dot
                         style: Object.assign({
-                            pointRadius: 10, fillColor: COLORS.pin[0], fillOpacity: 0.9,
-                            strokeColor: COLORS.pin[1], strokeWidth: 2
+                            pointRadius: 10, fillColor: COLORS.waze[0], fillOpacity: 0.9,
+                            strokeColor: COLORS.waze[1], strokeWidth: 2
                         }, gfx(ICONS.mapWaze))
                     }
                 ]
@@ -297,8 +297,9 @@
 
     function showPin(lat, lng, src) {
         if (!sdk || !ensurePinLayer()) return;
+        // clearing may fail (e.g. on an empty layer); that must not stop the draw
+        try { sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER }); } catch (e) { /* ignore */ }
         try {
-            sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER });
             sdk.Map.addFeatureToLayer({
                 layerName: PIN_LAYER,
                 feature: {
@@ -310,6 +311,7 @@
             });
             pinShown = true;
             pinAddedAt = Date.now();
+            if (DEBUG) console.log(LOG, 'pin drawn', src, lat, lng);
         } catch (err) {
             warnOnce('pindraw', 'Could not draw the map pin.', err);
         }
@@ -366,6 +368,7 @@
         const d = e && e.detail;
         const p = d && picks.get(d.id);
         if (!p) return;
+        if (DEBUG) console.log(LOG, 'picked', p.src, 'icons ok:', iconsOk, 'pin layer ready:', pinLayerReady);
         goTo(p.lat, p.lng);
         showPin(p.lat, p.lng, p.src);
     }
