@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Search Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.06
+// @version      2026.10.14.07
 // @description  Improves the WME search box: LiveMap-style place results (Waze vs Google marked, ranked by match), a pin on the map, and paste one or more segment IDs to select them.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-search-assist
