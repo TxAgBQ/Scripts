@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         WME Profile Edit Stats
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.01
+// @version      2026.10.14.02
 // @description  Editor profile page: adds Avg/Tot edits under each week column of Editing Activity, plus an Editing Stats section with per-week breakdowns.
 // @author       TxAgBQ (original idea: JustinS83)
 // @match        https://www.waze.com/*user/editor*
 // @match        https://beta.waze.com/*user/editor*
+// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-Profile-Edit-Stats/WME-Profile-Edit-Stats.user.js
+// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-Profile-Edit-Stats/WME-Profile-Edit-Stats.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
