@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         WME Profile Edit Stats
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.02
+// @version      2026.10.14.05
 // @description  Editor profile page: adds Avg/Tot edits under each week column of Editing Activity, plus an Editing Stats section with per-week breakdowns.
-// @author       TxAgBQ (original idea: JustinS83)
+// @author       TxAgBQ (original idea: JustinS83 but that one stopped working 2+ years ago)
 // @match        https://www.waze.com/*user/editor*
 // @match        https://beta.waze.com/*user/editor*
 // @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-Profile-Edit-Stats/WME-Profile-Edit-Stats.user.js
@@ -116,10 +116,36 @@
 
             const week = cols[c].querySelector('.week');
             if (!week) continue;
+            // Hover text for each day: date and edit count.
+            // A partial first column fills only its last cells (the earlier cells are blank).
+            const offset = (c !== cols.length - 1 && slice.length < 7) ? 7 - slice.length : 0;
+            Array.from(week.children).forEach((cell, j) => {
+                const idx = j - offset;
+                if (idx < 0 || idx >= slice.length) return;
+                const target = cell.querySelector('.day') || cell;
+                const label = fmt(slice[idx]);
+                target.title = label;
+                target.setAttribute('data-original-title', label);
+            });
+
             const total = sum(slice);
             week.appendChild(makeCell(String(round2(total / slice.length)),
                 `Average edits per day for this week (${slice.length} days)`, true));
             week.appendChild(makeCell(String(total), 'Total edits for this week', false));
+        }
+
+        fitGrid(weeksEl, legend);
+    }
+
+    // Keep all 14 week columns on one row (the last one was wrapping underneath the first).
+    function fitGrid(weeksEl, legend) {
+        weeksEl.style.flexWrap = 'nowrap';
+        weeksEl.style.whiteSpace = 'nowrap';
+        Array.from(weeksEl.children).forEach((c) => { c.style.flexShrink = '0'; });
+        const box = weeksEl.closest('.editing-activity');
+        if (box) {
+            const need = (legend ? legend.offsetWidth : 0) + weeksEl.scrollWidth + 40;
+            if (box.clientWidth < need) box.style.width = need + 'px';
         }
     }
 
