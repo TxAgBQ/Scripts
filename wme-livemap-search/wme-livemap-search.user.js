@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         WME LiveMap Search
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.01
-// @description  Adds Waze LiveMap place results to the WME search box, ranked by match quality, and centers/zooms the map on the one you pick.
+// @version      2026.10.14.03
+// @description  Adds Waze LiveMap place results (Waze vs Google marked) to the WME search box, ranked by match quality, and centers/zooms the map with a pin on the one you pick.
 // @author       TxAgBQ
+// @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-livemap-search
+// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/wme-livemap-search/wme-livemap-search.user.js
+// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/main/wme-livemap-search/wme-livemap-search.user.js
 // @match        https://www.waze.com/editor*
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/editor*
@@ -34,27 +37,78 @@
     const REQUEST_TIMEOUT_MS = 800;  // WME gives the search box ~1000 ms, so stay under it
     const CACHE_TTL_MS = 120000;
     const SEARCH_SELECTOR = '#search-autocomplete';
+    const PIN_LAYER = 'wme-livemap-search-pin';
+    const PIN_IGNORE_SELECTION_MS = 700; // ignore selection changes right after a pick
+
+    // Waze = blue, solid-dot pin. Google = green, ring pin. Map pin = red.
+    const COLORS = {
+        waze: ['#1E88E5', '#0D47A1'],
+        google: ['#43A047', '#1B5E20'],
+        pin: ['#E53935', '#8E1B1B']
+    };
 
     const doc = unsafeWindow.document;
     const hooked = new WeakSet();
-    const picks = new Map();   // our item id -> { lat, lng }
+    const picks = new Map();   // our item id -> { lat, lng, src }
     const cache = new Map();   // query key -> { t, rows }
+    const warnedKeys = new Set();
     let sdk = null;
     let inflight = null;
-    let warned = false;
+    let iconsOk = false;       // true once a data: image is proven to load on this page
+    let pinLayerReady = false;
+    let pinShown = false;
+    let pinAddedAt = 0;
 
-    function warnOnce(...args) {
-        if (warned) return;
-        warned = true;
+    function warnOnce(key, ...args) {
+        if (warnedKeys.has(key)) return;
+        warnedKeys.add(key);
         console.warn(LOG, ...args);
+    }
+
+    // ---------- pin icons ----------
+    // square = padded to a square for the dropdown; otherwise tight pin for the map
+    function pinSvg(colors, ring, square) {
+        const body =
+            '<path d="M12 0C5.4 0 0 5.3 0 11.8 0 20.5 12 32 12 32s12-11.5 12-20.2C24 5.3 18.6 0 12 0z" ' +
+            'fill="' + colors[0] + '" stroke="' + colors[1] + '" stroke-width="1"/>' +
+            (ring
+                ? '<circle cx="12" cy="11.8" r="4.8" fill="none" stroke="#fff" stroke-width="2.4"/>'
+                : '<circle cx="12" cy="11.8" r="4.6" fill="#fff"/>');
+        const svg = square
+            ? '<svg xmlns="http://www.w3.org/2000/svg" width="34" height="34" viewBox="-5 -1 34 34">' + body + '</svg>'
+            : '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="34" viewBox="-1 -1 26 34">' + body + '</svg>';
+        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    }
+
+    const ICONS = {
+        waze: pinSvg(COLORS.waze, false, true),
+        google: pinSvg(COLORS.google, true, true),
+        mapWaze: pinSvg(COLORS.pin, false, false),
+        mapGoogle: pinSvg(COLORS.pin, true, false)
+    };
+
+    // The page's security policy may block data: images. Test once; fall back to text if so.
+    function probeIcons() {
+        try {
+            const img = doc.createElement('img');
+            img.onload = () => { iconsOk = true; };
+            img.onerror = () => { iconsOk = false; };
+            img.src = ICONS.waze;
+        } catch (e) {
+            iconsOk = false;
+        }
+    }
+
+    function sourceOf(venueId) {
+        return String(venueId).startsWith('googlePlaces.') ? 'google' : 'waze';
     }
 
     // ---------- text matching ----------
     function norm(s) {
         return String(s || '')
             .toLowerCase()
-            .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-            .replace(/['\u2019]/g, '')
+            .normalize('NFD').replace(/[̀-ͯ]/g, '')
+            .replace(/['’]/g, '')
             .replace(/[^a-z0-9]+/g, ' ')
             .trim();
     }
@@ -120,18 +174,18 @@
                 headers: { Accept: 'application/json' },
                 onload: r => {
                     if (r.status !== 200) {
-                        warnOnce('LiveMap returned HTTP ' + r.status + '; showing WME results only.');
+                        warnOnce('http', 'LiveMap returned HTTP ' + r.status + '; showing WME results only.');
                         return resolve([]);
                     }
                     try {
                         const data = JSON.parse(r.responseText);
                         resolve(Array.isArray(data) ? data : []);
                     } catch (e) {
-                        warnOnce('Unexpected LiveMap response; showing WME results only.');
+                        warnOnce('parse', 'Unexpected LiveMap response; showing WME results only.');
                         resolve([]);
                     }
                 },
-                onerror: () => { warnOnce('LiveMap request failed.'); resolve([]); },
+                onerror: () => { warnOnce('net', 'LiveMap request failed.'); resolve([]); },
                 ontimeout: () => resolve([]),
                 onabort: () => resolve([])
             });
@@ -182,19 +236,19 @@
         lmRows.forEach((r, i) => {
             const km = distanceKm(center, r);
             const id = 'wls:' + r.id;
-            picks.set(id, { lat: r.lat, lng: r.lng });
+            const src = sourceOf(r.id);
+            picks.set(id, { lat: r.lat, lng: r.lng, src });
             if (picks.size > 300) picks.delete(picks.keys().next().value);
-            out.push({
-                item: {
-                    id,
-                    text: r.name,
-                    secondaryText: (r.address ? r.address + ' \u00b7 ' : '') + distanceText(km, miles)
-                },
-                tier: matchTier(r.name, q, tokens),
-                ours: true,
-                dist: km,
-                i
-            });
+
+            const prefix = iconsOk ? '' : (src === 'google' ? '○ Google · ' : '● Waze · ');
+            const item = {
+                id,
+                text: r.name,
+                secondaryText: prefix + (r.address ? r.address + ' · ' : '') + distanceText(km, miles)
+            };
+            if (iconsOk) item.imagePath = ICONS[src];
+
+            out.push({ item, tier: matchTier(r.name, q, tokens), ours: true, dist: km, i });
         });
 
         out.sort((a, b) =>
@@ -203,6 +257,70 @@
             (a.ours ? a.dist - b.dist : a.i - b.i));
 
         return out.slice(0, MAX_TOTAL_RESULTS).map(r => r.item);
+    }
+
+    // ---------- map pin (SDK layer) ----------
+    function ensurePinLayer() {
+        if (pinLayerReady) return true;
+        const gfx = src => iconsOk
+            ? { externalGraphic: src, graphicWidth: 26, graphicHeight: 34, graphicXOffset: -13, graphicYOffset: -33 }
+            : {};
+        try {
+            try { sdk.Map.removeLayer({ layerName: PIN_LAYER }); } catch (e) { /* not there yet */ }
+            sdk.Map.addLayer({
+                layerName: PIN_LAYER,
+                styleRules: [
+                    {
+                        predicate: p => !!p && p.src === 'google',
+                        // fallback if the pin graphic can't load: an open red ring
+                        style: Object.assign({
+                            pointRadius: 12, fillColor: COLORS.pin[0], fillOpacity: 0,
+                            strokeColor: COLORS.pin[0], strokeWidth: 4
+                        }, gfx(ICONS.mapGoogle))
+                    },
+                    {
+                        predicate: p => !!p && p.src === 'waze',
+                        // fallback: a solid red dot
+                        style: Object.assign({
+                            pointRadius: 10, fillColor: COLORS.pin[0], fillOpacity: 0.9,
+                            strokeColor: COLORS.pin[1], strokeWidth: 2
+                        }, gfx(ICONS.mapWaze))
+                    }
+                ]
+            });
+            pinLayerReady = true;
+        } catch (err) {
+            warnOnce('pinlayer', 'Could not create the map pin layer.', err);
+        }
+        return pinLayerReady;
+    }
+
+    function showPin(lat, lng, src) {
+        if (!sdk || !ensurePinLayer()) return;
+        try {
+            sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER });
+            sdk.Map.addFeatureToLayer({
+                layerName: PIN_LAYER,
+                feature: {
+                    type: 'Feature',
+                    id: 'wls-pin',
+                    geometry: { type: 'Point', coordinates: [lng, lat] },
+                    properties: { src }
+                }
+            });
+            pinShown = true;
+            pinAddedAt = Date.now();
+        } catch (err) {
+            warnOnce('pindraw', 'Could not draw the map pin.', err);
+        }
+    }
+
+    function clearPin() {
+        if (!pinShown) return;
+        pinShown = false;
+        try {
+            sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER });
+        } catch (e) { /* ignore */ }
     }
 
     // ---------- hook into the WME search box ----------
@@ -223,7 +341,7 @@
                 if (!lmRows.length) return nativeItems;
                 return buildRows(Array.isArray(nativeItems) ? nativeItems : [], lmRows, q, center);
             } catch (err) {
-                warnOnce('Search merge failed; showing WME results only.', err);
+                warnOnce('merge', 'Search merge failed; showing WME results only.', err);
                 return await nativeP;
             }
         };
@@ -247,18 +365,19 @@
     function onItemSelected(e) {
         const d = e && e.detail;
         const p = d && picks.get(d.id);
-        if (p) goTo(p.lat, p.lng);
+        if (!p) return;
+        goTo(p.lat, p.lng);
+        showPin(p.lat, p.lng, p.src);
     }
 
     function hook(el) {
         const proto = Object.getPrototypeOf(el);
         const d = Object.getOwnPropertyDescriptor(proto, 'getItems');
+        hooked.add(el);
         if (!d || !d.get || !d.set) {
-            warnOnce('Search box layout changed (no getItems accessor); LiveMap results disabled.');
-            hooked.add(el);
+            warnOnce('layout', 'Search box layout changed (no getItems accessor); LiveMap results disabled.');
             return;
         }
-        hooked.add(el);
         Object.defineProperty(el, 'getItems', {
             configurable: true,
             enumerable: true,
@@ -290,6 +409,7 @@
     }
 
     async function init() {
+        probeIcons();
         const ok = await waitFor(() => unsafeWindow.SDK_INITIALIZED && unsafeWindow.getWmeSdk, 250, 240);
         if (!ok) {
             console.error(LOG, 'WME SDK not found.');
@@ -300,6 +420,22 @@
         try {
             if (!sdk.State.isReady) await sdk.Events.once({ eventName: 'wme-ready' });
         } catch (e) { /* continue anyway */ }
+
+        // The pin stays until you select something else or press Esc.
+        try {
+            sdk.Events.on({
+                eventName: 'wme-selection-changed',
+                eventHandler: () => {
+                    if (Date.now() - pinAddedAt > PIN_IGNORE_SELECTION_MS) clearPin();
+                }
+            });
+        } catch (e) {
+            warnOnce('selevent', 'Selection event unavailable; pin clears with Esc only.', e);
+        }
+        doc.addEventListener('keydown', e => {
+            if (e.key === 'Escape') clearPin();
+        }, true);
+
         attach();
         setInterval(attach, 2000);
         console.log(LOG, 'ready');
