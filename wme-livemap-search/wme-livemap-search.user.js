@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME LiveMap Search
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.04
+// @version      2026.10.14.05
 // @description  Adds Waze LiveMap place results (Waze vs Google marked) to the WME search box, ranked by match quality, and centers/zooms the map with a pin on the one you pick.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-livemap-search
@@ -40,11 +40,13 @@
     const PIN_LAYER = 'wme-livemap-search-pin';
     const PIN_IGNORE_SELECTION_MS = 700; // ignore selection changes right after a pick
 
-    // Waze = #0099FF solid-dot pin. Google = green ring pin. The map pin matches the list icon.
+    // Waze = light-blue solid-dot pin. Google = three-band ring pin. The map pin matches the list icon.
+    // Edit the colors here to taste.
     const COLORS = {
-        waze: ['#0099FF', '#0066B3'],
-        google: ['#43A047', '#1B5E20']
+        waze: { fill: '#66C3F3', edge: '#2B7BB0' },
+        google: { bands: ['#7E57C2', '#FF9800', '#26A69A'], edge: '#4A3A6B' }
     };
+    const GOOGLE_RING_COLOR = '#FF9800'; // only used if the pin graphic can't load
     const DEBUG = true; // logs each pick to the console; set to false once it works for you
 
     const doc = unsafeWindow.document;
@@ -67,10 +69,20 @@
 
     // ---------- pin icons ----------
     // square = padded to a square for the dropdown; otherwise tight pin for the map
-    function pinSvg(colors, ring, square) {
-        const body =
-            '<path d="M12 0C5.4 0 0 5.3 0 11.8 0 20.5 12 32 12 32s12-11.5 12-20.2C24 5.3 18.6 0 12 0z" ' +
-            'fill="' + colors[0] + '" stroke="' + colors[1] + '" stroke-width="1"/>' +
+    function pinSvg(spec, ring, square) {
+        const outline = 'M12 0C5.4 0 0 5.3 0 11.8 0 20.5 12 32 12 32s12-11.5 12-20.2C24 5.3 18.6 0 12 0z';
+        let shape;
+        if (spec.bands) {
+            const h = 32 / spec.bands.length;
+            shape =
+                '<clipPath id="p"><path d="' + outline + '"/></clipPath><g clip-path="url(#p)">' +
+                spec.bands.map((b, i) =>
+                    '<rect x="-1" y="' + (i * h) + '" width="26" height="' + (h + 0.5) + '" fill="' + b + '"/>').join('') +
+                '</g><path d="' + outline + '" fill="none" stroke="' + spec.edge + '" stroke-width="1"/>';
+        } else {
+            shape = '<path d="' + outline + '" fill="' + spec.fill + '" stroke="' + spec.edge + '" stroke-width="1"/>';
+        }
+        const body = shape +
             (ring
                 ? '<circle cx="12" cy="11.8" r="4.8" fill="none" stroke="#fff" stroke-width="2.4"/>'
                 : '<circle cx="12" cy="11.8" r="4.6" fill="#fff"/>');
@@ -263,7 +275,8 @@
     function ensurePinLayer() {
         if (pinLayerReady) return true;
         const gfx = src => iconsOk
-            ? { externalGraphic: src, graphicWidth: 26, graphicHeight: 34, graphicXOffset: -13, graphicYOffset: -33 }
+            // graphicOpacity must be set: otherwise the pin takes the fill opacity (0 for the ring) and vanishes
+            ? { externalGraphic: src, graphicOpacity: 1, graphicWidth: 26, graphicHeight: 34, graphicXOffset: -13, graphicYOffset: -33 }
             : {};
         try {
             try { sdk.Map.removeLayer({ layerName: PIN_LAYER }); } catch (e) { /* not there yet */ }
@@ -274,16 +287,16 @@
                         predicate: p => !!p && p.src === 'google',
                         // fallback if the pin graphic can't load: an open green ring
                         style: Object.assign({
-                            pointRadius: 12, fillColor: COLORS.google[0], fillOpacity: 0,
-                            strokeColor: COLORS.google[0], strokeWidth: 4
+                            pointRadius: 12, fillColor: GOOGLE_RING_COLOR, fillOpacity: 0,
+                            strokeColor: GOOGLE_RING_COLOR, strokeWidth: 4
                         }, gfx(ICONS.mapGoogle))
                     },
                     {
                         predicate: p => !!p && p.src === 'waze',
                         // fallback: a solid blue dot
                         style: Object.assign({
-                            pointRadius: 10, fillColor: COLORS.waze[0], fillOpacity: 0.9,
-                            strokeColor: COLORS.waze[1], strokeWidth: 2
+                            pointRadius: 10, fillColor: COLORS.waze.fill, fillOpacity: 0.9,
+                            strokeColor: COLORS.waze.edge, strokeWidth: 2
                         }, gfx(ICONS.mapWaze))
                     }
                 ]
