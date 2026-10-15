@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.15.02
+// @version      2026.10.15.03
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -2409,7 +2409,7 @@ ${list}`;
     ui.readLine = el('div', { class: 'ua-muted' }, ReadSync.text());
     const urlInput = el('input', { value: settings.syncUrl, placeholder: 'https://script.google.com/macros/s/…/exec', style: 'width:100%' });
     const secretInput = el('input', { type: 'password', value: settings.syncSecret, placeholder: 'Same secret word as in the Apps Script', style: 'width:100%' });
-    return el('details', { class: 'ua-settings' },
+    return el('details', { class: 'ua-settings', open: true },
       el('summary', {}, el('b', {}, 'Sync between laptops (Google Sheets)')),
       el('div', { class: 'ua-muted' }, 'Web app URL'), urlInput,
       el('div', { class: 'ua-muted' }, 'Secret word'), secretInput,
