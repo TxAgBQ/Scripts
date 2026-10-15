@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101207
+// @version      2026101401
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1172,11 +1172,10 @@
         return document.querySelector('#overlay-buttons .overlay-buttons-container.top') || document.querySelector('.overlay-buttons-container.top');
     }
 
-    // Is the icon already where it belongs: in the stack, straight after WME's own buttons (or first, if it has none yet)?
+    // Is the icon in the stack? Its exact place is not policed: other scripts also put buttons in the stack, and two scripts each
+    // insisting on being right after WME's buttons will move them back and forth for ever (that froze WME while minimized).
     function dockPlaced(stack) {
-        if (dockButton.parentElement !== stack) return false;
-        const own = [...stack.children].filter((c) => c.classList.contains('overlay-button'));
-        return own.length ? own[own.length - 1].nextElementSibling === dockButton : stack.firstElementChild === dockButton;
+        return dockButton.parentElement === stack;
     }
 
     // Puts the icon in the stack (true), or reports that there is no stack to put it in (false).
@@ -1242,7 +1241,7 @@
     new MutationObserver(() => {
         if (dockCheckQueued || toolbarState.closed || !toolbarState.minimized) return;
         dockCheckQueued = true;
-        Promise.resolve().then(checkDock);
+        setTimeout(checkDock, 150); // not at once: a save rebuilds the stack in many small steps
     }).observe(document.body, { childList: true, subtree: true });
     setInterval(checkDock, 2000);
 
