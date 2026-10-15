@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101401
+// @version      2026101501
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -777,6 +777,21 @@
         // (blank parts are left out; `full` is used only if the pieces are all empty).
         // Route names (FM, SH, US, I) get their dash and put any direction after the shield: SH-46 E.
         // Returns { name, note } where note is a message when something needs a human decision.
+        // Some GIS layers put the road's type in a prefix field and again in the street name ("COUNTY ROAD" + "COUNTY ROAD 4755"), so a
+        // run of two or more words that is immediately repeated is written once.
+        function collapseRepeats(text) {
+            const tokens = text.split(' ').filter(Boolean);
+            for (let len = Math.floor(tokens.length / 2); len >= 2; len--) {
+                for (let i = 0; i + 2 * len <= tokens.length; i++) {
+                    if (tokens.slice(i, i + len).join(' ') === tokens.slice(i + len, i + 2 * len).join(' ')) {
+                        tokens.splice(i + len, len);
+                        return collapseRepeats(tokens.join(' '));
+                    }
+                }
+            }
+            return tokens.join(' ');
+        }
+
         function buildStreetName(parts) {
             const clean = (v) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
             // Apostrophes are dropped. A single letter before one (O'BRIEN, D'ANGELO) keeps the next capital.
@@ -789,7 +804,7 @@
             const typeRaw0 = clean(parts.type).toUpperCase();
             const typeRaw = ALT_TYPES[typeRaw0] || typeRaw0;
             const typeWord = typeRaw ? (TYPE_EXPANSIONS[typeRaw] || typeRaw) : '';
-            const core = fixApostrophes([clean(parts.name), typeWord].filter(Boolean).join(' ').toUpperCase());
+            const core = collapseRepeats(fixApostrophes([clean(parts.name), typeWord].filter(Boolean).join(' ').toUpperCase()));
 
             let note = '';
             let sawAmbiguousHighway = false;
@@ -805,7 +820,7 @@
             }
 
             const pieces = [pre, core, suf].filter(Boolean);
-            const raw = pieces.length ? pieces.join(' ') : abbreviateFullType(fixApostrophes(clean(parts.full).toUpperCase()));
+            const raw = collapseRepeats(pieces.length ? pieces.join(' ') : abbreviateFullType(fixApostrophes(clean(parts.full).toUpperCase())));
             if (!raw) return { name: '', note: '' };
 
             const route = matchRoute(raw, parts.shield);
