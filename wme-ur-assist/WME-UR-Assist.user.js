@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.12.01
+// @version      2026.10.15.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1319,6 +1319,7 @@ ${list}`;
     pos: null,       // key (UR-MP row id) of the row you last used
     snapshot: [],    // UR-MP row keys when you last used a row, so the next one is still found after rows disappear
     nextKey: null,   // key of the row "]" would open (null = pass "]" through to WME)
+    prevKey: null,   // key of the row "[" would open (null = pass "[" through to WME)
     recent: [],      // recent UR-MP row orders [{ t, rows: [{ key, urId }] }], so "next after UR x" still works once x has left the list
     lastSig: '',
 
@@ -1375,18 +1376,24 @@ ${list}`;
     },
  
     refresh() {
-      let next = null;
+      let next = null, prev = null;
       if (this.context === 'urmp' && this.pos) {
         const keys = URMP.rows().map(r => r.key);
         const at = keys.indexOf(this.pos);
         if (at >= 0) {
           next = keys[at + 1] ?? null;
+          prev = at > 0 ? keys[at - 1] : null;
         } else {
+          // Your row has left the list (e.g. you closed it): "]" and "[" use the nearest rows that are still there
           const snapAt = this.snapshot.indexOf(this.pos);
-          if (snapAt >= 0) next = this.snapshot.slice(snapAt + 1).find(k => keys.includes(k)) ?? null;
+          if (snapAt >= 0) {
+            next = this.snapshot.slice(snapAt + 1).find(k => keys.includes(k)) ?? null;
+            prev = this.snapshot.slice(0, snapAt).reverse().find(k => keys.includes(k)) ?? null;
+          }
         }
       }
       this.nextKey = next;
+      this.prevKey = prev;
       this.record(URMP.rows());
       publish('uaNextUr', this.row()?.urId || '');
       Strip.update();
@@ -1394,6 +1401,10 @@ ${list}`;
  
     row() {
       return this.nextKey ? URMP.rows().find(r => r.key === this.nextKey) || null : null;
+    },
+
+    prevRow() {
+      return this.prevKey ? URMP.rows().find(r => r.key === this.prevKey) || null : null;
     },
  
     openNext() {
@@ -1422,10 +1433,11 @@ ${list}`;
       (n.isContentEditable || /^(INPUT|TEXTAREA|SELECT|WZ-TEXTAREA|WZ-TEXT-INPUT)$/.test(n.tagName)));
   }
  
+  // "[" does the same going back: the previous row in the UR-MP list (same context rules as "]").
   window.addEventListener('keydown', e => {
-    if (!settings.bracketNext || e.key !== ']' || e.ctrlKey || e.altKey || e.metaKey || isTyping(e)) return;
-    const row = Next.row();
-    if (!row) return; // tracker context, or nothing queued from UR-MP — let WME handle "]"
+    if (!settings.bracketNext || (e.key !== ']' && e.key !== '[') || e.ctrlKey || e.altKey || e.metaKey || isTyping(e)) return;
+    const row = e.key === ']' ? Next.row() : Next.prevRow();
+    if (!row) return; // tracker context, or nothing queued from UR-MP — let WME handle the key
     e.preventDefault();
     e.stopImmediatePropagation();
     URMP.open(row);
@@ -2197,7 +2209,7 @@ ${list}`;
         el('b', {}, 'Settings'),
         el('label', { class: 'ua-row' },
           el('input', { type: 'checkbox', checked: settings.bracketNext, onchange: e => { settings.bracketNext = e.target.checked; } }),
-          'Use ] for the next row in UR-MP (after you click in UR-MP). After you click in the Issue Tracker, WME’s own ] is used.'),
+          'Use ] for the next row and [ for the previous row in UR-MP (after you click in UR-MP). After you click in the Issue Tracker, WME’s own ] and [ are used.'),
         el('label', { class: 'ua-row' },
           el('input', { type: 'checkbox', checked: settings.autoSendCameras, onchange: e => { settings.autoSendCameras = e.target.checked; AutoSend.status(''); Strip.update(); if (e.target.checked) AutoSend.refresh(); } }),
           `Answer camera reports automatically: when you open one, post your sheet's camera reply, mark it Not identified and open the next row (${AUTO_SEND_MIN_AGE_MIN}+ minutes old, only when nobody but Map Team has commented). Uncheck to stop.`),
