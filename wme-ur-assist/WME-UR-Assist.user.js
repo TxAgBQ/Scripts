@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.15.01
-// @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, and automatic replies to camera reports.
+// @version      2026.10.15.02
+// @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
 // @downloadURL  https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -42,6 +42,84 @@
   };
   // Event details must be copied into the page on Firefox so another userscript can read them
   const toPageObj = o => (typeof cloneInto === 'function' ? cloneInto(o, unsafeWindow) : o);
+  const toPageFn = f => { try { return typeof exportFunction === 'function' ? exportFunction(f, unsafeWindow) : f; } catch { return f; } };
+  const T0 = Date.now();
+  const URMP_LIST_KEY = 'WMEURMPTracking_URList';
+  let started = false; // true once start() has built the panels (early sync work must not touch them before)
+
+  // ===== EARLY HOOK ON UR-MP'S LIST LOAD (not SDK — UR-MP-specific) =====
+  // UR-MP keeps its whole list in memory and saves all of it when you leave a report, so anything written into its
+  // storage while it runs is lost. Instead we wrap UR-MP's own storage helper's load() as soon as it appears: when UR-MP
+  // asks for its saved list, we hold the answer for a moment (up to HOLD_MS, waiting for the Google Sheet sync), put the
+  // visited marks and read counts from your other laptop into that list, then hand it to UR-MP. UR-MP then keeps them.
+  const HOLD_MS = 3000;
+  const Hook = {
+    wrapped: false,
+    own: false,        // true while this script itself loads UR-MP's list (those loads pass straight through)
+    helperAt: 0,
+    intercepts: 0,
+    tooLate: false,    // UR-MP had already loaded its list before the hook was in place
+
+    start() {
+      const tick = () => {
+        const H = unsafeWindow.GMStorageHelper;
+        if (H && typeof H.load === 'function') { this.wrap(H); return; }
+        setTimeout(tick, 50);
+      };
+      tick();
+    },
+
+    wrap(H) {
+      this.wrapped = true;
+      this.helperAt = Date.now();
+      const self = this;
+      const orig = H.load;
+      const impl = function (entry, callback) {
+        if (entry !== URMP_LIST_KEY || self.own || typeof callback !== 'function') return orig.apply(this, arguments);
+        const thisArg = this, args = Array.prototype.slice.call(arguments);
+        const asked = Date.now();
+        args[1] = toPageFn(function (job) {
+          let done = false;
+          const finish = () => { if (done) return; done = true; callback.apply(thisArg, [job]); };
+          self.handleLoad(job, asked).then(finish, finish);
+        });
+        return orig.apply(thisArg, args);
+      };
+      try {
+        if (typeof exportFunction === 'function') exportFunction(impl, H, { defineAs: 'load' }); else H.load = impl;
+      } catch (e) {
+        try { H.load = impl; } catch (e2) { LOG('Could not hook UR-MP\'s list load:', e2.message); this.tooLate = true; return; }
+      }
+      LOG(`UR-MP's storage helper found ${this.helperAt - T0} ms after UR Assist started; waiting for UR-MP to load its list.`);
+      if (document.querySelector('tr[id^="urt-tr-"]')) {
+        this.tooLate = true;
+        LOG('GMStorageHelper appeared after UR-MP had already loaded (too late): visited marks from your other laptop will be saved for the next reload.');
+      }
+      setTimeout(() => {
+        if (this.intercepts || this.tooLate) return;
+        this.tooLate = true;
+        LOG('UR-MP did not load its list within 30 s of the hook being in place (it probably loaded before, too late).');
+        ReadSync.status();
+      }, 30000);
+    },
+
+    async handleLoad(job, asked) {
+      this.intercepts++;
+      try {
+        if (Sync.enabled() && Date.now() - Sync.lastOk > 60e3) await Promise.race([Sync.run(), sleep(HOLD_MS)]);
+        const held = Date.now() - asked;
+        const r = ReadSync.mergeIntoJob(job);
+        LOG(`UR-MP list load intercepted ${asked - T0} ms after UR Assist started (held ${held} ms): merged ${r.visited} visited, ${r.counts} read counts from your other laptop.`);
+        ReadSync.noteMerged(r);
+      } catch (e) {
+        LOG('Merging into UR-MP\'s list failed; UR-MP gets its list unchanged:', e.message);
+      }
+    },
+
+    // The hook missed UR-MP's load: fall back to writing into UR-MP's storage (it may be overwritten when you leave a report)
+    useFallback() { return this.tooLate; },
+  };
+  Hook.start();
  
   // ===== SETTINGS (Tampermonkey storage, shared by beta and production) =====
   const DEFAULT_SHEET_ID = '15cyUyhrIuQHYcJ62lpn9MvGLWxPBZBb6dFfYpEmcfRg';
@@ -629,7 +707,7 @@ ${list}`;
   const SEEN_TITLE = 'Looked at it, nothing to do (set automatically)';
   const HIDES_SEEN = ['mapwork', 'closure', 'maybeclosure', 'asked', 'watching', 'dupe'];
   const circleOn = f => (f.includes(SEEN) || f.includes('waiting')) && !HIDES_SEEN.some(x => f.includes(x)); // 'waiting' = old manual circle
-  const keepOnClear = f => f === 'priority' || f === SEEN || f === BL_ON || f === BL_OFF;
+  const keepOnClear = f => f === 'priority' || f === SEEN || isUrmpMarker(f);
  
   const Seen = {
     id: null,
@@ -778,7 +856,7 @@ ${list}`;
     Sync.markDirty(id);
     Strip.update();
   }
-  const hasContent = v => !!v && (v.flags?.length > 0 || !!String(v.note || '').trim());
+  const hasContent = v => !!v && (v.flags?.some(f => !isUrmpMarker(f)) || !!String(v.note || '').trim()); // hidden UR-MP markers are not statuses
  
   // Backup / restore. Accepts this script's export, or the whole Storage tab of an older version from Tampermonkey.
   function exportData() {
@@ -821,6 +899,8 @@ ${list}`;
   const Sync = {
     timer: null,
     busy: false,
+    inflight: null,
+    lastOk: 0,
     enabled: () => !!(settings.syncUrl && settings.syncSecret),
  
     markDirty(id) {
@@ -832,8 +912,15 @@ ${list}`;
       this.timer = setTimeout(() => this.run(), 3000);
     },
  
-    async run() {
-      if (!this.enabled() || this.busy) return;
+    // Starts a sync (or joins the one already running); resolves when it is done
+    run() {
+      if (!this.enabled()) return Promise.resolve();
+      if (this.busy && this.inflight) return this.inflight;
+      this.inflight = this._run();
+      return this.inflight;
+    },
+
+    async _run() {
       this.busy = true;
       try {
         const since = GM_getValue('syncSince', 0);
@@ -844,22 +931,39 @@ ${list}`;
         if (res.error) throw new Error(res.error);
         let n = 0;
         const blArrived = []; // UR-MP blacklist changes from your other laptop, to apply here
+        const resend = [];    // entries where we hold hidden UR-MP markers the sheet's copy lacks
+        let changed = false;
         for (const [id, v] of Object.entries(res.changes || {})) {
           const cur = urStore[id];
           if (!cur || (v.updated || 0) > (cur.updated || 0)) {
-            const mark = blMark(v);
+            // The newer copy wins for statuses and notes; the visited / read-count markers are a union of both copies
+            const entry = { ...v, flags: mergeMarkerFlags(v.flags, cur?.flags) };
+            const mark = blMark(entry);
             if (mark && mark !== blMark(cur)) blArrived.push(id);
-            logAskedLoss(id, cur, v, 'a newer copy arrived through sync from your other laptop');
-            urStore[id] = v;
+            logAskedLoss(id, cur, entry, 'a newer copy arrived through sync from your other laptop');
+            urStore[id] = entry;
+            if (markerSig(entry.flags) !== markerSig(v.flags)) resend.push(id);
             n++;
+            changed = true;
+          } else {
+            const flags = mergeMarkerFlags(cur.flags, v.flags);
+            if (markerSig(flags) !== markerSig(cur.flags)) {
+              urStore[id] = { ...cur, flags, updated: Date.now() };
+              resend.push(id);
+              changed = true;
+            }
           }
         }
         const dirty = GM_getValue('syncDirty', {});
         for (const id of Object.keys(changes)) if (urStore[id]?.updated === changes[id].updated) delete dirty[id];
+        for (const id of resend) dirty[id] = 1;
         GM_setValue('syncDirty', dirty);
         GM_setValue('syncSince', Math.max(0, (res.now || Date.now()) - 5000));
-        if (n) { GM_setValue('urData', urStore); Strip.update(); }
+        if (changed) { GM_setValue('urData', urStore); if (started) Strip.update(); }
+        if (resend.length) { clearTimeout(this.timer); this.timer = setTimeout(() => this.run(), 3000); }
         if (blArrived.length) UrmpBL.addPending(blArrived);
+        this.lastOk = Date.now();
+        ReadSync.status();
         this.status(`Synced ${new Date().toLocaleTimeString()}${n ? ` – ${n} update(s) from your other laptop` : ''}`);
       } catch (e) {
         this.status(`Sync failed: ${e.message}`);
@@ -932,6 +1036,16 @@ ${list}`;
   const BL_OFF = 'urmp-wl';  // hidden marker: taken off UR-MP's blacklist
   const blMark = v => (v?.flags?.includes(BL_ON) ? BL_ON : v?.flags?.includes(BL_OFF) ? BL_OFF : null);
  
+  // Save marker changes and send them on the next sync
+  function commitMarks(dirty) {
+    GM_setValue('urData', urStore);
+    if (Sync.enabled()) {
+      GM_setValue('syncDirty', dirty);
+      clearTimeout(Sync.timer);
+      Sync.timer = setTimeout(() => Sync.run(), 3000);
+    }
+  }
+
   // Record blacklist changes you made in UR-MP (many at once) and send them on the next sync
   function setBlMarks(changes) {
     const dirty = GM_getValue('syncDirty', {});
@@ -940,14 +1054,149 @@ ${list}`;
       urStore[id] = { flags: cur.flags.filter(f => f !== BL_ON && f !== BL_OFF).concat(mark), note: cur.note || '', updated: Date.now() };
       dirty[id] = 1;
     }
-    GM_setValue('urData', urStore);
-    if (Sync.enabled()) {
-      GM_setValue('syncDirty', dirty);
-      clearTimeout(Sync.timer);
-      Sync.timer = setTimeout(() => Sync.run(), 3000);
-    }
+    commitMarks(dirty);
   }
  
+  // ===== UR-MP VISITED AND NEW-COMMENTS SYNC (not SDK) =====
+  // UR-MP's "visited" mark and its read count (lastVisitCommentsCount; fewer than the report's comments = orange) travel
+  // like the blacklist: hidden markers inside each open report's flags go through the Google Sheet. Both only ever move
+  // one way (visited stays visited, the read count only grows), so the merge is "either laptop" and "the higher number".
+  //   Sending:   every read of UR-MP's saved list (see UrmpBL.read) turns visits and read counts that the markers lack into markers.
+  //   Receiving: when UR-MP loads its list, the Hook above puts the markers in before UR-MP sees it (see Hook).
+  const READ_VIS = 'urmp-vis';   // hidden marker: visited in UR-MP
+  const READ_LV = 'urmp-lv:';    // hidden marker: read count, e.g. urmp-lv:7
+  const isUrmpMarker = f => f === BL_ON || f === BL_OFF || f === READ_VIS || String(f).startsWith(READ_LV);
+  const lvOf = v => Math.max(0, ...(v?.flags || []).filter(f => String(f).startsWith(READ_LV)).map(f => Number(String(f).slice(READ_LV.length)) || 0));
+  const visOf = v => !!v?.flags?.includes(READ_VIS);
+  const markerSig = flags => (flags || []).filter(isUrmpMarker).sort().join(',');
+  // Statuses and the blacklist marker come from `winner` (the blacklist marker from `other` only when the winner has none);
+  // the visited and read-count markers are the union of both
+  function mergeMarkerFlags(winner, other) {
+    const w = winner || [], o = other || [];
+    const out = w.filter(f => f !== READ_VIS && !String(f).startsWith(READ_LV));
+    if (w.includes(READ_VIS) || o.includes(READ_VIS)) out.push(READ_VIS);
+    const lv = Math.max(lvOf({ flags: w }), lvOf({ flags: o }));
+    if (lv > 0) out.push(READ_LV + lv);
+    if (!out.includes(BL_ON) && !out.includes(BL_OFF)) {
+      const b = o.find(f => f === BL_ON || f === BL_OFF);
+      if (b) out.push(b);
+    }
+    return out;
+  }
+  // changes: [urId, visited, readCount]
+  function setReadMarks(changes) {
+    const dirty = GM_getValue('syncDirty', {});
+    for (const [id, vis, lv] of changes) {
+      const cur = urInfo(id);
+      const flags = cur.flags.filter(f => f !== READ_VIS && !String(f).startsWith(READ_LV));
+      if (vis) flags.push(READ_VIS);
+      if (lv > 0) flags.push(READ_LV + lv);
+      urStore[id] = { flags, note: cur.note || '', updated: Date.now() };
+      dirty[id] = 1;
+    }
+    commitMarks(dirty);
+  }
+
+  const ReadSync = {
+    merged: null,        // { visited, counts, at } what the last load / save put into UR-MP's list
+    covered: new Set(),  // open reports that were in UR-MP's list at that merge
+    behind: 0,           // open reports in UR-MP's stored list that still lack marks from your other laptop
+    dataIsString: true,  // UR-MP stores its list as a JSON string (kept the same way when we write it)
+    haveRead: false,
+    lastSave: 0,
+
+    // Put the markers into a list: open reports get visited / a higher read count
+    apply(list) {
+      let visited = 0, counts = 0;
+      for (const u of list) {
+        if (!u?.data?.open) continue;
+        const m = urStore[Number(u.id)];
+        if (!m) continue;
+        if (visOf(m) && !u.alreadyVisited) { u.alreadyVisited = true; visited++; }
+        const lv = lvOf(m);
+        if (lv > (Number(u.lastVisitCommentsCount) || 0)) { u.lastVisitCommentsCount = lv; counts++; }
+      }
+      return { visited, counts };
+    },
+
+    // The list UR-MP is about to receive (keeps the same type, string or object)
+    mergeIntoJob(job) {
+      const raw = job?.data;
+      const isStr = typeof raw === 'string';
+      const list = isStr ? JSON.parse(raw) : raw;
+      if (!Array.isArray(list)) return { visited: 0, counts: 0 };
+      const r = this.apply(list);
+      this.covered = new Set(list.filter(u => u?.data?.open).map(u => Number(u.id)));
+      if (r.visited || r.counts) job.data = isStr ? JSON.stringify(list) : list;
+      return r;
+    },
+
+    noteMerged(r) {
+      this.merged = { ...r, at: Date.now() };
+      this.status();
+    },
+
+    // Sending: this laptop's visits and read counts that the markers don't have yet
+    scan(list) {
+      const changes = [];
+      for (const u of list) {
+        if (!u?.data?.open) continue;
+        const id = Number(u.id);
+        const vis = !!u.alreadyVisited, lv = Math.max(0, Number(u.lastVisitCommentsCount) || 0);
+        if (!id || (!vis && !lv)) continue;
+        const m = urStore[id];
+        if ((vis && !visOf(m)) || lv > lvOf(m)) changes.push([id, vis || visOf(m), Math.max(lv, lvOf(m))]);
+      }
+      if (changes.length) {
+        setReadMarks(changes);
+        LOG(`UR-MP read status: ${changes.length} visited / read-count change(s) from this laptop queued for your other laptop.`);
+      }
+      return changes.length;
+    },
+
+    // Reports in UR-MP's stored list that still lack what the markers say (and were not in the list when it was merged)
+    countBehind(list) {
+      let n = 0;
+      for (const u of list) {
+        if (!u?.data?.open || this.covered.has(Number(u.id))) continue;
+        const m = urStore[Number(u.id)];
+        if (m && ((visOf(m) && !u.alreadyVisited) || lvOf(m) > (Number(u.lastVisitCommentsCount) || 0))) n++;
+      }
+      return n;
+    },
+
+    // Fallback (the hook was too late): write the merged list into UR-MP's storage. UR-MP may overwrite it when you
+    // leave a report; the next read puts it back. Skipped while a UR panel is open.
+    async saveMerged() {
+      if (document.querySelector('wz-card.mapUpdateRequest')) return;
+      const H = unsafeWindow.GMStorageHelper;
+      if (!H || typeof H.save !== 'function') return;
+      const fresh = await UrmpBL.loadList(); // read again right before saving, keeping everything else as it is
+      if (!fresh) return;
+      const r = this.apply(fresh);
+      if (!r.visited && !r.counts) return;
+      H.save(URMP_LIST_KEY, this.dataIsString ? JSON.stringify(fresh) : fresh, () => {});
+      this.merged = { ...r, at: Date.now() };
+      this.lastSave = Date.now();
+      LOG(`Saved ${r.visited} visited and ${r.counts} read counts into UR-MP's stored list (shown after a reload; UR-MP may overwrite them if you leave a report first).`);
+    },
+
+    text() {
+      const when = d => new Date(d).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      if (!this.haveRead && !this.merged) return 'UR-MP read status: waiting for UR-MP to load…';
+      let t = 'UR-MP read status: ';
+      t += this.merged
+        ? `${this.merged.visited} visited, ${this.merged.counts} read counts merged from your other laptop (${when(this.merged.at)})`
+        : 'nothing from your other laptop to merge yet';
+      if (this.behind) t += `; ${this.behind} more will show after you reload WME`;
+      if (Hook.useFallback()) t += ' – UR-MP loaded before UR Assist could merge, so reload WME before you leave any report';
+      return t;
+    },
+    status() {
+      if (ui.readLine) ui.readLine.textContent = this.text();
+    },
+  };
+
   const UrmpBL = {
     ids: new Set(),     // URs blacklisted in UR-MP on this laptop
     ready: false,
@@ -965,13 +1214,19 @@ ${list}`;
         const H = unsafeWindow.GMStorageHelper;
         if (!H || typeof H.load !== 'function') { resolve(null); return; }
         const giveUp = setTimeout(() => resolve(null), 15000);
-        H.load('WMEURMPTracking_URList', job => {
-          clearTimeout(giveUp);
-          try {
-            const list = typeof job.data === 'string' ? JSON.parse(job.data) : job.data;
-            resolve(Array.isArray(list) ? list : null);
-          } catch { resolve(null); }
-        });
+        Hook.own = true; // our own load: the hook must not hold it or merge into it
+        try {
+          H.load(URMP_LIST_KEY, job => {
+            clearTimeout(giveUp);
+            try {
+              ReadSync.dataIsString = typeof job.data === 'string';
+              const list = ReadSync.dataIsString ? JSON.parse(job.data) : job.data;
+              resolve(Array.isArray(list) ? list : null);
+            } catch { resolve(null); }
+          });
+        } finally {
+          Hook.own = false;
+        }
       });
     },
  
@@ -992,6 +1247,16 @@ ${list}`;
     readSoon() {
       clearTimeout(this.timer);
       this.timer = setTimeout(() => this.read(), 6000); // gives UR-MP time to save after a click
+    },
+
+    // UR-MP saves its list when you leave a report: read about 3 s after a UR panel opens or closes, so visits go out quickly.
+    // A read already waiting is not pushed back, so quick open / close runs still get read every few seconds.
+    readAfterPanel() {
+      if (this.panelTimer) return;
+      this.panelTimer = setTimeout(() => {
+        this.panelTimer = null;
+        if (this.busy) this.readAfterPanel(); else this.read();
+      }, 3000);
     },
  
     // A row turned up without a report time (UR-MP added it since the last read): read again, at most once a minute
@@ -1052,6 +1317,13 @@ ${list}`;
         this.lastRead = Date.now();
         this.status();
         Strip.update();
+
+        // Visited marks and read counts (see UR-MP VISITED AND NEW-COMMENTS SYNC)
+        ReadSync.haveRead = true;
+        ReadSync.scan(list);
+        ReadSync.behind = ReadSync.countBehind(list);
+        if (Hook.useFallback()) await ReadSync.saveMerged();
+        ReadSync.status();
       } catch (e) {
         LOG('Reading the UR-MP blacklist failed:', e.message);
       } finally {
@@ -1500,6 +1772,7 @@ ${list}`;
       let closedUrId = null;
       try { closedUrId = Number(e.detail && e.detail.closedUrId) || null; } catch { /* detail not readable */ }
       if (!closedUrId) { this.fail(null, 'no closedUrId in the request'); return; }
+      Asked.closed(closedUrId);   // closed with F9: no purple "?"
       const now = Date.now();
       for (const [k, t] of this.seen) if (now - t > OPEN_NEXT_DEDUPE_MS) this.seen.delete(k);
       if (this.seen.has(closedUrId)) return;   // duplicate: stay silent so the first answer stands
@@ -1927,7 +2200,9 @@ ${list}`;
     ensure() {
       const card = document.querySelector('wz-card.mapUpdateRequest');
       const sub = card?.querySelector('[data-testid="issue-panel-header-subtitle"]');
-      publish('uaOpenUr', sub && Next.openId ? Next.openId : '');
+      const openNow = sub && Next.openId ? Next.openId : '';
+      publish('uaOpenUr', openNow);
+      if (openNow !== this.lastPanel) { this.lastPanel = openNow; UrmpBL.readAfterPanel(); } // UR-MP saves when you leave a report
       if (!sub || !Next.openId) { Note.close(); Seen.stop(); return; }
       let bar = card.querySelector('.ua-hdr');
       if (!bar || bar.dataset.ur !== String(Next.openId)) {
@@ -2131,6 +2406,7 @@ ${list}`;
   function syncSection() {
     ui.syncLine = el('div', { class: 'ua-muted' }, Sync.enabled() ? 'Waiting for first sync…' : 'Not set up yet.');
     ui.blLine = el('div', { class: 'ua-muted' }, 'UR-MP blacklist: waiting for UR-MP to load…');
+    ui.readLine = el('div', { class: 'ua-muted' }, ReadSync.text());
     const urlInput = el('input', { value: settings.syncUrl, placeholder: 'https://script.google.com/macros/s/…/exec', style: 'width:100%' });
     const secretInput = el('input', { type: 'password', value: settings.syncSecret, placeholder: 'Same secret word as in the Apps Script', style: 'width:100%' });
     return el('details', { class: 'ua-settings' },
@@ -2150,7 +2426,8 @@ ${list}`;
         }),
         el('button', { textContent: 'Sync now', onclick: () => Sync.run() })),
       ui.syncLine,
-      ui.blLine);
+      ui.blLine,
+      ui.readLine);
   }
  
   function backupSection() {
@@ -2556,7 +2833,14 @@ ${list}`;
   const ASKED_VERIFY_EVERY_MS = 4000;   // then look again this often
   const ASKED_VERIFY_MS = 30000;        // keep watching for a close this long
   const Asked = {
+    closedAt: new Map(),   // UR id -> time Rapid UR Reply's F9 (or another script) said it closed that report
+    // A report closed through the open-next handoff never gets the "?" (and loses it at once if it already had it)
+    closed(id) {
+      this.closedAt.set(Number(id), Date.now());
+      this.unset(id);
+    },
     set(id) {
+      if (Date.now() - (this.closedAt.get(Number(id)) || 0) < 60e3) return false;
       const cur = urInfo(id);
       if (cur.flags.includes('asked')) return false;
       saveUrInfo(id, { ...cur, flags: [...cur.flags, 'asked'] });
@@ -2591,6 +2875,7 @@ ${list}`;
     },
   };
   document.addEventListener('click', e => {
+    if (!e.isTrusted) return;   // only your own click on Send; a click made by another script (Rapid UR Reply's F9 close) is not a question
     const btn = e.composedPath().find(n => n && n.matches && n.matches('wz-button.send-button'));
     if (!btn) return;
     const card = btn.closest('wz-card.mapUpdateRequest') || document.querySelector('wz-card.mapUpdateRequest');
@@ -2611,6 +2896,7 @@ ${list}`;
     migrateOldNotes();
     convertWaiting();
     Strip.init();
+    started = true;
     GM_addValueChangeListener('urData', (key, oldVal, newVal, remote) => {
       if (remote) {
         for (const [id, v] of Object.entries(urStore)) logAskedLoss(id, v, (newVal || {})[id], 'another WME tab or window saved over it');
@@ -2648,6 +2934,7 @@ ${list}`;
     LOG(`v${VERSION} ready${sdk.isBeta?.() ? ' (beta)' : ''}`);
   }
  
+  if (Sync.enabled()) Sync.run(); // pull your other laptop's changes now, so they are ready when UR-MP loads its list
   unsafeWindow.SDK_INITIALIZED.then(async () => {
     try {
       sdk = unsafeWindow.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME, mode: 'async' });
