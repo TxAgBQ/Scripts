@@ -2,7 +2,7 @@
 // @name         WME Water Import
 // @namespace    wme-water-import
 // @author       TxAgBQ
-// @version      2026101501
+// @version      2026101505
 // @description  Click a creek, river or pond on the map and add it to WME as a Place (River/Stream or Lake) using the FEMA/NOAA water data that GIS Layers also shows. Streams are drawn as a narrow area along the stream. Nothing is saved for you.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -450,6 +450,21 @@
         }
     }
 
+    // Turns the Waze places layer on if it is off, by clicking its toggle in the Map layers panel (so the panel stays in step with the
+    // map). If the toggle is not found the SDK is asked instead. Returns true if it had to be switched on.
+    function ensurePlacesLayerOn() {
+        try {
+            if (sdk.Map.isLayerVisible({ layerName: 'venues' })) return false;
+            const toggle = document.getElementById('layer-switcher-group_places');
+            if (toggle) toggle.click();
+            else sdk.Map.setLayerVisibility({ layerName: 'venues', visibility: true });
+            return true;
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Could not check or switch on the Places layer:`, err);
+            return false;
+        }
+    }
+
     function addIt() {
         if (!pick || busy) return;
         const name = ui.name.value.trim();
@@ -474,8 +489,11 @@
             return;
         }
         try {
+            // WME only shows (and so only saves) a new Place with the Places layer on, so it is switched on first
+            ensurePlacesLayerOn();
             const made = sdk.DataModel.Venues.addVenue({ category: categoryId, geometry: { type: 'Polygon', coordinates: [area.ring] } });
-            const id = made && typeof made === 'object' ? (made.id ?? made.venueId) : made;
+            const rawId = made && typeof made === 'object' ? (made.id ?? made.venueId) : made;
+            const id = rawId === undefined || rawId === null ? rawId : String(rawId); // WME wants the id as a string, even a negative number
             if (id === undefined || id === null) throw new Error('WME did not say which Place it made');
             try {
                 sdk.DataModel.Venues.updateVenue({ venueId: id, name });
@@ -485,7 +503,7 @@
                 return;
             }
             const label = categories.find((c) => String(c.id) === String(categoryId))?.label || 'Place';
-            setStatus(`${name} added as ${label}${pick.kind === 'line' ? `, ${currentWidth()} m wide` : ''}. It is not saved yet: look it over, then save.`, area.crosses ? 'warn' : 'ok');
+            setStatus(`${name} added as ${label}${pick.kind === 'line' ? `, ${currentWidth()} m wide` : ''}.It is not saved yet: look it over, then save.`, area.crosses ? 'warn' : 'ok');
             clearAfterAdd(id);
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Add failed:`, err);
