@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101601
+// @version      2026101603
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -832,6 +832,40 @@
             return tokens.join(' ');
         }
 
+        // The same street type twice at the end of a name ("Weston Dr Drive", "Trl Trail") is written once. Different types
+        // ("Jones Way Trail Drive Ln") are left alone. Only the last type word (before any trailing direction) is checked.
+        function dedupeStreetType(tokens) {
+            const expandedToShort = {};
+            for (const [short, long] of Object.entries(TYPE_EXPANSIONS)) expandedToShort[long.toUpperCase()] = short;
+            const known = new Set([...Object.values(LONG_TYPES), ...Object.values(ALT_TYPES), ...Object.keys(TYPE_EXPANSIONS)]);
+            const canon = (t) => {
+                const c = LONG_TYPES[t] || ALT_TYPES[t] || expandedToShort[t] || t;
+                return known.has(c) ? c : '';
+            };
+            const out = tokens.slice();
+            let end = out.length - 1;
+            while (end > 0 && DIRECTION_TOKENS.has(out[end])) end--;
+            if (end >= 2) {
+                const a = canon(out[end - 1]);
+                const b = canon(out[end]);
+                if (a && a === b) {
+                    out.splice(end - 1, 2, TYPE_EXPANSIONS[a] ? TYPE_EXPANSIONS[a].toUpperCase() : a);
+                    out.dupAt = end - 1;
+                }
+            }
+            return out;
+        }
+
+        // A mapped street name with its type written twice ("Weston Dr Drive") -> the name with it written once, or '' if it has none.
+        function fixRepeatedType(name) {
+            const original = String(name || '').trim().split(/\s+/).filter(Boolean);
+            if (original.length < 3) return '';
+            const fixed = dedupeStreetType(original.map((t) => t.toUpperCase()));
+            if (fixed.dupAt === undefined) return '';
+            original.splice(fixed.dupAt, 2, formatNameToken(fixed[fixed.dupAt], fixed.dupAt, original.length - 1));
+            return original.join(' ');
+        }
+
         function buildStreetName(parts) {
             const clean = (v) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
             // Apostrophes are dropped. A single letter before one (O'BRIEN, D'ANGELO) keeps the next capital.
@@ -860,7 +894,7 @@
             }
 
             const pieces = [pre, core, suf].filter(Boolean);
-            const raw = collapseRepeats(pieces.length ? pieces.join(' ') : abbreviateFullType(fixApostrophes(clean(parts.full).toUpperCase())));
+            const raw = dedupeStreetType(collapseRepeats(pieces.length ? pieces.join(' ') : abbreviateFullType(fixApostrophes(clean(parts.full).toUpperCase()))).split(' ').filter(Boolean)).join(' ');
             if (!raw) return { name: '', note: '' };
 
             const route = matchRoute(raw, parts.shield);
@@ -883,11 +917,12 @@
             pointAlongLine,
             formatCityName,
             DIRECTION_TOKENS,
-            buildStreetName
+            buildStreetName,
+            fixRepeatedType
         };
     })();
 
-    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName } = WmeSiCore;
+    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, fixRepeatedType } = WmeSiCore;
 
     const mapDiv = (typeof sdk.Map.getMapViewportElement === 'function' && sdk.Map.getMapViewportElement()) ||
         document.getElementById('map');
@@ -941,7 +976,8 @@
         none: { colour: '#d93025', label: 'no street name and no city' },
         name: { colour: '#f29900', label: 'no street name' },
         city: { colour: '#fbc02d', label: 'no city (primary or alternate)' },
-        badcity: { colour: '#1a73e8', label: 'primary city does not fit the city limits' }
+        badcity: { colour: '#1a73e8', label: 'primary city does not fit the city limits' },
+        duptype: { colour: '#8e24aa', label: 'street type written twice in the name (Dr Drive)' }
     };
     let gapLayerReady = false;
     let gapZoomNote = '';
@@ -4875,6 +4911,19 @@
         const before = ccAddressOf(id);
         const originalPrimary = before ? before.primary : '';
 
+        // a street type written twice ("Weston Dr Drive") is written once
+        {
+            const current = ccAddressOf(id);
+            const single = current && current.name ? fixRepeatedType(current.name) : '';
+            if (single) {
+                ccApply(id, { kind: 'name', name: single });
+                changed = true;
+                renamed = true;
+                notes.push(`Renamed "${current.name}" to "${single}" (street type was written twice).`);
+                cityCheckCache.clear();
+            }
+        }
+
         const analysis = await ccAnalyze(id, false);
         const primary = (analysis.proposals || []).find((p) => p.kind === 'primary');
         if (primary && primary.city) {
@@ -6146,8 +6195,12 @@
                 detail = `primary city ${primary}, but the limits here say ${limits.name}`;
             }
         }
+        if (!kind && name && fixRepeatedType(name)) {
+            kind = 'duptype';
+            detail = `street type written twice: "${name}" should be "${fixRepeatedType(name)}"`;
+        }
         if (!kind) return null;
-        return { id: segment.id, kind, name, primary, detail: kind === 'badcity' ? detail : GAP_KINDS[kind].label };
+        return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' ? detail : GAP_KINDS[kind].label };
     }
 
     function gapsWanted() {
