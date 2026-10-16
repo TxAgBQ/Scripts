@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101605
+// @version      2026101607
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -316,10 +316,24 @@
         return gislLayersPromise;
     }
 
+    // The layers checked in the GIS Layers panel (its checkboxes are gis-layer-<id>). Its saved visibleLayers list can lag behind what is
+    // actually checked (it lacked Statewide - Roads while that was drawn), so the panel is read first and the saved list is the fallback.
+    function gislPanelChecked() {
+        const boxes = document.querySelectorAll('input[type="checkbox"][id^="gis-layer-"]');
+        if (!boxes.length) return null;
+        const ids = new Set();
+        boxes.forEach((b) => {
+            if (b.checked && !b.id.endsWith('-container')) ids.add(b.id.slice('gis-layer-'.length));
+        });
+        return ids;
+    }
+
     function gislVisibleIds() {
         try {
             const s = JSON.parse(localStorage.getItem(GISL_SETTINGS_KEY) || '{}');
             if (s.enabled === false) return new Set();
+            const panel = gislPanelChecked();
+            if (panel) return panel;
             return new Set(s.visibleLayers || []);
         } catch (e) {
             return new Set();
@@ -1613,7 +1627,8 @@
         try {
             const st = JSON.parse(localStorage.getItem(GISL_SETTINGS_KEY) || 'null');
             if (!st) return { found: false };
-            return { found: true, enabled: st.enabled !== false, checked: (st.visibleLayers || []).length };
+            const panel = gislPanelChecked();
+            return { found: true, enabled: st.enabled !== false, checked: panel ? panel.size : (st.visibleLayers || []).length };
         } catch (e) {
             return { found: false };
         }
@@ -3525,7 +3540,11 @@
         }
         const data = await queryGis(source, click.lon, click.lat);
         if (!data.features || data.features.length === 0) {
-            setStatus('No GIS feature under click.', 'warn');
+            // say which layers were asked and where, so a layer that is drawn but not being read can be spotted
+            const asked = (source.roadLayers || []).map((l) => { const off = gislOffsetOf(l.id); return `${l.id}${off ? ` (shifted ${off.x} E, ${off.y} N)` : ''}`; });
+            const where = source.county ? `${source.county} County` : 'this area';
+            setStatus(`No GIS feature under click. Looked in ${where}${asked.length ? ` at ${asked.join(', ')}` : ''}, about ${Math.round(0.00015 * 111320)} m around the click.`, 'warn');
+            console.warn(`[${SCRIPT_NAME}] No GIS feature under click at ${click.lat.toFixed(6)}, ${click.lon.toFixed(6)}; road layers asked: ${asked.join(', ') || '(Kendall source)'}`);
             return;
         }
 
