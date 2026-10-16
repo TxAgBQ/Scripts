@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101603
+// @version      2026101604
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -5248,11 +5248,44 @@
         return b;
     }
 
+    // Drag the Area panel by its title bar; the spot is remembered (double-click the title bar to put it back under the toolbar).
+    const AREA_POS_KEY = 'wme_gis_importer_area_pos_v1';
+    let areaPanelPos = null;
+    try {
+        const p = JSON.parse(localStorage.getItem(AREA_POS_KEY));
+        if (p && typeof p.left === 'number' && typeof p.top === 'number') areaPanelPos = p;
+    } catch (e) { /* no saved spot */ }
+    function saveAreaPanelPos() {
+        try {
+            if (areaPanelPos) localStorage.setItem(AREA_POS_KEY, JSON.stringify(areaPanelPos));
+            else localStorage.removeItem(AREA_POS_KEY);
+        } catch (e) { /* not saved */ }
+    }
+    function startAreaPanelDrag(e) {
+        if (e.button !== 0 || e.target.closest('button')) return;
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const left0 = parseInt(areaPanel.style.left, 10) || 0;
+        const top0 = parseInt(areaPanel.style.top, 10) || 0;
+        const move = (ev) => {
+            areaPanelPos = { left: left0 + ev.clientX - startX, top: top0 + ev.clientY - startY };
+            positionAreaPanel();
+        };
+        const up = () => {
+            document.removeEventListener('mousemove', move);
+            document.removeEventListener('mouseup', up);
+            saveAreaPanelPos();
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+        e.preventDefault();
+    }
+
     function positionAreaPanel() {
         const open = !toolbarState.closed && !toolbarState.minimized;
         const r = container.getBoundingClientRect();
-        let left = open ? r.left : 80;
-        let top = open ? r.bottom + 8 : 80;
+        let left = areaPanelPos ? areaPanelPos.left : open ? r.left : 80;
+        let top = areaPanelPos ? areaPanelPos.top : open ? r.bottom + 8 : 80;
         left = Math.max(8, Math.min(left, window.innerWidth - 340));
         top = Math.max(8, Math.min(top, window.innerHeight - Math.min(areaPanel.offsetHeight || 200, window.innerHeight * 0.8) - 8));
         areaPanel.style.left = `${left}px`;
@@ -5280,8 +5313,16 @@
         btnArea.style.color = area.panelOpen ? COLOUR_ROADS : '#5f6368';
         if (!area.panelOpen) return;
 
-        const head = areaEl('div', 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;');
-        head.appendChild(areaEl('strong', 'font-size: 13px;', 'Area import'));
+        const head = areaEl('div', 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; cursor: move; user-select: none;');
+        head.title = 'Drag to move this panel; double-click to put it back under the toolbar';
+        head.appendChild(areaEl('strong', 'font-size: 13px;', '\u2630 Area import'));
+        head.addEventListener('mousedown', startAreaPanelDrag);
+        head.addEventListener('dblclick', (e) => {
+            if (e.target.closest('button')) return;
+            areaPanelPos = null;
+            saveAreaPanelPos();
+            positionAreaPanel();
+        });
         const close = areaButton('×', () => {
             if (area.phase === 'running') area.panelOpen = false;
             else {
