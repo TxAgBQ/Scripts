@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101501
+// @version      2026101502
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -337,8 +337,45 @@
         return null;
     };
 
+    // GIS Layers can shift a layer to line it up with the imagery. The shift is saved at layers.<id>.offset as { x, y } in ground
+    // metres (+x east, +y north) and GIS Layers turns it into degrees with 111320 m per degree (east scaled by cos(latitude)). The
+    // importer applies the same shift to what it reads, so a road is imported where the shifted layer is drawn.
+    const GISL_M_PER_DEG = 111320;
+    function gislOffsetOf(layerId) {
+        try {
+            const o = (JSON.parse(localStorage.getItem(GISL_SETTINGS_KEY) || '{}').layers || {})[layerId];
+            const off = o && o.offset;
+            const x = Number(off && off.x);
+            const y = Number(off && off.y);
+            if (Number.isFinite(x) && Number.isFinite(y) && (x || y)) return { x, y };
+        } catch (e) { /* no saved shift */ }
+        return null;
+    }
+    const gislShiftNoted = new Set();
+    const shiftedLonLat = (pt, off, sign) => [
+        pt[0] + (sign * off.x) / (GISL_M_PER_DEG * Math.cos((pt[1] * Math.PI) / 180)),
+        pt[1] + (sign * off.y) / GISL_M_PER_DEG
+    ];
+    function shiftGeometry(geom, off) {
+        const walk = (c) => (typeof c[0] === 'number' ? [...shiftedLonLat(c, off, 1), ...c.slice(2)] : c.map(walk));
+        return { ...geom, coordinates: walk(geom.coordinates) };
+    }
+
     // Queries one GIS Layers layer for a box; answers in the same shape as the Kendall queries (GeoJSON-like features).
+    // If the layer is shifted in GIS Layers the box is moved back to where the raw data is, and the answers are shifted.
     async function queryGislLayer(layer, box, outFields = '*') {
+        const off = gislOffsetOf(layer.id);
+        if (off) {
+            const key = `${layer.id}:${off.x}:${off.y}`;
+            if (!gislShiftNoted.has(key)) {
+                gislShiftNoted.add(key);
+                console.log(`[${SCRIPT_NAME}] ${layer.id} is shifted in GIS Layers (${off.x} m east, ${off.y} m north): importing at the shifted position.`);
+            }
+            const lat = (box.minLat + box.maxLat) / 2;
+            const dLon = off.x / (GISL_M_PER_DEG * Math.cos((lat * Math.PI) / 180));
+            const dLat = off.y / GISL_M_PER_DEG;
+            box = { minLon: box.minLon - dLon, maxLon: box.maxLon - dLon, minLat: box.minLat - dLat, maxLat: box.maxLat - dLat };
+        }
         const params = {
             geometry: `${box.minLon},${box.minLat},${box.maxLon},${box.maxLat}`, geometryType: 'esriGeometryEnvelope', inSR: '4326',
             spatialRel: 'esriSpatialRelIntersects', where: layer.where || '1=1', outFields, outSR: '4326', returnGeometry: 'true', f: 'json'
@@ -359,6 +396,7 @@
             const id = oid && props[oid] !== undefined ? props[oid] : i;
             return { type: 'Feature', id: `${layer.id}:${id}`, properties: props, geometry: esriToGeoJson(f.geometry) };
         }).filter((f) => f.geometry);
+        if (off) for (const f of features) f.geometry = shiftGeometry(f.geometry, off);
         return { features };
     }
 
