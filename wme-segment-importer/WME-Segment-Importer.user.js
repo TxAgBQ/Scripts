@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101503
+// @version      2026101601
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -2685,7 +2685,8 @@
 
         // 1b. a stub lies along the road but can't be extended (no dead end, or nothing beyond it):
         //     importing the full road would put a second segment on top of it
-        if (stubMatch) {
+        //     (but a tiny segment on a long road, e.g. a short crossover, must not block the whole road)
+        if (stubMatch && analysis.unionFraction >= PARTIAL_OVERLAP_FRACTION) {
             const stub = stubMatch.segment;
             const stubLabel = streetNameOf(stub.id);
             setStatus(analysis.unionFraction >= DUPLICATE_FRACTION
@@ -4031,6 +4032,17 @@
         cursorRing.style.top = `${e.clientY}px`;
     });
 
+    // Shift+click is WME's "zoom in" gesture and it acts on mouse down/up, before our click handler runs. Swallow those
+    // events (window capture, so we run first) while Roads is on, so Shift-click reaches the importer as an override.
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick']) {
+        window.addEventListener(type, (e) => {
+            if (!e.shiftKey || !isImporterActive || !importRoadsEnabled || areaDrawing || !e.isTrusted) return;
+            if (!(e.target instanceof Node) || !mapDiv.contains(e.target)) return;
+            e.stopImmediatePropagation();
+            e.stopPropagation();
+        }, true);
+    }
+
     mapDiv.addEventListener('click', async (e) => {
         if (!isImporterActive || areaDrawing) return;
         // Other scripts sometimes fire synthetic clicks with no position; ignore them.
@@ -4404,7 +4416,7 @@
             if (beyond.unionFraction >= PARTIAL_OVERLAP_FRACTION && beyond.unionLen >= OVERLAP_MIN_M) return 'mapped';
             return 'extend';
         }
-        if (stubMatch) return 'mapped';
+        if (stubMatch && analysis.unionFraction >= PARTIAL_OVERLAP_FRACTION) return 'mapped';
         return analysis.unionFraction >= PARTIAL_OVERLAP_FRACTION ? 'mapped' : 'new';
     }
 
