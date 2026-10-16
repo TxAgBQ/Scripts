@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101607
+// @version      2026101608
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -542,7 +542,7 @@
             query: (box) => queryFirstWithData(roads, box, used, 'roads'),
             // every road layer you have on, merged: the block beyond a segment can live in another layer (county vs city)
             queryAll: async (box) => {
-                const answers = await Promise.all(roads.filter((l) => !brokenLayers.has(l.id)).map((l) => queryGislLayer(l, box).catch((err) => {
+                const answers = await Promise.all(roads.filter((l) => !l.fallback && !brokenLayers.has(l.id)).map((l) => queryGislLayer(l, box).catch((err) => {
                     console.warn(`[${SCRIPT_NAME}] GIS Layers query failed:`, err);
                     return { features: [] };
                 })));
@@ -595,9 +595,14 @@
         const visible = gislVisibleIds();
         const all = await loadGislLayers();
         const wanted = county.name.toLowerCase();
-        const layers = all
-            .filter((l) => visible.has(l.id) && !brokenLayers.has(l.id) && (!l.counties.length || l.counties.includes(wanted)))
-            .sort((a, b) => LEVEL_ORDER.indexOf(a.level) - LEVEL_ORDER.indexOf(b.level));
+        const byLevel = (a, b) => LEVEL_ORDER.indexOf(a.level) - LEVEL_ORDER.indexOf(b.level);
+        const checked = all.filter((l) => visible.has(l.id) && !brokenLayers.has(l.id));
+        // Layers for this county (or statewide) come first. Checked layers of other counties go last, as a fallback: a county's layer
+        // often covers a bit past its border (a road on the line can be in only the neighbour's layer).
+        const layers = [
+            ...checked.filter((l) => !l.counties.length || l.counties.includes(wanted)).sort(byLevel),
+            ...checked.filter((l) => l.counties.length && !l.counties.includes(wanted)).sort(byLevel).map((l) => ({ ...l, fallback: true }))
+        ];
         if (!layers.some((l) => l.role === 'roads')) {
             sourceProblem = `No road layer is checked in WME GIS Layers for ${county.name} County (or statewide).`;
             return null;
