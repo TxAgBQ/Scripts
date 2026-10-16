@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101604
+// @version      2026101605
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -832,38 +832,56 @@
             return tokens.join(' ');
         }
 
-        // The same street type twice at the end of a name ("Weston Dr Drive", "Trl Trail") is written once. Different types
-        // ("Jones Way Trail Drive Ln") are left alone. Only the last type word (before any trailing direction) is checked.
-        function dedupeStreetType(tokens) {
+        // A street type or direction written twice ("Weston Dr Drive", "Trl Trail", "West W Sherwood Dr", "Sherwood Dr W West") is
+        // written once, in WME's abbreviated form. Different types ("Jones Way Trail Drive Ln") are left alone.
+        // Works on items { u: UPPERCASE word, o: word as written }; returns { items, changed }.
+        const DIRECTION_LONG = { NORTH: 'N', SOUTH: 'S', EAST: 'E', WEST: 'W', NORTHEAST: 'NE', NORTHWEST: 'NW', SOUTHEAST: 'SE', SOUTHWEST: 'SW' };
+        function collapseRepeatedWords(items) {
             const expandedToShort = {};
             for (const [short, long] of Object.entries(TYPE_EXPANSIONS)) expandedToShort[long.toUpperCase()] = short;
             const known = new Set([...Object.values(LONG_TYPES), ...Object.values(ALT_TYPES), ...Object.keys(TYPE_EXPANSIONS)]);
-            const canon = (t) => {
+            const canonType = (t) => {
                 const c = LONG_TYPES[t] || ALT_TYPES[t] || expandedToShort[t] || t;
                 return known.has(c) ? c : '';
             };
-            const out = tokens.slice();
-            let end = out.length - 1;
-            while (end > 0 && DIRECTION_TOKENS.has(out[end])) end--;
-            if (end >= 2) {
-                const a = canon(out[end - 1]);
-                const b = canon(out[end]);
-                if (a && a === b) {
-                    out.splice(end - 1, 2, TYPE_EXPANSIONS[a] ? TYPE_EXPANSIONS[a].toUpperCase() : a);
-                    out.dupAt = end - 1;
-                }
+            const canonDir = (t) => (DIRECTION_TOKENS.has(t) ? t : DIRECTION_LONG[t] || '');
+            let out = items.slice();
+            let changed = false;
+            const merge = (at, word) => {
+                const u = TYPE_EXPANSIONS[word] ? TYPE_EXPANSIONS[word].toUpperCase() : word;
+                out.splice(at, 2, { u, o: formatNameToken(u, at, out.length - 1) });
+                changed = true;
+            };
+            // leading direction twice: West W Sherwood Dr
+            if (out.length >= 3) {
+                const a = canonDir(out[0].u);
+                if (a && a === canonDir(out[1].u)) merge(0, a);
             }
-            return out;
+            // trailing direction twice: Sherwood Dr W West
+            if (out.length >= 3) {
+                const a = canonDir(out[out.length - 2].u);
+                if (a && a === canonDir(out[out.length - 1].u)) merge(out.length - 2, a);
+            }
+            // the street type twice, just before any trailing direction
+            let end = out.length - 1;
+            while (end > 0 && DIRECTION_TOKENS.has(out[end].u)) end--;
+            if (end >= 2) {
+                const a = canonType(out[end - 1].u);
+                if (a && a === canonType(out[end].u)) merge(end - 1, a);
+            }
+            return { items: out, changed };
         }
 
-        // A mapped street name with its type written twice ("Weston Dr Drive") -> the name with it written once, or '' if it has none.
+        function dedupeStreetType(tokens) {
+            return collapseRepeatedWords(tokens.map((t) => ({ u: t, o: t }))).items.map((x) => x.o);
+        }
+
+        // A mapped street name with a type or direction written twice -> the name written once, or '' if it has none.
         function fixRepeatedType(name) {
             const original = String(name || '').trim().split(/\s+/).filter(Boolean);
             if (original.length < 3) return '';
-            const fixed = dedupeStreetType(original.map((t) => t.toUpperCase()));
-            if (fixed.dupAt === undefined) return '';
-            original.splice(fixed.dupAt, 2, formatNameToken(fixed[fixed.dupAt], fixed.dupAt, original.length - 1));
-            return original.join(' ');
+            const result = collapseRepeatedWords(original.map((t) => ({ u: t.toUpperCase(), o: t })));
+            return result.changed ? result.items.map((x) => x.o).join(' ') : '';
         }
 
         function buildStreetName(parts) {
@@ -977,7 +995,7 @@
         name: { colour: '#f29900', label: 'no street name' },
         city: { colour: '#fbc02d', label: 'no city (primary or alternate)' },
         badcity: { colour: '#1a73e8', label: 'primary city does not fit the city limits' },
-        duptype: { colour: '#8e24aa', label: 'street type written twice in the name (Dr Drive)' }
+        duptype: { colour: '#8e24aa', label: 'street type or direction written twice in the name (Dr Drive, W West)' }
     };
     let gapLayerReady = false;
     let gapZoomNote = '';
@@ -4919,7 +4937,7 @@
                 ccApply(id, { kind: 'name', name: single });
                 changed = true;
                 renamed = true;
-                notes.push(`Renamed "${current.name}" to "${single}" (street type was written twice).`);
+                notes.push(`Renamed "${current.name}" to "${single}" (type or direction was written twice).`);
                 cityCheckCache.clear();
             }
         }
@@ -6238,7 +6256,7 @@
         }
         if (!kind && name && fixRepeatedType(name)) {
             kind = 'duptype';
-            detail = `street type written twice: "${name}" should be "${fixRepeatedType(name)}"`;
+            detail = `type or direction written twice: "${name}" should be "${fixRepeatedType(name)}"`;
         }
         if (!kind) return null;
         return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' ? detail : GAP_KINDS[kind].label };
