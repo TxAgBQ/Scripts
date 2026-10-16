@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101502
+// @version      2026101503
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -507,7 +507,7 @@
         const cities = [];
         for (const f of FIELDS.postal) {
             const v = fieldValue(p, [f]);
-            if (v && !cities.some((c) => c.toLowerCase() === v.toLowerCase())) cities.push(v);
+            if (v && formatCityName(v) && !cities.some((c) => c.toLowerCase() === v.toLowerCase())) cities.push(v);
             if (cities.length >= 2) break;
         }
         return { cities, notes: [], missing: !cities.length };
@@ -623,7 +623,7 @@
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Address point postal lookup failed:`, err);
         }
-        if (defaultPostalCity) return { cities: [defaultPostalCity], notes: [], fromSetting: true };
+        if (defaultPostalCity && formatCityName(defaultPostalCity)) return { cities: [defaultPostalCity], notes: [], fromSetting: true };
         try {
             const near = await neighborPostal(source, coords, featureId);
             if (near) postal = { cities: near.postal.cities, notes: [], fromNeighbor: Math.round(near.dist) };
@@ -719,8 +719,10 @@
             return [...coords[0]];
         }
 
+        // "Unincorporated" is not a city, so it is never used as a primary or alternate city: it formats to nothing.
+        const NOT_A_CITY = /^\s*(?:unincorporated|unincorp\.?|uninc\.?)(?:\s|$)/i;
         function formatCityName(raw) {
-            if (typeof raw !== 'string') return '';
+            if (typeof raw !== 'string' || NOT_A_CITY.test(raw)) return '';
             return raw.trim().replace(/\s+/g, ' ').toLowerCase()
                 .replace(/(^|[\s-])([a-z])/g, (m, sep, ch) => sep + ch.toUpperCase());
         }
@@ -2173,7 +2175,7 @@
             } catch (err) {
                 continue;
             }
-            const cityName = (x) => (x && x.city && !x.city.isEmpty && x.city.name ? x.city.name : '');
+            const cityName = (x) => (x && x.city && !x.city.isEmpty && x.city.name && formatCityName(x.city.name) ? x.city.name : '');
             const alternates = (address.altStreets || []).map(cityName).filter(Boolean);
             const cities = alternates.length ? alternates : [cityName(address)].filter(Boolean);
             if (cities.length) best = { cities, segmentId: segment.id, dist: d };
@@ -2250,8 +2252,8 @@
 
         // Decide from the middle of the segment; flag it if the quarter points disagree.
         const inside = [0.25, 0.5, 0.75].map((f) => placeAt(places, pointAlongLine(coords, f)));
-        const primary = inside[1];
-        if (inside.some((name) => name !== primary)) {
+        const primary = formatCityName(inside[1]) ? inside[1] : '';
+        if (inside.some((name) => name !== inside[1])) {
             result.warn = true;
             result.notes.push(`Segment crosses a city limit (${[...new Set(inside)].map((n) => n || 'no city').join(' / ')}); check the city.`);
         }
