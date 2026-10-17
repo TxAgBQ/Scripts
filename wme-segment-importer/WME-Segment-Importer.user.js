@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101608
+// @version      2026101702
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -257,6 +257,31 @@
         return county;
     }
 
+    // Counties within `miles` of a point (a box around it), lower-cased names, from the same TIGERweb county layer. Used to keep the
+    // fallback to neighbouring layers local. Returns null if the lookup fails (then no neighbouring layers are used).
+    const NEARBY_MILES = 30;
+    const nearbyCache = new Map();
+    async function countiesNear(pt, miles = NEARBY_MILES) {
+        const key = `${pt.lon.toFixed(1)},${pt.lat.toFixed(1)},${miles}`;
+        if (nearbyCache.has(key)) return nearbyCache.get(key);
+        try {
+            if (tigerCountyLayerId === null) await countyAt(pt);
+            const dLat = miles / 69;
+            const dLon = miles / (69 * Math.cos((pt.lat * Math.PI) / 180));
+            const params = new URLSearchParams({
+                geometry: `${pt.lon - dLon},${pt.lat - dLat},${pt.lon + dLon},${pt.lat + dLat}`, geometryType: 'esriGeometryEnvelope', inSR: '4326',
+                spatialRel: 'esriSpatialRelIntersects', outFields: 'BASENAME,STATE', returnGeometry: 'false', f: 'json'
+            });
+            const data = await gmGetJson(`${TIGER_URL}/${tigerCountyLayerId}/query?${params}`);
+            const names = new Set((data.features || []).filter((f) => String(f.attributes.STATE) === '48').map((f) => String(f.attributes.BASENAME).toLowerCase()));
+            nearbyCache.set(key, names);
+            return names;
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Nearby county lookup failed:`, err);
+            return null;
+        }
+    }
+
     const roleOfLayer = (id, style) => {
         if (/parcel/i.test(id)) return null;
         if (/(pts|points|address|addr)/i.test(id)) return 'address';
@@ -417,17 +442,35 @@
     // Asks the layers in order (most local first) and returns the first answer that has features.
     async function queryFirstWithData(layers, box, used, role) {
         const errors = [];
-        for (const layer of layers) {
-            if (brokenLayers.has(layer.id)) continue;
+        const ask = async (layer) => {
             try {
-                const data = await queryGislLayer(layer, box);
-                if (data.features.length) {
-                    used[role] = layer.id;
-                    return data;
-                }
+                return await queryGislLayer(layer, box);
             } catch (err) {
                 errors.push(err.message || String(err));
                 console.warn(`[${SCRIPT_NAME}] GIS Layers query failed:`, err);
+                // a layer whose service is gone or unreachable is skipped from now on (until the page is reloaded)
+                if (/not found|does not exist|inaccessible|request to .* failed|timed out/i.test(err.message || '')) brokenLayers.set(layer.id, err.message || 'failed');
+                return null;
+            }
+        };
+        const live = layers.filter((l) => !brokenLayers.has(l.id));
+        // this county's (and statewide) layers, one at a time in order; the first with data wins
+        for (const layer of live.filter((l) => !l.fallback)) {
+            const data = await ask(layer);
+            if (data && data.features.length) {
+                used[role] = layer.id;
+                return data;
+            }
+        }
+        // nearby counties' layers are only a fallback, so they are asked together (a few at a time), not one after another
+        const fallback = live.filter((l) => l.fallback);
+        for (let i = 0; i < fallback.length; i += 8) {
+            const batch = fallback.slice(i, i + 8);
+            const answers = await Promise.all(batch.map(ask));
+            const hit = answers.findIndex((a) => a && a.features.length);
+            if (hit >= 0) {
+                used[role] = batch[hit].id;
+                return answers[hit];
             }
         }
         if (errors.length) console.warn(`[${SCRIPT_NAME}] ${role} layers with errors: ${errors.join('; ')}`);
@@ -599,9 +642,11 @@
         const checked = all.filter((l) => visible.has(l.id) && !brokenLayers.has(l.id));
         // Layers for this county (or statewide) come first. Checked layers of other counties go last, as a fallback: a county's layer
         // often covers a bit past its border (a road on the line can be in only the neighbour's layer).
+        const near = await countiesNear(pt);
         const layers = [
             ...checked.filter((l) => !l.counties.length || l.counties.includes(wanted)).sort(byLevel),
-            ...checked.filter((l) => l.counties.length && !l.counties.includes(wanted)).sort(byLevel).map((l) => ({ ...l, fallback: true }))
+            // only layers of counties within about NEARBY_MILES; none if the nearby counties could not be looked up
+            ...checked.filter((l) => l.counties.length && !l.counties.includes(wanted) && near && l.counties.some((c) => near.has(c))).sort(byLevel).map((l) => ({ ...l, fallback: true }))
         ];
         if (!layers.some((l) => l.role === 'roads')) {
             sourceProblem = `No road layer is checked in WME GIS Layers for ${county.name} County (or statewide).`;
@@ -1562,6 +1607,21 @@
     `;
     document.body.appendChild(cursorRing);
 
+    // While the importer is working the ring spins (one side goes clear), so a slow lookup doesn't look like a missed click.
+    const spinStyle = document.createElement('style');
+    spinStyle.textContent = '@keyframes wme-gis-ring-spin { to { transform: rotate(360deg); } }';
+    document.head.appendChild(spinStyle);
+    setInterval(() => {
+        const working = busy && isImporterActive && !areaDrawing;
+        const spinning = cursorRing.dataset.spin === '1';
+        if (working === spinning) return;
+        cursorRing.dataset.spin = working ? '1' : '0';
+        cursorRing.style.animation = working ? 'wme-gis-ring-spin 0.8s linear infinite' : 'none';
+        cursorRing.style.borderTopColor = working ? 'transparent' : cursorRing.style.borderColor;
+        cursorRing.style.width = cursorRing.style.height = working ? '30px' : '24px';
+        cursorRing.style.marginLeft = cursorRing.style.marginTop = working ? '-15px' : '-12px';
+    }, 120);
+
     function paintToggleButton(button, on, colour) {
         button.style.background = on ? colour : '#ffffff';
         button.style.borderColor = on ? colour : '#dadce0';
@@ -2335,7 +2395,8 @@
         result.primaryCity = primary;
         result.alternateCities = postalCities.filter((c) => c.toLowerCase() !== primary.toLowerCase());
         if (!postalCities.length) {
-            result.warn = true;
+            // the primary city from the city limits is enough; only a road with no city at all needs a look
+            if (!primary) result.warn = true;
             result.notes.push('GIS road has no postal city.');
         }
 
@@ -3548,7 +3609,7 @@
             // say which layers were asked and where, so a layer that is drawn but not being read can be spotted
             const asked = (source.roadLayers || []).map((l) => { const off = gislOffsetOf(l.id); return `${l.id}${off ? ` (shifted ${off.x} E, ${off.y} N)` : ''}`; });
             const where = source.county ? `${source.county} County` : 'this area';
-            setStatus(`No GIS feature under click. Looked in ${where}${asked.length ? ` at ${asked.join(', ')}` : ''}, about ${Math.round(0.00015 * 111320)} m around the click.`, 'warn');
+            setStatus(`No GIS feature under click. Looked in ${where}${asked.length ? ` at ${asked.filter((x, i) => i < 4).join(', ')}${asked.length > 4 ? ` and ${asked.length - 4} other layers` : ''}` : ''}, about ${Math.round(0.00015 * 111320)} m around the click.`, 'warn');
             console.warn(`[${SCRIPT_NAME}] No GIS feature under click at ${click.lat.toFixed(6)}, ${click.lon.toFixed(6)}; road layers asked: ${asked.join(', ') || '(Kendall source)'}`);
             return;
         }
@@ -4132,6 +4193,7 @@
         if (busy) return;
         busy = true;
         altHeld = e.altKey;
+        setStatus('Looking up the road...', 'info');
 
         try {
             // getLonLatFromPixel expects page (client) pixel coordinates, not map-relative ones.
