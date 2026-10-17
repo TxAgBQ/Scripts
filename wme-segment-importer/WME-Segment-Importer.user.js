@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101702
+// @version      2026101703
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4171,6 +4171,26 @@
         cursorRing.style.top = `${e.clientY}px`;
     });
 
+    // A press that moved (panning the map) or was held a while is not a click. The browser still sends a click when the button is
+    // released, so every map click handler asks pressWasDrag() first and ignores the click if it was really a drag.
+    const press = { down: false, x: 0, y: 0, t: 0, moved: false };
+    const DRAG_PX = 5;
+    const HOLD_MS = 600;
+    window.addEventListener('mousedown', (e) => {
+        press.pendingDrag = false;
+        if (e.button !== 0 || !(e.target instanceof Node) || !mapDiv.contains(e.target)) { press.down = false; return; }
+        Object.assign(press, { down: true, x: e.clientX, y: e.clientY, t: Date.now(), moved: false });
+    }, true);
+    window.addEventListener('mousemove', (e) => {
+        if (press.down && !press.moved && Math.hypot(e.clientX - press.x, e.clientY - press.y) > DRAG_PX) press.moved = true;
+    }, true);
+    window.addEventListener('mouseup', () => { press.pendingDrag = press.down && (press.moved || Date.now() - press.t > HOLD_MS); press.down = false; }, true);
+    function pressWasDrag() {
+        const dragged = !!press.pendingDrag;
+        press.pendingDrag = false;
+        return dragged;
+    }
+
     // Shift+click is WME's "zoom in" gesture and it acts on mouse down/up, before our click handler runs. Swallow those
     // events (window capture, so we run first) while Roads is on, so Shift-click reaches the importer as an override.
     for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick']) {
@@ -4186,6 +4206,7 @@
         if (!isImporterActive || areaDrawing) return;
         // Other scripts sometimes fire synthetic clicks with no position; ignore them.
         if (!e.isTrusted || typeof e.clientX !== 'number' || typeof e.clientY !== 'number') return;
+        if (pressWasDrag()) return; // the map was being panned: not a click
 
         e.stopPropagation();
         e.preventDefault();
@@ -5283,6 +5304,7 @@
     mapDiv.addEventListener('click', (e) => {
         if (area.phase !== 'drawing') return;
         if (!e.isTrusted || typeof e.clientX !== 'number' || typeof e.clientY !== 'number') return;
+        if (pressWasDrag()) return; // the map was being panned: not a corner
         e.stopImmediatePropagation();
         e.stopPropagation();
         e.preventDefault();
