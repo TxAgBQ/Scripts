@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101703
+// @version      2026101704
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -3977,9 +3977,19 @@
     }
 
     // opts.continueOnMismatch: when the mapped name differs from the GIS name, fill in the cities anyway (the name is left alone) and report it in `mismatch`.
+    function address0Name(segmentId) {
+        try {
+            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            return a.street && !a.street.isEmpty && a.street.name ? String(a.street.name).trim() : '';
+        } catch (err) {
+            return '';
+        }
+    }
+
     async function fillSegmentInfo(segmentId, opts = {}) {
         const segment = sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) return { message: 'Segment not found.', warn: true };
+        if (isRoundabout(segment) && !(address0Name(segmentId))) return { message: 'Nothing missing. Roundabouts do not get a street name.', info: true, match: null, mismatch: null };
         const coords = segment.geometry.coordinates;
         const source = await resolveSource({ lon: coords[0][0], lat: coords[0][1] });
         const address = sdk.DataModel.Segments.getAddress({ segmentId });
@@ -6343,6 +6353,7 @@
             for (let i = 1; i < pts.length && meters < GAP_SHORT_CONNECTOR_M; i++) meters += distanceMeters(pts[i - 1][1], pts[i - 1][0], pts[i][1], pts[i][0]);
             shortConnector = !thorough && meters < GAP_SHORT_CONNECTOR_M;
         }
+        if (!name && isRoundabout(segment)) shortConnector = true; // no name needed, in every kind of run
         let kind = null;
         let detail = GAP_KINDS.none.label;
         // An alternate city needs a street name, so an unnamed segment can only have a city when it lies inside city/CDP limits.
@@ -6369,6 +6380,9 @@
         if (!kind) return null;
         return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' ? detail : GAP_KINDS[kind].label };
     }
+
+    // A roundabout segment has a junctionId (checked in the console on a real roundabout). Roundabouts are not given street names.
+    const isRoundabout = (segment) => !!segment && segment.junctionId !== null && segment.junctionId !== undefined;
 
     function gapsWanted() {
         return scanLevel !== 'off';
@@ -6741,7 +6755,10 @@
             for (let i = 1; i < coords.length && meters < GAP_SHORT_CONNECTOR_M; i++) meters += distanceMeters(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]);
             shortConnector = meters < GAP_SHORT_CONNECTOR_M;
         }
+        const roundabout = isRoundabout(segment);
+        if (!addr.name && roundabout) shortConnector = true;
         if (addr.name) result.rows.push({ label: 'Street name', text: addr.name, level: 'ok' });
+        else if (roundabout) result.rows.push({ label: 'Street name', text: 'None, which is right for a roundabout.', level: 'ok' });
         else if (shortConnector) result.rows.push({ label: 'Street name', text: `None, which is fine for a short connector (under ${GAP_SHORT_CONNECTOR_M} m).`, level: 'ok' });
         else {
             result.rows.push({ label: 'Street name', text: 'None. Name it (the Roads fill-in can do it from the GIS or Google Maps).', level: 'error' });
@@ -6820,7 +6837,7 @@
                     const match = await gisRoadAlong(segment, source).catch(() => null);
                     const props = match ? match.feature.properties || {} : {};
                     // The GIS road along this segment names it differently (e.g. "Huntwick" mapped, "Huntwick Dr" in the GIS): offer the GIS name
-                    const gisName = match && addr.name ? buildStreetName(source.nameParts(props)).name : '';
+                    const gisName = match && addr.name && !roundabout ? buildStreetName(source.nameParts(props)).name : '';
                     if (gisName && normalizeName(gisName) !== normalizeName(addr.name) && normalizeName(gisName) !== normalizeName(buildStreetName({ full: addr.name }).name)
                         && !keptNames.has(keptKey(segmentId, gisName))) {
                         const layerNote = match.layerId ? `GIS Layers: ${match.layerId}` : source.label;
