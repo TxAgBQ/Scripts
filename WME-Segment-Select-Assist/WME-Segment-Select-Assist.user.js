@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Segment Select Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.10.18.02
+// @version      2026.10.18.03
 // @description  Select a first and last segment, then click one link in the edit panel to select every segment in between (shortest connected path, one side only).
 // @author       TxAgBQ
 // @match        https://www.waze.com/editor*
@@ -71,7 +71,7 @@
     }
 
     function GM_VERSION() {
-        return '2026.10.18.02';
+        return '2026.10.18.03';
     }
 
     // ---------- UI ----------
@@ -113,7 +113,13 @@
             anchor.parentElement.insertAdjacentElement('afterend', wrapper);
             return;
         }
-        // Fallback: top of the edit panel.
+        // Multi-select panel has no "Select entire street": sit just below the address area instead.
+        const alt = document.querySelector('#edit-panel .alt-streets-control');
+        if (alt) {
+            alt.insertAdjacentElement('afterend', wrapper);
+            return;
+        }
+        // Last resort: top of the edit panel.
         const panel = document.getElementById('edit-panel');
         if (panel) panel.prepend(wrapper);
     }
