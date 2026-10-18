@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Segment Select Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.10.18.03
+// @version      2026.10.18.04
 // @description  Select a first and last segment, then click one link in the edit panel to select every segment in between (shortest connected path, one side only).
 // @author       TxAgBQ
 // @match        https://www.waze.com/editor*
@@ -71,7 +71,7 @@
     }
 
     function GM_VERSION() {
-        return '2026.10.18.03';
+        return '2026.10.18.04';
     }
 
     // ---------- UI ----------
@@ -98,6 +98,7 @@
         if (existing && document.body.contains(existing)) return;
 
         const wrapper = document.createElement('div');
+        wrapper.style.marginBottom = '10px'; // breathing room above the Length list
         const btn = document.createElement('wz-button');
         btn.id = BUTTON_ID;
         btn.setAttribute('color', 'text');
@@ -107,13 +108,14 @@
         btn.addEventListener('click', runSelectBetween);
         wrapper.appendChild(btn);
 
-        // Anchor by class, not by English text, so other languages work.
-        const anchor = document.querySelector('wz-button.select-entire-street');
-        if (anchor && anchor.parentElement) {
-            anchor.parentElement.insertAdjacentElement('afterend', wrapper);
+        // Preferred spot: just above the Length list (anchored by class, not English text).
+        const lengthItem = document.querySelector('#edit-panel li.length-attribute');
+        const lengthList = lengthItem && lengthItem.parentElement;
+        if (lengthList) {
+            lengthList.insertAdjacentElement('beforebegin', wrapper);
             return;
         }
-        // Multi-select panel has no "Select entire street": sit just below the address area instead.
+        // Fallback: just below the address area.
         const alt = document.querySelector('#edit-panel .alt-streets-control');
         if (alt) {
             alt.insertAdjacentElement('afterend', wrapper);
