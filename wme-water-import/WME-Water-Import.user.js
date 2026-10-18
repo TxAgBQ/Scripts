@@ -2,7 +2,7 @@
 // @name         WME Water Import
 // @namespace    wme-water-import
 // @author       TxAgBQ
-// @version      2026101505
+// @version      2026101801
 // @description  Click a creek, river or pond on the map and add it to WME as a Place (River/Stream or Lake) using the FEMA/NOAA water data that GIS Layers also shows. Streams are drawn as a narrow area along the stream. Nothing is saved for you.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -502,14 +502,28 @@
                 clearAfterAdd(id);
                 return;
             }
+            // lock the new Place at level 3 (WME counts lock ranks from 0, so level 3 is rank 2); never above the editor's own level
+            let lockNote = '';
+            try {
+                const info = sdk.State.getUserInfo ? sdk.State.getUserInfo() : null;
+                const own = info && Number.isFinite(info.rank) ? info.rank : LOCK_RANK;
+                const rank = Math.min(LOCK_RANK, own);
+                sdk.DataModel.Venues.updateVenue({ venueId: id, lockRank: rank });
+                lockNote = ` Locked at level ${rank + 1}.`;
+            } catch (err) {
+                console.warn(`[${SCRIPT_NAME}] Could not lock the Place:`, err);
+                lockNote = ' Could not set the lock level; set it by hand.';
+            }
             const label = categories.find((c) => String(c.id) === String(categoryId))?.label || 'Place';
-            setStatus(`${name} added as ${label}${pick.kind === 'line' ? `, ${currentWidth()} m wide` : ''}.It is not saved yet: look it over, then save.`, area.crosses ? 'warn' : 'ok');
+            setStatus(`${name} added as ${label}${pick.kind === 'line' ? `, ${currentWidth()} m wide` : ''}.It is not saved yet: look it over, then save.${lockNote}`, area.crosses || /Could not/.test(lockNote) ? 'warn' : 'ok');
             clearAfterAdd(id);
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Add failed:`, err);
             setStatus(`${name}: WME would not add it (${err.message || err}).`, 'error');
         }
     }
+
+    const LOCK_RANK = 2; // lock level 3
 
     function clearAfterAdd(id) {
         const keep = ui.status.textContent;
