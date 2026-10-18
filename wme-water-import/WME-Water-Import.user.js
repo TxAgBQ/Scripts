@@ -2,7 +2,7 @@
 // @name         WME Water Import
 // @namespace    wme-water-import
 // @author       TxAgBQ
-// @version      2026101801
+// @version      2026101802
 // @description  Click a creek, river or pond on the map and add it to WME as a Place (River/Stream or Lake) using the FEMA/NOAA water data that GIS Layers also shows. Streams are drawn as a narrow area along the stream. Nothing is saved for you.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -531,9 +531,11 @@
         clearPick();
         ui.status.textContent = keep;
         ui.status.style.color = colour;
+        // Clearing the selection (the Place is not left selected) lets WME go back to the script's tab, ready for the next one.
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'venue', ids: [id] } });
-        } catch (err) { /* selecting is only a convenience */ }
+            if (typeof sdk.Editing.clearSelection === 'function') sdk.Editing.clearSelection();
+            else sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [] } });
+        } catch (err) { /* only a convenience */ }
     }
 
     // ------------------------------------------------------------------
