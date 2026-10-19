@@ -2,7 +2,7 @@
 // @name         WME Water Import
 // @namespace    wme-water-import
 // @author       TxAgBQ
-// @version      2026101803
+// @version      2026101901
 // @description  Click a creek, river or pond on the map and add it to WME as a Place (River/Stream or Lake) using the FEMA/NOAA water data that GIS Layers also shows. Streams are drawn as a narrow area along the stream. Nothing is saved for you.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1063,6 +1063,265 @@
     });
 
     // ------------------------------------------------------------------
+    // Magic wand: click inside a pond on WME's own imagery and the connected area of about the same colour becomes the shape
+    // ------------------------------------------------------------------
+    const WAND = { R: 384, DEFAULT_TOL: 30, MIN_ZOOM: 17, MAX_ZOOM: 19, MAX_POINTS: 220 };
+    const tileCache = new Map();
+    let wanding = false;
+    let wandSeed = null; // { lon, lat } of the last click, so changing the tolerance can run it again
+
+    // the imagery tiles are .../tile/v1/tiles/{z}/{x}/{y}?session=..&key=..; one tile on the page gives the address pattern
+    function imageryTemplate() {
+        const root = mapDiv;
+        const src = [...root.querySelectorAll('img')].map((i) => i.src).find((s) => /googleapis\.com\/tile\/v1\/tiles\/\d+\/\d+\/\d+/.test(s));
+        return src || null;
+    }
+
+    function loadTile(sample, z, x, y) {
+        const key = `${z}/${x}/${y}`;
+        if (tileCache.has(key)) return tileCache.get(key);
+        const u = new URL(sample);
+        u.pathname = u.pathname.replace(/tiles\/\d+\/\d+\/\d+/, `tiles/${z}/${x}/${y}`);
+        const p = new Promise((resolve) => {
+            const im = new Image();
+            im.crossOrigin = 'anonymous';
+            im.onload = () => resolve(im);
+            im.onerror = () => resolve(null);
+            im.src = u.toString();
+            setTimeout(() => resolve(null), 10000);
+        });
+        if (tileCache.size > 80) tileCache.delete(tileCache.keys().next().value);
+        tileCache.set(key, p);
+        return p;
+    }
+
+    const worldPx = (lon, lat, z) => {
+        const n = 256 * 2 ** z;
+        const s = Math.sin((lat * Math.PI) / 180);
+        return [((lon + 180) / 360) * n, (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * n];
+    };
+    const worldLonLat = (px, py, z) => {
+        const n = 256 * 2 ** z;
+        const lon = (px / n) * 360 - 180;
+        const lat = (Math.atan(Math.sinh(Math.PI * (1 - (2 * py) / n))) * 180) / Math.PI;
+        return [lon, lat];
+    };
+
+    // the picture around a spot as pixel data: { data, w, h, x0, y0, z }
+    async function imageryAround(lon, lat) {
+        const sample = imageryTemplate();
+        if (!sample) throw new Error('no WME imagery tiles are on the page. Turn on the satellite imagery layer.');
+        const z = Math.max(WAND.MIN_ZOOM, Math.min(WAND.MAX_ZOOM, Math.round(sdk.Map.getZoomLevel())));
+        const [cx, cy] = worldPx(lon, lat, z);
+        const tx0 = Math.floor((cx - WAND.R) / 256);
+        const tx1 = Math.floor((cx + WAND.R) / 256);
+        const ty0 = Math.floor((cy - WAND.R) / 256);
+        const ty1 = Math.floor((cy + WAND.R) / 256);
+        const w = (tx1 - tx0 + 1) * 256;
+        const h = (ty1 - ty0 + 1) * 256;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const g = canvas.getContext('2d', { willReadFrequently: true });
+        const jobs = [];
+        for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) jobs.push(loadTile(sample, z, tx, ty).then((im) => ({ im, tx, ty })));
+        const got = await Promise.all(jobs);
+        if (got.some((t) => !t.im)) throw new Error('some imagery tiles would not load');
+        for (const t of got) g.drawImage(t.im, (t.tx - tx0) * 256, (t.ty - ty0) * 256);
+        let image;
+        try {
+            image = g.getImageData(0, 0, w, h);
+        } catch (err) {
+            throw new Error('the imagery could not be read (the browser blocked it)');
+        }
+        return { data: image.data, w, h, x0: tx0 * 256, y0: ty0 * 256, z, seedX: Math.round(cx - tx0 * 256), seedY: Math.round(cy - ty0 * 256) };
+    }
+
+    // the connected pixels near the colour at the seed; returns { mask, count, touchesEdge }
+    function floodSimilar(img, tol) {
+        const { data, w, h, seedX, seedY } = img;
+        let r = 0, gr = 0, b = 0, n = 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+            const x = seedX + dx; const y = seedY + dy;
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            const i = (y * w + x) * 4;
+            r += data[i]; gr += data[i + 1]; b += data[i + 2]; n++;
+        }
+        r /= n; gr /= n; b /= n;
+        const lim = tol * tol;
+        const mask = new Uint8Array(w * h);
+        const stack = new Int32Array(w * h);
+        let sp = 0;
+        let count = 0;
+        let touchesEdge = false;
+        const similar = (p) => {
+            const i = p * 4;
+            const dr = data[i] - r; const dg = data[i + 1] - gr; const db = data[i + 2] - b;
+            return dr * dr + dg * dg + db * db <= lim;
+        };
+        const start = seedY * w + seedX;
+        if (!similar(start)) return { mask, count: 0, touchesEdge: false, color: [r, gr, b] };
+        mask[start] = 1;
+        stack[sp++] = start;
+        while (sp) {
+            const p = stack[--sp];
+            count++;
+            const x = p % w; const y = (p - x) / w;
+            if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touchesEdge = true;
+            if (x > 0 && !mask[p - 1] && similar(p - 1)) { mask[p - 1] = 1; stack[sp++] = p - 1; }
+            if (x < w - 1 && !mask[p + 1] && similar(p + 1)) { mask[p + 1] = 1; stack[sp++] = p + 1; }
+            if (y > 0 && !mask[p - w] && similar(p - w)) { mask[p - w] = 1; stack[sp++] = p - w; }
+            if (y < h - 1 && !mask[p + w] && similar(p + w)) { mask[p + w] = 1; stack[sp++] = p + w; }
+        }
+        return { mask, count, touchesEdge, color: [r, gr, b] };
+    }
+
+    // fills holes (a boat, a reflection) and rounds off ragged edges
+    function cleanMask(mask, w, h) {
+        // holes: anything not reachable from the border through non-mask pixels is inside
+        const outside = new Uint8Array(w * h);
+        const stack = new Int32Array(w * h);
+        let sp = 0;
+        const push = (p) => { if (!mask[p] && !outside[p]) { outside[p] = 1; stack[sp++] = p; } };
+        for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+        for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+        while (sp) {
+            const p = stack[--sp];
+            const x = p % w; const y = (p - x) / w;
+            if (x > 0) push(p - 1);
+            if (x < w - 1) push(p + 1);
+            if (y > 0) push(p - w);
+            if (y < h - 1) push(p + w);
+        }
+        const filled = new Uint8Array(w * h);
+        for (let p = 0; p < w * h; p++) filled[p] = outside[p] ? 0 : 1;
+        // majority smoothing over 5x5 (box counts via a running sum is overkill here: one pass over the filled area's box)
+        let minX = w, minY = h, maxX = 0, maxY = 0;
+        for (let p = 0; p < w * h; p++) if (filled[p]) { const x = p % w; const y = (p - x) / w; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+        if (maxX < minX) return filled;
+        const out = new Uint8Array(w * h);
+        for (let y = Math.max(2, minY - 3); y <= Math.min(h - 3, maxY + 3); y++) {
+            for (let x = Math.max(2, minX - 3); x <= Math.min(w - 3, maxX + 3); x++) {
+                let c = 0;
+                for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) c += filled[(y + dy) * w + (x + dx)];
+                out[y * w + x] = c >= 13 ? 1 : 0;
+            }
+        }
+        return out;
+    }
+
+    // the outer edge of the region that contains (seedX, seedY), as corner points; null if there is none
+    function traceOutline(mask, w, h, seedX, seedY) {
+        // find a pixel of the region's component to start from: walk left from the seed to the first edge
+        let sx = seedX; const sy = seedY;
+        if (!mask[sy * w + sx]) return null;
+        while (sx > 0 && mask[sy * w + sx - 1]) sx--;
+        const at = (x, y) => x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === 1;
+        // the first boundary pixel above the start: climb so the start is the top-left of the component column
+        // (the outline found from here is the outer edge when the region has no holes, which cleanMask guarantees)
+        let startX = sx; let startY = sy;
+        while (at(startX, startY - 1)) startY--;
+        // corner (startX, startY) heading east, region on the right-hand side
+        let x = startX; let y = startY; let d = 0;
+        const pts = [[x, y]];
+        const max = 4 * w * h;
+        for (let step = 0; step < max; step++) {
+            // pixels ahead-left and ahead-right of the corner for this heading
+            let L; let R;
+            if (d === 0) { L = at(x, y - 1); R = at(x, y); }
+            else if (d === 1) { L = at(x, y); R = at(x - 1, y); }
+            else if (d === 2) { L = at(x - 1, y); R = at(x - 1, y - 1); }
+            else { L = at(x - 1, y - 1); R = at(x, y - 1); }
+            if (L) d = (d + 3) % 4; else if (!R) d = (d + 1) % 4;
+            if (d === 0) x++; else if (d === 1) y++; else if (d === 2) x--; else y--;
+            if (x === startX && y === startY) break;
+            pts.push([x, y]);
+        }
+        return pts;
+    }
+
+    function ringArea(pts) {
+        let a = 0;
+        for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) a += (pts[j][0] + pts[i][0]) * (pts[j][1] - pts[i][1]);
+        return Math.abs(a / 2);
+    }
+
+    async function runWand(lon, lat) {
+        wandSeed = { lon, lat };
+        const tol = Math.max(5, Math.min(90, parseFloat(ui.wandTol.value) || WAND.DEFAULT_TOL));
+        setStatus('Reading the imagery...', 'info');
+        const img = await imageryAround(lon, lat);
+        const found = floodSimilar(img, tol);
+        if (found.count < 20) {
+            setStatus(`Nothing around that spot is close enough in colour (${found.color.map(Math.round).join(', ')}). Raise the tolerance or click nearer the middle of the water.`, 'warn');
+            return;
+        }
+        const mask = cleanMask(found.mask, img.w, img.h);
+        const raw = traceOutline(mask, img.w, img.h, img.seedX, img.seedY);
+        if (!raw || raw.length < 8) {
+            setStatus('Could not make an outline from that. Try a different spot or tolerance.', 'warn');
+            return;
+        }
+        // thin the corner points, then to longitude / latitude
+        let ptsPx = raw;
+        let tolPx = 1.2;
+        do {
+            ptsPx = simplify(raw, tolPx);
+            tolPx *= 1.5;
+        } while (ptsPx.length > WAND.MAX_POINTS && tolPx < 20);
+        const ring = ptsPx.map((p) => worldLonLat(img.x0 + p[0], img.y0 + p[1], img.z));
+        ring.push(ring[0]);
+        const mPerPx = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / 2 ** img.z;
+        const areaM2 = ringArea(ptsPx) * mPerPx * mPerPx;
+        pick = { kind: 'area', name: '', desc: `Magic wand, about ${Math.round(areaM2).toLocaleString()} m², tolerance ${tol}`, ring };
+        afterPick();
+        const hint = found.touchesEdge
+            ? 'The shape runs to the edge of the area read, so it has probably leaked into something of the same colour. Lower the tolerance.'
+            : 'If it fell short or leaked, change the tolerance and click again.';
+        setStatus(`Shape made: about ${Math.round(areaM2).toLocaleString()} m², ${ring.length - 1} points. ${hint} Type a name, then add it.`, found.touchesEdge ? 'warn' : 'ok');
+    }
+
+    async function onWandClick(e) {
+        if (!wanding || e.button !== 0) return;
+        if (waPress.drag) { waPress.drag = false; return; }
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        if (busy) return;
+        busy = true;
+        renderPanel();
+        try {
+            const click = sdk.Map.getLonLatFromPixel({ x: e.clientX, y: e.clientY });
+            await runWand(click.lon, click.lat);
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Magic wand failed:`, err);
+            setStatus(`Magic wand: ${err.message || err}`, 'error');
+        } finally {
+            busy = false;
+            renderPanel();
+        }
+    }
+
+    function setWanding(on) {
+        wanding = on;
+        if (on && picking) setPicking(false);
+        if (on && wa.phase === 'drawing') waFinishDrawing();
+        ui.wandBtn.textContent = on ? 'Click inside the water (Esc stops)' : 'Magic wand (colour match)';
+        ui.wandBtn.style.background = on ? COLOUR : '#fff';
+        ui.wandBtn.style.color = on ? '#fff' : COLOUR;
+        mapDiv.style.cursor = on ? 'crosshair' : '';
+        if (on) setStatus('Click inside the pond or lake on the satellite imagery.', 'info');
+    }
+
+    mapDiv.addEventListener('click', onWandClick, true);
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && wanding) {
+            setWanding(false);
+            setStatus('Stopped.', 'info');
+        }
+    });
+
+    // ------------------------------------------------------------------
     // Sidebar tab
     // ------------------------------------------------------------------
     const { tabLabel, tabPane } = await sdk.Sidebar.registerScriptTab();
@@ -1077,6 +1336,29 @@
     ui.pickBtn.style.width = '100%';
     ui.pickBtn.addEventListener('click', () => setPicking(!picking));
     tabPane.appendChild(ui.pickBtn);
+
+    ui.wandBtn = button('Magic wand (colour match)', false);
+    ui.wandBtn.style.width = '100%';
+    ui.wandBtn.style.marginTop = '6px';
+    ui.wandBtn.title = 'For water that is not in the water data: click inside it on the satellite imagery and the area of about the same colour becomes the shape.';
+    ui.wandBtn.addEventListener('click', () => setWanding(!wanding));
+    tabPane.appendChild(ui.wandBtn);
+    const tolRow = el('div', 'display: flex; align-items: center; gap: 6px; margin: 6px 0;');
+    ui.wandTol = el('input', 'flex: 1;');
+    ui.wandTol.type = 'range';
+    ui.wandTol.min = '5';
+    ui.wandTol.max = '90';
+    ui.wandTol.value = String(WAND.DEFAULT_TOL);
+    ui.wandTolLabel = el('span', 'width: 28px; text-align: right;', String(WAND.DEFAULT_TOL));
+    ui.wandTol.addEventListener('input', () => { ui.wandTolLabel.textContent = ui.wandTol.value; });
+    ui.wandTol.addEventListener('change', async () => {
+        if (!wandSeed || !pick || pick.kind !== 'area' || !/^Magic wand/.test(pick.desc || '') || busy) return;
+        busy = true;
+        renderPanel();
+        try { await runWand(wandSeed.lon, wandSeed.lat); } catch (err) { setStatus(`Magic wand: ${err.message || err}`, 'error'); } finally { busy = false; renderPanel(); }
+    });
+    tolRow.append(el('span', 'width: 70px;', 'Tolerance'), ui.wandTol, ui.wandTolLabel);
+    tabPane.appendChild(tolRow);
 
     const wholeRow = el('label', 'display: flex; align-items: center; gap: 6px; margin: 8px 0;');
     ui.whole = el('input');
