@@ -2,7 +2,7 @@
 // @name         WME Water Import
 // @namespace    wme-water-import
 // @author       TxAgBQ
-// @version      2026101901
+// @version      2026101902
 // @description  Click a creek, river or pond on the map and add it to WME as a Place (River/Stream or Lake) using the FEMA/NOAA water data that GIS Layers also shows. Streams are drawn as a narrow area along the stream. Nothing is saved for you.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -426,8 +426,7 @@
         picking = false;
         ui.name.value = pick.name;
         ui.detail.textContent = `${pick.name || 'Unnamed'}: ${pick.desc}.`;
-        const re = pick.kind === 'line' ? /river|stream/i : /sea|lake|pool/i;
-        const id = findCategory(re);
+        const id = pick.kind === 'line' ? findCategory(/river|stream/i) : (findCategory(/sea[\W_]*lake/i) ?? findCategory(/lake|pool|pond/i));
         if (id !== null) ui.category.value = String(id);
         const area = currentArea();
         drawPreview();
