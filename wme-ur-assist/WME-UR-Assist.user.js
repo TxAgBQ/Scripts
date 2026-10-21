@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.15.03
+// @version      2026.10.20.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -2424,7 +2424,13 @@ ${list}`;
             Sync.run();
           },
         }),
-        el('button', { textContent: 'Sync now', onclick: () => Sync.run() })),
+        el('button', { textContent: 'Sync now', onclick: () => Sync.run() }),
+        el('button', {
+          textContent: 'Re-import everything',
+          title: 'Ask the sheet for every saved status, note, blacklist and visited / read mark, not just recent changes',
+          onclick: () => { GM_setValue('syncSince', 0); Sync.run(); },
+        })),
+      el('div', { class: 'ua-muted' }, 'After "Re-import everything", reload WME so UR-MP picks up the visited and read marks.'),
       ui.syncLine,
       ui.blLine,
       ui.readLine);
