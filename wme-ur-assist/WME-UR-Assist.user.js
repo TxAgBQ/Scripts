@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.20.01
+// @version      2026.10.20.02
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -913,8 +913,11 @@ ${list}`;
     },
  
     // Starts a sync (or joins the one already running); resolves when it is done
-    run() {
-      if (!this.enabled()) return Promise.resolve();
+    run(manual) {
+      if (!this.enabled()) {
+        if (manual) this.status('Not set up yet: type the web app URL and the secret word into the boxes above, click Save & sync now, then try again.');
+        return Promise.resolve();
+      }
       if (this.busy && this.inflight) return this.inflight;
       this.inflight = this._run();
       return this.inflight;
@@ -2421,14 +2424,14 @@ ${list}`;
             settings.syncUrl = urlInput.value;
             settings.syncSecret = secretInput.value;
             if (changedTarget) GM_setValue('syncSince', 0); // new sheet: send everything
-            Sync.run();
+            Sync.run(true);
           },
         }),
-        el('button', { textContent: 'Sync now', onclick: () => Sync.run() }),
+        el('button', { textContent: 'Sync now', onclick: () => Sync.run(true) }),
         el('button', {
           textContent: 'Re-import everything',
           title: 'Ask the sheet for every saved status, note, blacklist and visited / read mark, not just recent changes',
-          onclick: () => { GM_setValue('syncSince', 0); Sync.run(); },
+          onclick: () => { GM_setValue('syncSince', 0); Sync.status('Re-importing everything from the sheet…'); Sync.run(true); },
         })),
       el('div', { class: 'ua-muted' }, 'After "Re-import everything", reload WME so UR-MP picks up the visited and read marks.'),
       ui.syncLine,
