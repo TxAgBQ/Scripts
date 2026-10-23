@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME History Time Display
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.10.23.01
+// @version      2026.10.23.02
 // @description  Adds the time of day to edit History entries and the "Last updated" line in the Waze Map Editor (e.g. 18 Sep 26 · 2:41 PM).
 // @author       TxAgBQ
 // @license      MIT
@@ -13,10 +13,10 @@
 // @exclude      https://beta.waze.com/user/editor*
 // @grant        none
 // @run-at       document-end
-// @homepageURL  https://github.com/TxAgBQ/Scripts
+// @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-History-Time-Display
 // @supportURL   https://github.com/TxAgBQ/Scripts/issues
-// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-History-Time-Display.user.js
-// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-History-Time-Display.user.js
+// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-History-Time-Display/WME-History-Time-Display.user.js
+// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-History-Time-Display/WME-History-Time-Display.user.js
 // ==/UserScript==
 
 /*
@@ -40,7 +40,7 @@
 
     const SCRIPT_ID = 'wme-history-time-display';
     const SCRIPT_NAME = 'WME History Time Display';
-    const VERSION = '2026.10.23.01';
+    const VERSION = '2026.10.23.02';
     const MARK = '·';
     const LOG = '[' + SCRIPT_NAME + ']';
 
