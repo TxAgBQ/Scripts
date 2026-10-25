@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.20.02
+// @version      2026.10.25.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -767,10 +767,12 @@ ${list}`;
   }
  
   // Automatic popcorn: another editor has replied and you never have
-  function autoPopcorn(comments) {
-    return !!myName && comments.some(c => c.role === 'editor') && !comments.some(c => c.role === 'me');
+  // Also when an editor (rank 2-6 after the name, never Map_Team) filed the report itself, with or without comments (EditorReport below)
+  function autoPopcorn(comments, urId) {
+    return !!myName && !comments.some(c => c.role === 'me') &&
+      (comments.some(c => c.role === 'editor') || (urId != null && !!urStore[urId]?.flags?.includes(EDITOR_REPORT)));
   }
-  const POPCORN_AUTO_TITLE = 'Another editor replied and you haven\'t – watching';
+  const POPCORN_AUTO_TITLE = 'Another editor reported or replied and you haven\'t – watching';
  
   // ===== STANDARD-REPLY REPORTS (cameras, trains on the tracks) =====
   // 'auto'   = nobody has added anything – the reply is filled in and Not identified selected when you open it
@@ -1068,7 +1070,9 @@ ${list}`;
   //   Receiving: when UR-MP loads its list, the Hook above puts the markers in before UR-MP sees it (see Hook).
   const READ_VIS = 'urmp-vis';   // hidden marker: visited in UR-MP
   const READ_LV = 'urmp-lv:';    // hidden marker: read count, e.g. urmp-lv:7
-  const isUrmpMarker = f => f === BL_ON || f === BL_OFF || f === READ_VIS || String(f).startsWith(READ_LV);
+  // (hidden markers that travel with a report: UR-MP's blacklist, visited, read count, and "an editor filed this report")
+  const EDITOR_REPORT = 'edrep';
+  const isUrmpMarker = f => f === BL_ON || f === BL_OFF || f === READ_VIS || f === EDITOR_REPORT || String(f).startsWith(READ_LV);
   const lvOf = v => Math.max(0, ...(v?.flags || []).filter(f => String(f).startsWith(READ_LV)).map(f => Number(String(f).slice(READ_LV.length)) || 0));
   const visOf = v => !!v?.flags?.includes(READ_VIS);
   const markerSig = flags => (flags || []).filter(isUrmpMarker).sort().join(',');
@@ -1078,6 +1082,7 @@ ${list}`;
     const w = winner || [], o = other || [];
     const out = w.filter(f => f !== READ_VIS && !String(f).startsWith(READ_LV));
     if (w.includes(READ_VIS) || o.includes(READ_VIS)) out.push(READ_VIS);
+    if (!out.includes(EDITOR_REPORT) && o.includes(EDITOR_REPORT)) out.push(EDITOR_REPORT);
     const lv = Math.max(lvOf({ flags: w }), lvOf({ flags: o }));
     if (lv > 0) out.push(READ_LV + lv);
     if (!out.includes(BL_ON) && !out.includes(BL_OFF)) {
@@ -1495,7 +1500,7 @@ ${list}`;
         const dupeOf = Dupes.closeOf.get(r.urId)?.keep || null;
         const comments = URMP.comments(r.tr);
         const auto = autoState(URMP.description(r.urId), comments);
-        const popcorn = autoPopcorn(comments);
+        const popcorn = autoPopcorn(comments, r.urId);
         const blacklisted = UrmpBL.has(r.urId);
         const possibleDupe = Dupes.possible.get(r.urId) || null;
         const key = JSON.stringify([info?.flags || [], info?.note || '', overdue, dupeOf, auto && [auto.rule.id, auto.state], popcorn, blacklisted, possibleDupe]);
@@ -2060,7 +2065,7 @@ ${list}`;
     const info = urInfo(id), f = info.flags;
     return f.includes('closure') && !f.includes('maybeclosure') &&
       !['mapwork', 'watching', 'dupe'].some(x => f.includes(x)) &&
-      !UrmpBL.has(id) && !autoPopcorn(comments) &&
+      !UrmpBL.has(id) && !autoPopcorn(comments, id) &&
       comments.every(c => c.role === 'system') &&
       overdueFor(info, comments, reportedOn) &&
       closureSaid(desc, type);
@@ -2195,6 +2200,32 @@ ${list}`;
     }
   }
  
+  // ===== EDITOR-FILED REPORTS (not SDK — reads the reporter's name from WME's UR panel) =====
+  // The reporter's name shows in the panel as "DRail_100(5)": the number is the editor's rank. Rank 2-6 means an editor filed
+  // this report, so it gets the automatic popcorn like a report an editor replied to. Map_Team (also rank 6) and you never count.
+  // WME's data has no reporter name, and UR-MP's list doesn't show one, so this happens when you open the report; the hidden
+  // marker then keeps the popcorn on its row (and syncs to your other laptop).
+  const EDITOR_RANKS = [2, 3, 4, 5, 6];
+  function parseReporter(text) {
+    const m = String(text || '').replace(/\s+/g, ' ').trim().match(/^(?:Username:\s*)?(.+?)\s*\((\d+)\)$/);
+    return m ? { name: m[1].trim(), rank: Number(m[2]) } : null;
+  }
+  const isEditorReporter = r => !!r && EDITOR_RANKS.includes(r.rank) && roleOf(r.name) === 'editor';
+  const EditorReport = {
+    cand: null, // { id, name, count }: the same reporter seen on the same open report a few checks in a row (the panel can lag behind)
+    check(card, id) {
+      const el0 = card.querySelector('[data-testid="issue-panel-header-username"]');
+      const r = el0 ? parseReporter(el0.textContent) : null;
+      if (!isEditorReporter(r) || urInfo(id).flags.includes(EDITOR_REPORT)) { this.cand = null; return; }
+      if (!this.cand || this.cand.id !== id || this.cand.name !== r.name) { this.cand = { id, name: r.name, count: 1 }; return; }
+      if (++this.cand.count < 3) return;
+      this.cand = null;
+      const cur = urInfo(id);
+      saveUrInfo(id, { ...cur, flags: [...cur.flags, EDITOR_REPORT] });
+      LOG(`Editor-filed report (rank ${r.rank}): popcorn set on UR ${id}.`);
+    },
+  };
+
   // ===== UR PANEL HEADER (not SDK — status buttons and sticky note added to WME's UR panel) =====
   const Header = {
     urId: null,
@@ -2215,6 +2246,7 @@ ${list}`;
       }
       this.refresh(bar, Next.openId);
       this.reporter(card, Next.openId);
+      if (this.loadedId === Next.openId) EditorReport.check(card, Next.openId);
       this.autoInsert(card, Next.openId);
       Seen.check(Next.openId);
       Note.position();
@@ -2281,7 +2313,7 @@ ${list}`;
     refresh(bar, id) {
       const info = urInfo(id);
       const loaded = this.loadedId === id;
-      const popcorn = loaded && autoPopcorn(this.comments);
+      const popcorn = loaded && autoPopcorn(this.comments, id);
       const blacklisted = UrmpBL.has(id);
       const overdue = loaded && overdueFor(info, this.comments, this.reportedOn);
       for (const b of bar.querySelectorAll('[data-status]')) {
