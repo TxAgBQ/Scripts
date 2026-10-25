@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.25.02
+// @version      2026.10.25.03
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1410,14 +1410,30 @@ ${list}`;
   const FullScan = {
     running: false,
     cancel: false,
-    line: null,
-    btn: null,
+    flashTimer: null,
+    flashing: false,
     link(name) { return [...document.querySelectorAll('a')].find(a => a.textContent.trim() === name && a.offsetParent !== null) || null; },
     barShown() { const b = document.getElementById('urt-progressBar'); return !!b && b.offsetParent !== null; },
-    percent() { return (document.getElementById('urt-progressBar')?.textContent || '').match(/(\d+)\s*%/)?.[1] || '0'; },
-    say(text, kind = 'info') {
-      if (this.line) { this.line.textContent = text; this.line.style.color = FS_COLORS[kind] || FS_COLORS.info; }
+    me() { return document.getElementById('ua-fullscan'); },
+    // The link only ever reads "Full Scan" (or "Stop full scan" while running). A stop or failure shows briefly, then it reverts.
+    label(text, color) {
+      const a = this.me();
+      if (!a) return;
+      a.textContent = text;
+      a.style.color = color || '';
+    },
+    note(text, kind) {
       LOG(text);
+      const a = this.me();
+      if (a) a.title = text;
+      clearTimeout(this.flashTimer);
+      this.flashing = false;
+      const shown = { bad: ['Full Scan failed', FS_COLORS.bad], warn: ['Full Scan stopped', FS_COLORS.warn], busy: ['Scan already running', FS_COLORS.warn] }[kind];
+      if (shown) {
+        this.flashing = true;
+        this.label(shown[0], shown[1]);
+        this.flashTimer = setTimeout(() => { this.flashing = false; this.label(this.running ? 'Stop full scan' : 'Full Scan', ''); }, 10000);
+      }
     },
     async waitFor(cond, ms) {
       const t0 = Date.now();
@@ -1432,7 +1448,7 @@ ${list}`;
     async scanOne(name, step, total) {
       const a = this.link(name);
       if (!a) return 'missing';
-      this.say(`Full scan ${step} of ${total}: starting the ${name} scan…`);
+      LOG(`Full scan ${step} of ${total}: starting the ${name} scan.`);
       a.click();
       const started = await this.waitFor(() => this.barShown(), FULL_SCAN_START_MS);
       if (started === 'cancel') return 'cancel';
@@ -1441,10 +1457,8 @@ ${list}`;
       const t0 = Date.now();
       while (Date.now() - t0 < FULL_SCAN_MAX_MS) {
         if (this.cancel) return 'cancel';
-        if (this.barShown()) {
-          hiddenSince = 0;
-          this.say(`Full scan ${step} of ${total}: ${name} scan running, ${this.percent()}%`);
-        } else {
+        if (this.barShown()) hiddenSince = 0;
+        else {
           hiddenSince = hiddenSince || Date.now();
           if (Date.now() - hiddenSince >= FULL_SCAN_DONE_MS) return 'done';
         }
@@ -1453,11 +1467,13 @@ ${list}`;
       return 'timeout';
     },
     async run() {
-      if (this.running) { this.cancel = true; this.say('Stopping after this check. UR-MP\'s current scan keeps going; the next one will not be started.', 'warn'); return; }
-      if (this.barShown()) { this.say(`A scan is already running (${this.percent()}%). Wait until it finishes, then click Full scan.`, 'warn'); return; }
+      if (this.running) { this.cancel = true; this.note('Full scan: stopping. UR-MP\'s current scan keeps going; the next one will not be started.'); return; }
+      if (this.barShown()) { this.note('A scan is already running. Wait until it finishes, then click Full Scan.', 'busy'); return; }
       this.running = true;
       this.cancel = false;
-      if (this.btn) this.btn.textContent = 'Stop full scan';
+      clearTimeout(this.flashTimer);
+      this.flashing = false;
+      this.label('Stop full scan', '');
       const done = [];
       try {
         for (let i = 0; i < FULL_SCAN_AREAS.length; i++) {
@@ -1467,28 +1483,33 @@ ${list}`;
           const why = { missing: `couldn't find UR-MP's ${name} link`, nostart: `UR-MP never showed its progress bar after the ${name} click`,
             timeout: `the ${name} scan didn't finish within ${FULL_SCAN_MAX_MS / 60e3} minutes`, cancel: 'you stopped it' }[r];
           const left = FULL_SCAN_AREAS.slice(i + 1);
-          this.say(`Full scan stopped at ${name}: ${why}.` + (done.length ? ` Finished: ${done.join(', ')}.` : '') + (left.length ? ` Not run: ${left.join(', ')}.` : ''), done.length ? 'warn' : 'bad');
+          this.running = false;
+          this.note(`Full scan stopped at ${name}: ${why}.` + (done.length ? ` Finished: ${done.join(', ')}.` : '') + (left.length ? ` Not run: ${left.join(', ')}.` : ''), r === 'cancel' ? 'warn' : (done.length ? 'warn' : 'bad'));
           return;
         }
-        this.say(`Full scan finished: ${done.join(' and ')} (${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}).`, 'ok');
+        this.running = false;
+        this.note(`Full scan finished: ${done.join(' and ')} (${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}).`);
       } catch (e) {
-        this.say(`Full scan failed: ${e.message}`, 'bad');
+        this.running = false;
+        this.note(`Full scan failed: ${e.message}`, 'bad');
       } finally {
         this.running = false;
         this.cancel = false;
-        if (this.btn) this.btn.textContent = 'Full scan';
+        if (!this.flashing) this.label('Full Scan', '');
       }
     },
-    // Put the button above UR-MP's scan links (re-added if UR-MP redraws its panel)
+    // A "Full Scan" link after Texas area, styled like UR-MP's own links and with the same separator (re-added if UR-MP redraws)
     ensure() {
       const texas = this.link('Texas area');
-      if (!texas || document.getElementById('ua-fullscan')) return;
-      const box = el('div', { id: 'ua-fullscan', style: 'margin:4px 0' });
-      this.btn = el('button', { textContent: this.running ? 'Stop full scan' : 'Full scan', title: 'Scan Drive area, then Texas area, one after the other', style: 'margin-right:8px', onclick: () => this.run() });
-      this.line = el('span', { style: `font-size:12px;color:${FS_COLORS.info}` }, 'Scans Drive area, then Texas area.');
-      box.append(this.btn, this.line);
-      const group = texas.parentElement && /Drive area/.test(texas.parentElement.textContent) ? texas.parentElement : texas;
-      group.before(box);
+      if (!texas || this.me()) return;
+      const a = texas.cloneNode(false);
+      a.id = 'ua-fullscan';
+      a.textContent = this.running ? 'Stop full scan' : 'Full Scan';
+      a.title = 'Scan Drive area, then Texas area, one after the other';
+      a.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); this.run(); });
+      const before = texas.previousSibling;
+      const sep = before && before !== texas && !(before.nodeType === 1 && before.tagName === 'A') ? before.cloneNode(true) : document.createTextNode(' | ');
+      texas.after(sep, a);
     },
     start() { setInterval(() => { try { this.ensure(); } catch (e) { /* UR-MP not on screen yet */ } }, 1500); },
   };
