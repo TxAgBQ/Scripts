@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.25.01
+// @version      2026.10.25.02
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1397,6 +1397,102 @@ ${list}`;
     UrmpBL.readSoon();
   }, true);
  
+  // ===== UR-MP FULL SCAN (not SDK — clicks UR-MP's own scan links, one after the other) =====
+  // One button runs UR-MP's "Drive area" scan, waits until it is finished, then runs "Texas area". UR-MP's scan links stay
+  // clickable while a scan runs, and a second click cancels the running scan, so the next scan is only started once the
+  // first one is done. UR-MP shows a percent progress bar (#urt-progressBar) during a scan and hides it when the scan ends.
+  // ("Managed area" is left out on purpose: it reaches into Mexico.)
+  const FULL_SCAN_AREAS = ['Drive area', 'Texas area'];
+  const FULL_SCAN_START_MS = 15000;     // UR-MP must show its progress bar this soon after the click, or the scan didn't start
+  const FULL_SCAN_MAX_MS = 15 * 60e3;   // give up waiting on one scan after this long
+  const FULL_SCAN_DONE_MS = 2000;       // the bar must stay hidden this long to count as finished
+  const FS_COLORS = { info: '#666', ok: '#2e7d32', warn: '#b26a00', bad: '#c62828' };   // grey / green / yellow / red
+  const FullScan = {
+    running: false,
+    cancel: false,
+    line: null,
+    btn: null,
+    link(name) { return [...document.querySelectorAll('a')].find(a => a.textContent.trim() === name && a.offsetParent !== null) || null; },
+    barShown() { const b = document.getElementById('urt-progressBar'); return !!b && b.offsetParent !== null; },
+    percent() { return (document.getElementById('urt-progressBar')?.textContent || '').match(/(\d+)\s*%/)?.[1] || '0'; },
+    say(text, kind = 'info') {
+      if (this.line) { this.line.textContent = text; this.line.style.color = FS_COLORS[kind] || FS_COLORS.info; }
+      LOG(text);
+    },
+    async waitFor(cond, ms) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        if (this.cancel) return 'cancel';
+        if (cond()) return true;
+        await sleep(300);
+      }
+      return false;
+    },
+    // Click one scan link and wait until its scan is finished. Returns done | missing | nostart | timeout | cancel
+    async scanOne(name, step, total) {
+      const a = this.link(name);
+      if (!a) return 'missing';
+      this.say(`Full scan ${step} of ${total}: starting the ${name} scan…`);
+      a.click();
+      const started = await this.waitFor(() => this.barShown(), FULL_SCAN_START_MS);
+      if (started === 'cancel') return 'cancel';
+      if (!started) return 'nostart';
+      let hiddenSince = 0;
+      const t0 = Date.now();
+      while (Date.now() - t0 < FULL_SCAN_MAX_MS) {
+        if (this.cancel) return 'cancel';
+        if (this.barShown()) {
+          hiddenSince = 0;
+          this.say(`Full scan ${step} of ${total}: ${name} scan running, ${this.percent()}%`);
+        } else {
+          hiddenSince = hiddenSince || Date.now();
+          if (Date.now() - hiddenSince >= FULL_SCAN_DONE_MS) return 'done';
+        }
+        await sleep(500);
+      }
+      return 'timeout';
+    },
+    async run() {
+      if (this.running) { this.cancel = true; this.say('Stopping after this check. UR-MP\'s current scan keeps going; the next one will not be started.', 'warn'); return; }
+      if (this.barShown()) { this.say(`A scan is already running (${this.percent()}%). Wait until it finishes, then click Full scan.`, 'warn'); return; }
+      this.running = true;
+      this.cancel = false;
+      if (this.btn) this.btn.textContent = 'Stop full scan';
+      const done = [];
+      try {
+        for (let i = 0; i < FULL_SCAN_AREAS.length; i++) {
+          const name = FULL_SCAN_AREAS[i];
+          const r = await this.scanOne(name, i + 1, FULL_SCAN_AREAS.length);
+          if (r === 'done') { done.push(name); continue; }
+          const why = { missing: `couldn't find UR-MP's ${name} link`, nostart: `UR-MP never showed its progress bar after the ${name} click`,
+            timeout: `the ${name} scan didn't finish within ${FULL_SCAN_MAX_MS / 60e3} minutes`, cancel: 'you stopped it' }[r];
+          const left = FULL_SCAN_AREAS.slice(i + 1);
+          this.say(`Full scan stopped at ${name}: ${why}.` + (done.length ? ` Finished: ${done.join(', ')}.` : '') + (left.length ? ` Not run: ${left.join(', ')}.` : ''), done.length ? 'warn' : 'bad');
+          return;
+        }
+        this.say(`Full scan finished: ${done.join(' and ')} (${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}).`, 'ok');
+      } catch (e) {
+        this.say(`Full scan failed: ${e.message}`, 'bad');
+      } finally {
+        this.running = false;
+        this.cancel = false;
+        if (this.btn) this.btn.textContent = 'Full scan';
+      }
+    },
+    // Put the button above UR-MP's scan links (re-added if UR-MP redraws its panel)
+    ensure() {
+      const texas = this.link('Texas area');
+      if (!texas || document.getElementById('ua-fullscan')) return;
+      const box = el('div', { id: 'ua-fullscan', style: 'margin:4px 0' });
+      this.btn = el('button', { textContent: this.running ? 'Stop full scan' : 'Full scan', title: 'Scan Drive area, then Texas area, one after the other', style: 'margin-right:8px', onclick: () => this.run() });
+      this.line = el('span', { style: `font-size:12px;color:${FS_COLORS.info}` }, 'Scans Drive area, then Texas area.');
+      box.append(this.btn, this.line);
+      const group = texas.parentElement && /Drive area/.test(texas.parentElement.textContent) ? texas.parentElement : texas;
+      group.before(box);
+    },
+    start() { setInterval(() => { try { this.ensure(); } catch (e) { /* UR-MP not on screen yet */ } }, 1500); },
+  };
+
   // ===== UR-MP STATUS STRIP (drawn beside the UR-MP table — UR-MP's own table is left untouched) =====
   function scrollParent(node) {
     for (let n = node.parentElement; n && n !== document.body; n = n.parentElement) {
@@ -2951,6 +3047,7 @@ ${list}`;
     tabLabel.title = SCRIPT_NAME;
     buildUi(tabPane);
     UrmpBL.start();
+    FullScan.start();
  
     sdk.Events.on({ eventName: 'wme-update-request-panel-opened', eventHandler: onUrOpened });
     publish('uaApi', '1'); // ready: other scripts can now use the open-next API
