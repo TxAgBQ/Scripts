@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Search Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.14.07
-// @description  Improves the WME search box: LiveMap-style place results (Waze vs Google marked, ranked by match), a pin on the map, and paste one or more segment IDs to select them.
+// @version      2026.10.28.01
+// @description  Improves the WME search box: LiveMap-style place results (Waze vs Google marked, ranked by match), a pin on the map, and type segment IDs (one or several) or an update request ID to jump straight to them.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-search-assist
 // @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/wme-search-assist/wme-search-assist.user.js
@@ -44,7 +44,12 @@
     const MAX_SEGMENT_IDS = 50;
     const SEG_LOOKUP_BUDGET_MS = 600;     // how long the dropdown waits to say "found / not found"
     const SEG_PREFIX = 'wsa-seg:';
+    const UR_PREFIX = 'wsa-ur:';
     const PLACE_PREFIX = 'wsa:';
+    const UR_LOAD_ZOOM = 16;              // URs far from the view are loaded by centering at least this close
+    const UR_POLL_MS = 400;               // how often to check whether WME has loaded the report
+    const UR_LOAD_TRIES = 15;             // x UR_POLL_MS = how long to wait for WME to load it
+    const UR_CLICK_TRIES = 10;            // x UR_POLL_MS = how long to wait for the marker to be drawn
 
     // Waze = light-blue solid-dot pin. Google = three-band diagonal ring pin.
     // The map pin matches the list icon. Edit the colors here to taste.
@@ -174,20 +179,23 @@
     }
 
     // ---------- map movement (never zooms out) ----------
-    function targetZoom() {
-        let z = ZOOM_ON_SELECT;
-        try { z = Math.max(sdk.Map.getZoomLevel(), ZOOM_ON_SELECT); } catch (e) { /* use default */ }
+    // The SDK runs in 'async' mode, so every SDK call is awaited.
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    async function targetZoom(minZoom) {
+        let z = minZoom;
+        try { z = Math.max(await sdk.Map.getZoomLevel(), minZoom); } catch (e) { /* use default */ }
         return z;
     }
 
-    function centerOn(lon, lat) {
-        const zoomLevel = targetZoom();
+    async function centerOn(lon, lat, minZoom = ZOOM_ON_SELECT) {
+        const zoomLevel = await targetZoom(minZoom);
         try {
-            sdk.Map.setMapCenter({ lonLat: { lon, lat }, zoomLevel });
+            await sdk.Map.setMapCenter({ lonLat: { lon, lat }, zoomLevel });
         } catch (err) {
             try {
-                sdk.Map.setMapCenter({ lonLat: { lon, lat } });
-                sdk.Map.setZoomLevel({ zoomLevel });
+                await sdk.Map.setMapCenter({ lonLat: { lon, lat } });
+                await sdk.Map.setZoomLevel({ zoomLevel });
             } catch (err2) {
                 console.warn(LOG, 'Could not move the map.', err2);
             }
@@ -238,16 +246,16 @@
         if (!bbox) return;
         if (FIT_MULTIPLE_SEGMENTS && segs.length > 1) {
             try {
-                const before = sdk.Map.getMapCenter();
+                const before = await sdk.Map.getMapCenter();
                 await sdk.Map.zoomToExtent({ bbox });
-                await new Promise(r => setTimeout(r, 200));
-                const after = sdk.Map.getMapCenter();
+                await sleep(200);
+                const after = await sdk.Map.getMapCenter();
                 if (after.lon !== before.lon || after.lat !== before.lat) return;
             } catch (err) {
                 if (DEBUG) console.log(LOG, 'zoomToExtent failed, centering instead:', String(err).slice(0, 80));
             }
         }
-        centerOn((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2);
+        await centerOn((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2);
     }
 
     async function selectSegments(ids) {
@@ -262,16 +270,23 @@
             console.warn(LOG, 'Not found:', ids.filter(id => !segs.some(s => s.id === id)).join(', '));
         }
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: segs.map(s => s.id) } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: segs.map(s => s.id) } });
         } catch (err) {
             console.warn(LOG, 'Could not select the segment(s).', err);
         }
         await frameSegments(segs);
     }
 
+    // Resolves to undefined if the lookup has not finished within the budget (the dropdown must not wait long).
+    function withBudget(p) {
+        return Promise.race([p, new Promise(r => setTimeout(() => r(undefined), SEG_LOOKUP_BUDGET_MS))]);
+    }
+
     async function segmentRow(ids) {
-        const budget = new Promise(r => setTimeout(() => r(null), SEG_LOOKUP_BUDGET_MS));
-        const segs = await Promise.race([lookupSegments(ids), budget]);
+        return segmentRowFrom(ids, await withBudget(lookupSegments(ids)));
+    }
+
+    function segmentRowFrom(ids, segs) {
         const found = segs ? segs.filter(Boolean).length : null;
         const many = ids.length > 1;
         let note;
@@ -284,6 +299,125 @@
             text: many ? ids.length + ' segments' : 'Segment ' + ids[0],
             secondaryText: note + (many ? ' · ' + ids.join(', ') : '')
         };
+    }
+
+    // ---------- update requests (URs) ----------
+    // The SDK can read URs that are loaded around the current view, but it cannot look up one that is far
+    // away and it cannot select one (setSelection has no update-request type). So:
+    //   1. an unloaded UR is found through WME's own by-ID request, which gives the report's route;
+    //   2. the map is centered on that route so WME loads the report, and the SDK then finds it;
+    //   3. the report is opened by clicking its marker (WME internals, kept in clickUrMarker only).
+    async function fetchUrSession(id) {
+        const r = await unsafeWindow.fetch('/Descartes/app/MapProblems/UpdateRequests?ids=' + id, { credentials: 'include' });
+        if (!r.ok) return null;
+        const j = await r.json();
+        const list = j && j.updateRequestSessions && j.updateRequestSessions.objects;
+        const o = Array.isArray(list) ? list.find(x => x && x.id === id) : null;
+        return o || null;
+    }
+
+    // Resolves to { ur } when the SDK has it loaded, { session } when it exists but is not loaded, else null.
+    async function lookupUr(id) {
+        try {
+            const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
+            if (ur) return { ur };
+        } catch (e) { /* fall through to the by-ID request */ }
+        try {
+            const session = await fetchUrSession(id);
+            if (session) return { session };
+        } catch (e) { /* not reachable */ }
+        return null;
+    }
+
+    function geomBbox(geoms) {
+        const pts = [];
+        geoms.forEach(g => flattenPoints(g && g.coordinates, pts));
+        if (!pts.length) return null;
+        const xs = pts.map(p => p[0]);
+        const ys = pts.map(p => p[1]);
+        return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    }
+
+    // Sends the clicks a real mouse click would. Uses WME internals: the UR layer's marker element.
+    async function clickUrMarker(id) {
+        const w = unsafeWindow;
+        const layer = w.W && w.W.map && w.W.map.mapUpdateRequestsLayer;
+        if (!layer || typeof layer.getWazeFeatureElement !== 'function') return false;
+        await sleep(300); // let the recentered map draw
+        for (let i = 0; i < UR_CLICK_TRIES; i++) {
+            let el = null;
+            try { el = layer.getWazeFeatureElement(id); } catch (e) { /* marker not drawn yet */ }
+            if (el) {
+                const r = el.getBoundingClientRect();
+                const opts = { bubbles: true, cancelable: true, view: w, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(t => {
+                    const Ev = t.startsWith('pointer') && w.PointerEvent ? w.PointerEvent : w.MouseEvent;
+                    el.dispatchEvent(new Ev(t, opts));
+                });
+                return true;
+            }
+            await sleep(UR_POLL_MS);
+        }
+        return false;
+    }
+
+    async function openUr(id) {
+        if (!sdk) return;
+        const hit = await lookupUr(id);
+        if (!hit) {
+            console.warn(LOG, 'Update request ' + id + ' could not be found.');
+            return;
+        }
+        let ur = hit.ur || null;
+        if (!ur) {
+            const box = geomBbox([hit.session.driveGeometry, hit.session.routeGeometry]);
+            if (!box) {
+                console.warn(LOG, 'Update request ' + id + ' has no location to jump to.');
+                return;
+            }
+            await centerOn((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, UR_LOAD_ZOOM);
+            for (let i = 0; i < UR_LOAD_TRIES && !ur; i++) {
+                await sleep(UR_POLL_MS);
+                try { ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id }); } catch (e) { ur = null; }
+            }
+            if (!ur) {
+                console.warn(LOG, 'WME did not load update request ' + id + ' near its route.');
+                return;
+            }
+        }
+        const c = ur.geometry && ur.geometry.coordinates;
+        if (!c) return;
+        await centerOn(c[0], c[1]);
+        const opened = await clickUrMarker(id);
+        if (DEBUG) console.log(LOG, 'update request pick:', id, 'opened:', opened);
+        if (!opened) {
+            console.warn(LOG, 'Centered on update request ' + id + ' but could not open it. Check that the UR layer is on and that your filters show this report (for example closed URs).');
+        }
+    }
+
+    // A single number could be a segment or a UR, so look up both and show whichever exist.
+    async function singleIdRows(id) {
+        const [segs, urHit] = await Promise.all([withBudget(lookupSegments([id])), withBudget(lookupUr(id))]);
+        const segFound = !!(segs && segs[0]);
+        const segMissing = !!segs && !segs[0];
+        const urFound = !!urHit;
+        const urMissing = urHit === null;
+        const segRow = segmentRowFrom([id], segs);
+        const type = urHit && urHit.ur && urHit.ur.updateRequestType;
+        const urRow = {
+            id: UR_PREFIX + id,
+            text: 'Update request ' + id,
+            secondaryText: urFound ? 'Found · ' + (type ? type + ' · ' : '') + 'open it' : (urMissing ? 'Not found' : 'Open it')
+        };
+        const rows = [];
+        if (segFound) rows.push(segRow);
+        if (urFound) rows.push(urRow);
+        if (!rows.length) {
+            if (!segMissing) rows.push(segRow);
+            if (!urMissing) rows.push(urRow);
+        }
+        if (!rows.length) rows.push(segRow, urRow); // neither exists: say so for both
+        return rows;
     }
 
     // ---------- LiveMap request ----------
@@ -394,15 +528,15 @@
     }
 
     // ---------- map pin (SDK layer) ----------
-    function ensurePinLayer() {
+    async function ensurePinLayer() {
         if (pinLayerReady) return true;
         const gfx = src => iconsOk
             // graphicOpacity must be set: otherwise the pin takes the fill opacity (0 for the ring) and vanishes
             ? { externalGraphic: src, graphicOpacity: 1, graphicWidth: 26, graphicHeight: 34, graphicXOffset: -13, graphicYOffset: -33 }
             : {};
         try {
-            try { sdk.Map.removeLayer({ layerName: PIN_LAYER }); } catch (e) { /* not there yet */ }
-            sdk.Map.addLayer({
+            try { await sdk.Map.removeLayer({ layerName: PIN_LAYER }); } catch (e) { /* not there yet */ }
+            await sdk.Map.addLayer({
                 layerName: PIN_LAYER,
                 styleRules: [
                     {
@@ -430,12 +564,12 @@
         return pinLayerReady;
     }
 
-    function showPin(lat, lng, src) {
-        if (!sdk || !ensurePinLayer()) return;
+    async function showPin(lat, lng, src) {
+        if (!sdk || !(await ensurePinLayer())) return;
         // clearing may fail (e.g. on an empty layer); that must not stop the draw
-        try { sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER }); } catch (e) { /* ignore */ }
+        try { await sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER }); } catch (e) { /* ignore */ }
         try {
-            sdk.Map.addFeatureToLayer({
+            await sdk.Map.addFeatureToLayer({
                 layerName: PIN_LAYER,
                 feature: {
                     type: 'Feature',
@@ -452,11 +586,11 @@
         }
     }
 
-    function clearPin() {
+    async function clearPin() {
         if (!pinShown) return;
         pinShown = false;
         try {
-            sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER });
+            await sdk.Map.removeAllFeaturesFromLayer({ layerName: PIN_LAYER });
         } catch (e) { /* ignore */ }
     }
 
@@ -470,12 +604,13 @@
                 const q = String(query || '');
                 if (!sdk) return await nativeP;
 
-                // One or more segment IDs: answer right away and skip WME's bogus "latitude, longitude" row.
+                // One or more long numbers: answer right away and skip WME's bogus "latitude, longitude" row.
+                // One number can be a segment or an update request; several can only be segments.
                 const ids = parseSegmentIds(q);
-                if (ids) return [await segmentRow(ids)];
+                if (ids) return ids.length === 1 ? await singleIdRows(ids[0]) : [await segmentRow(ids)];
 
                 if (shouldSkip(q)) return await nativeP;
-                const c = sdk.Map.getMapCenter();
+                const c = await sdk.Map.getMapCenter();
                 const center = { lat: c.lat, lon: c.lon };
                 const [nativeItems, lmRows] = await Promise.all([
                     nativeP,
@@ -492,20 +627,28 @@
         return wrapped;
     }
 
-    function onItemSelected(e) {
+    async function onItemSelected(e) {
         const d = e && e.detail;
         if (!d || typeof d.id !== 'string') return;
 
-        if (d.id.startsWith(SEG_PREFIX)) {
-            selectSegments(d.id.slice(SEG_PREFIX.length).split(',').map(Number));
-            return;
-        }
+        try {
+            if (d.id.startsWith(SEG_PREFIX)) {
+                await selectSegments(d.id.slice(SEG_PREFIX.length).split(',').map(Number));
+                return;
+            }
+            if (d.id.startsWith(UR_PREFIX)) {
+                await openUr(Number(d.id.slice(UR_PREFIX.length)));
+                return;
+            }
 
-        const p = picks.get(d.id);
-        if (!p) return;
-        if (DEBUG) console.log(LOG, 'picked', p.src, 'icons ok:', iconsOk, 'pin layer ready:', pinLayerReady);
-        centerOn(p.lng, p.lat);
-        showPin(p.lat, p.lng, p.src);
+            const p = picks.get(d.id);
+            if (!p) return;
+            if (DEBUG) console.log(LOG, 'picked', p.src, 'icons ok:', iconsOk, 'pin layer ready:', pinLayerReady);
+            await centerOn(p.lng, p.lat);
+            await showPin(p.lat, p.lng, p.src);
+        } catch (err) {
+            console.warn(LOG, 'Could not complete that pick.', err);
+        }
     }
 
     function hook(el) {
@@ -554,14 +697,17 @@
             return;
         }
         await unsafeWindow.SDK_INITIALIZED;
-        sdk = unsafeWindow.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
+        // 'async' mode: the old 'sync' mode is deprecated. SDK calls return promises.
+        sdk = unsafeWindow.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME, mode: 'async' });
         try {
-            if (!sdk.State.isReady) await sdk.Events.once({ eventName: 'wme-ready' });
+            let ready = sdk.State.isReady;
+            if (typeof ready === 'function') ready = ready.call(sdk.State);
+            if (!(await ready)) await sdk.Events.once({ eventName: 'wme-ready' });
         } catch (e) { /* continue anyway */ }
 
         // The pin stays until you select something else or press Esc.
         try {
-            sdk.Events.on({
+            await sdk.Events.on({
                 eventName: 'wme-selection-changed',
                 eventHandler: () => {
                     if (Date.now() - pinAddedAt > PIN_IGNORE_SELECTION_MS) clearPin();
