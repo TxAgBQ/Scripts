@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.25.03
+// @version      2026.10.28.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1406,21 +1406,37 @@ ${list}`;
   const FULL_SCAN_START_MS = 15000;     // UR-MP must show its progress bar this soon after the click, or the scan didn't start
   const FULL_SCAN_MAX_MS = 15 * 60e3;   // give up waiting on one scan after this long
   const FULL_SCAN_DONE_MS = 2000;       // the bar must stay hidden this long to count as finished
-  const FS_COLORS = { info: '#666', ok: '#2e7d32', warn: '#b26a00', bad: '#c62828' };   // grey / green / yellow / red
+  const FS_COLORS = { info: '#666', ok: '#2e7d32', warn: '#b26a00', bad: '#c62828', part: '#ef6c00' };   // grey / green / yellow / red / orange
+  const FULL_SCAN_COLOR_MS = 5 * 60e3;  // the orange (Drive area done) or green (both done) stays this long, then the link is back to normal
   const FullScan = {
     running: false,
     cancel: false,
     flashTimer: null,
     flashing: false,
+    flashColor: '',       // colour of a short failure / stop message
+    stateColor: '',       // orange after Drive area is done, green after both are done
+    stateTimer: null,
     link(name) { return [...document.querySelectorAll('a')].find(a => a.textContent.trim() === name && a.offsetParent !== null) || null; },
     barShown() { const b = document.getElementById('urt-progressBar'); return !!b && b.offsetParent !== null; },
     me() { return document.getElementById('ua-fullscan'); },
     // The link only ever reads "Full Scan" (or "Stop full scan" while running). A stop or failure shows briefly, then it reverts.
     label(text, color) {
       const a = this.me();
+      this.flashColor = color || '';
       if (!a) return;
       a.textContent = text;
-      a.style.color = color || '';
+      this.paint();
+    },
+    // What colour the link shows: a failure message first, otherwise the progress colour (kept 5 minutes), otherwise normal
+    paint() {
+      const a = this.me();
+      if (a) a.style.color = this.flashColor || this.stateColor || '';
+    },
+    setState(color) {
+      clearTimeout(this.stateTimer);
+      this.stateColor = color;
+      if (color) this.stateTimer = setTimeout(() => { this.stateColor = ''; this.paint(); }, FULL_SCAN_COLOR_MS);
+      this.paint();
     },
     note(text, kind) {
       LOG(text);
@@ -1473,13 +1489,18 @@ ${list}`;
       this.cancel = false;
       clearTimeout(this.flashTimer);
       this.flashing = false;
+      this.setState('');   // a new run starts from the normal colour
       this.label('Stop full scan', '');
       const done = [];
       try {
         for (let i = 0; i < FULL_SCAN_AREAS.length; i++) {
           const name = FULL_SCAN_AREAS[i];
           const r = await this.scanOne(name, i + 1, FULL_SCAN_AREAS.length);
-          if (r === 'done') { done.push(name); continue; }
+          if (r === 'done') {
+            done.push(name);
+            if (i < FULL_SCAN_AREAS.length - 1) this.setState(FS_COLORS.part);   // first scan finished, the rest still to go
+            continue;
+          }
           const why = { missing: `couldn't find UR-MP's ${name} link`, nostart: `UR-MP never showed its progress bar after the ${name} click`,
             timeout: `the ${name} scan didn't finish within ${FULL_SCAN_MAX_MS / 60e3} minutes`, cancel: 'you stopped it' }[r];
           const left = FULL_SCAN_AREAS.slice(i + 1);
@@ -1488,6 +1509,7 @@ ${list}`;
           return;
         }
         this.running = false;
+        this.setState(FS_COLORS.ok);
         this.note(`Full scan finished: ${done.join(' and ')} (${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}).`);
       } catch (e) {
         this.running = false;
@@ -1510,6 +1532,7 @@ ${list}`;
       const before = texas.previousSibling;
       const sep = before && before !== texas && !(before.nodeType === 1 && before.tagName === 'A') ? before.cloneNode(true) : document.createTextNode(' | ');
       texas.after(sep, a);
+      this.paint();   // UR-MP redrew its panel: the colour is put back
     },
     start() { setInterval(() => { try { this.ensure(); } catch (e) { /* UR-MP not on screen yet */ } }, 1500); },
   };
