@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Search Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.10.28.01
+// @version      2026.10.28.02
 // @description  Improves the WME search box: LiveMap-style place results (Waze vs Google marked, ranked by match), a pin on the map, and type segment IDs (one or several) or an update request ID to jump straight to them.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/wme-search-assist
@@ -50,6 +50,7 @@
     const UR_POLL_MS = 400;               // how often to check whether WME has loaded the report
     const UR_LOAD_TRIES = 15;             // x UR_POLL_MS = how long to wait for WME to load it
     const UR_CLICK_TRIES = 10;            // x UR_POLL_MS = how long to wait for the marker to be drawn
+    const UR_NEW_TAB_FALLBACK = true;     // URs WME can't place on the map open in a new tab; false = just log a warning
 
     // Waze = light-blue solid-dot pin. Google = three-band diagonal ring pin.
     // The map pin matches the list icon. Edit the colors here to taste.
@@ -361,6 +362,21 @@
         return false;
     }
 
+    // Fallback when the map cannot be sent to the report: WME's own link (...&mapUpdateRequest=ID) always finds it.
+    // A new tab leaves this editor alone, so unsaved edits are safe.
+    function openUrInNewTab(id, why) {
+        if (!UR_NEW_TAB_FALLBACK) {
+            console.warn(LOG, 'Update request ' + id + ' found, but ' + why + '.');
+            return;
+        }
+        const env = new URLSearchParams(location.search).get('env');
+        const url = location.origin + location.pathname + '?' + (env ? 'env=' + encodeURIComponent(env) + '&' : '') +
+            'mapUpdateRequest=' + id;
+        if (DEBUG) console.log(LOG, 'opening update request ' + id + ' in a new tab (' + why + ')');
+        const w = unsafeWindow.open(url, '_blank');
+        if (!w) console.warn(LOG, 'The browser blocked the new tab. Allow pop-ups for waze.com, or open: ' + url);
+    }
+
     async function openUr(id) {
         if (!sdk) return;
         const hit = await lookupUr(id);
@@ -372,7 +388,8 @@
         if (!ur) {
             const box = geomBbox([hit.session.driveGeometry, hit.session.routeGeometry]);
             if (!box) {
-                console.warn(LOG, 'Update request ' + id + ' has no location to jump to.');
+                // Many URs have no route, and WME gives no location for an unloaded one by ID.
+                openUrInNewTab(id, 'it has no route to jump to');
                 return;
             }
             await centerOn((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, UR_LOAD_ZOOM);
@@ -381,7 +398,7 @@
                 try { ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id }); } catch (e) { ur = null; }
             }
             if (!ur) {
-                console.warn(LOG, 'WME did not load update request ' + id + ' near its route.');
+                openUrInNewTab(id, 'WME did not load it near its route');
                 return;
             }
         }
