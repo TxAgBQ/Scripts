@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026102901
+// @version      2026102902
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1059,7 +1059,8 @@
         name: { colour: '#f29900', label: 'no street name' },
         city: { colour: '#fbc02d', label: 'no city (primary or alternate)' },
         badcity: { colour: '#1a73e8', label: 'primary city does not fit the city limits' },
-        duptype: { colour: '#8e24aa', label: 'street type or direction written twice in the name (Dr Drive, W West)' }
+        duptype: { colour: '#8e24aa', label: 'street type or direction written twice in the name (Dr Drive, W West)' },
+        altnocity: { colour: '#00897b', label: 'an alternate street has no city (an alternate city is never blank)' }
     };
     let gapLayerReady = false;
     let gapZoomNote = '';
@@ -4083,6 +4084,7 @@
 
         let primary = currentCity;
         let newAltCities = [];
+        let blankAltFix = null;
         if (cityInfo.skipCity) {
             warn = true;
             notes.push('City limits could not be loaded, so the city was not checked.');
@@ -4099,6 +4101,20 @@
             }
             const wantedAlts = cityInfo.alternateCities.filter((c) => c.toLowerCase() !== primary.toLowerCase());
             const haveAlts = currentAlts.map(cityOf).filter(Boolean);
+            // An alternate street with no city is never right: it gets the postal city (or the primary city when the postal city is the
+            // primary city), keeping its own street name.
+            const blankAlts = currentAlts.filter((x) => !cityOf(x));
+            if (blankAlts.length) {
+                const target = wantedAlts[0] || primary || '';
+                if (target) {
+                    blankAltFix = { city: target, names: blankAlts.map((x) => x.street.name) };
+                    filled.push(`alternate city ${target} (the alternate street ${blankAltFix.names.join(' / ')} had none)`);
+                    haveAlts.push(target);
+                } else {
+                    warn = true;
+                    notes.push(`The alternate street ${blankAlts.map((x) => x.street.name).join(' / ')} has no city, and no postal city was found to give it.`);
+                }
+            }
             if (!currentAlts.length) {
                 newAltCities = wantedAlts;
                 if (newAltCities.length) filled.push(`alternate city ${newAltCities.join(' / ')}`);
@@ -4121,7 +4137,19 @@
 
         const { country, state } = regionOf(segmentId);
         if (!country || !state) return { message: `Could not fill in the address: ${REGION_ERROR}.`, warn: true, match };
-        const alternateStreetIds = currentAlts.map((x) => x.street.id);
+        const alternateStreetIds = [];
+        for (const x of currentAlts) {
+            let id = x.street.id;
+            if (blankAltFix && !cityOf(x)) {
+                const cityName = blankAltFix.city;
+                let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+                if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
+                let street = sdk.DataModel.Streets.getStreet({ streetName: x.street.name, cityId: city.id });
+                if (!street) street = sdk.DataModel.Streets.addStreet({ streetName: x.street.name, cityId: city.id });
+                id = street.id;
+            }
+            if (!alternateStreetIds.includes(id)) alternateStreetIds.push(id);
+        }
         for (const cityName of newAltCities) {
             let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
             if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
@@ -6377,8 +6405,16 @@
             kind = 'duptype';
             detail = `type or direction written twice: "${name}" should be "${fixRepeatedType(name)}"`;
         }
+        // an alternate street with no city ("No city" in the alternate list) is never right
+        if (!kind && name) {
+            const blank = (address.altStreets || []).filter((x) => x && x.street && !x.street.isEmpty && x.street.name && !cityOf(x));
+            if (blank.length) {
+                kind = 'altnocity';
+                detail = `alternate street ${blank.map((x) => x.street.name).join(' / ')} has no city`;
+            }
+        }
         if (!kind) return null;
-        return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' ? detail : GAP_KINDS[kind].label };
+        return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' || kind === 'altnocity' ? detail : GAP_KINDS[kind].label };
     }
 
     // A roundabout segment has a junctionId (checked in the console on a real roundabout). Roundabouts are not given street names.
