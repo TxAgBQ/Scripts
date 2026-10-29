@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026101704
+// @version      2026102901
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4011,10 +4011,10 @@
         const nameClash = !!(currentName && gisName && normalizeName(currentName) !== normalizeName(gisName) && !keptNames.has(keptKey(segmentId, gisName)));
         const mismatchInfo = nameClash && opts.continueOnMismatch ? { mapped: currentName, gis: gisName } : null;
         if (nameClash && !mismatchInfo) {
-            const rerun = async () => {
+            const rerun = async (extra = '') => {
                 cityCheckCache.clear();
                 const again = await fillSegmentInfo(segmentId);
-                setStatus(`${streetNameOf(segmentId) || 'Road'}: ${again.message}`, again.error ? 'error' : again.warn ? 'warn' : again.info ? 'info' : 'ok', again.actions);
+                setStatus(`${streetNameOf(segmentId) || 'Road'}: ${again.message}${extra}`, again.error ? 'error' : again.warn ? 'warn' : again.info ? 'info' : 'ok', again.actions);
                 ccRequestCheck(150, true);
             };
             return {
@@ -4022,7 +4022,7 @@
                 warn: true,
                 match,
                 actions: [
-                    { label: `Apply: Rename to ${gisName} (GIS)`, primary: true, run: async () => { ccApply(segmentId, { kind: 'name', name: gisName }); await rerun(); } },
+                    { label: `Apply: Rename to ${gisName} (GIS)`, primary: true, run: async () => { const cityNote = await ccApplyNameAndCity(segmentId, { kind: 'name', name: gisName }); await rerun(cityNote); } },
                     { label: `Keep mine: ${currentName} (until reload)`, run: async () => { keptNames.add(keptKey(segmentId, gisName)); await rerun(); } }
                 ]
             };
@@ -6935,6 +6935,25 @@
         });
     }
 
+    // A name correction also corrects the city: once the new name is written, the primary city is checked against the city and CDP limits
+    // and fixed in the same step, so it does not have to be found after saving. Returns a short note ('' when the city needed nothing).
+    async function ccApplyNameAndCity(segmentId, proposal) {
+        ccApply(segmentId, proposal);
+        cityCheckCache.clear();
+        if (proposal.kind !== 'name') return '';
+        try {
+            const analysis = await ccAnalyze(segmentId, false);
+            const primary = (analysis.proposals || []).find((p) => p.kind === 'primary' && p.city);
+            if (!primary) return '';
+            ccApply(segmentId, primary);
+            cityCheckCache.clear();
+            return ` ${primary.label}.`;
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] City correction after the rename failed:`, err);
+            return ' The city could not be checked.';
+        }
+    }
+
     // ----- the popup -----
     const cityCheckPanel = (() => {
         const el = (tag, css, text) => {
@@ -7062,11 +7081,10 @@
             const btn = p.el('button', proposal.keep
                 ? 'border: 1px solid #9aa0a6; background: #ffffff; color: #3c4043; border-radius: 5px; padding: 5px 8px; font-size: 12px; font-weight: bold; cursor: pointer; text-align: left; white-space: normal;'
                 : 'border: 1px solid #1a73e8; background: #1a73e8; color: #ffffff; border-radius: 5px; padding: 5px 8px; font-size: 12px; font-weight: bold; cursor: pointer; text-align: left; white-space: normal;', proposal.keep ? proposal.label : `Apply: ${proposal.label}`);
-            btn.addEventListener('click', () => {
+            btn.addEventListener('click', async () => {
                 try {
-                    ccApply(result.segmentId, proposal);
-                    cityCheckCache.clear();
-                    p.verdict.textContent = `${result.name || 'Road'}: done. ${proposal.label}.`;
+                    const cityNote = await ccApplyNameAndCity(result.segmentId, proposal);
+                    p.verdict.textContent = `${result.name || 'Road'}: done. ${proposal.label}.${cityNote}`;
                     paintStatus(p.verdict, 'ok');
                     p.actions.textContent = '';
                     ccRequestCheck(150, true);
@@ -7489,12 +7507,11 @@
         showHoverTip(best.item, result, result ? '' : 'Could not check this segment.');
     }
 
-    function hoverApply(id, result, proposal) {
+    async function hoverApply(id, result, proposal) {
         const label = result.name || 'Road';
         try {
-            ccApply(id, proposal);
-            cityCheckCache.clear();
-            setStatus(`${label}: done. ${proposal.label}.`, 'ok');
+            const cityNote = await ccApplyNameAndCity(id, proposal);
+            setStatus(`${label}: done. ${proposal.label}.${cityNote}`, 'ok');
             hideHoverTip();
             ccRequestCheck(150, true);
             scheduleGapScan(200);
