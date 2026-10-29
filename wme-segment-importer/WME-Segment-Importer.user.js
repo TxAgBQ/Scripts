@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026102903
+// @version      2026102904
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -16,6 +16,7 @@
 // @connect      services2.arcgis.com
 // @connect      docs.google.com
 // @connect      tigerweb.geo.census.gov
+// @connect      api.zippopotam.us
 // @connect      *
 // @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/refs/heads/main/wme-segment-importer/WME-Segment-Importer.user.js
 // @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/refs/heads/main/wme-segment-importer/WME-Segment-Importer.user.js
@@ -255,6 +256,60 @@
         const county = attrs ? { name: attrs.BASENAME, stateFips: String(attrs.STATE) } : null;
         countyCache.set(key, county);
         return county;
+    }
+
+    // ZIP area at a point (Census ZIP Code Tabulation Areas on TIGERweb), then the postal city for that ZIP (zippopotam.us).
+    // For roads whose GIS record has no ZIP or postal city. Every step is logged so a failure can be read in the console.
+    const TIGER_ZCTA_URL = 'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/PUMA_TAD_TAZ_UGA_ZCTA/MapServer';
+    const ZIP_CITY_KEY = 'wme_si_zip_city_v1';
+    const zipAreaCache = new Map();
+    let zctaLayerId = null;
+    let zipCityStore = null;
+    function zipCityLoad() {
+        if (zipCityStore) return zipCityStore;
+        try { zipCityStore = JSON.parse(localStorage.getItem(ZIP_CITY_KEY) || '{}') || {}; } catch (err) { zipCityStore = {}; }
+        return zipCityStore;
+    }
+    async function zipAt(pt) {
+        const key = `${pt.lon.toFixed(3)},${pt.lat.toFixed(3)}`;
+        if (zipAreaCache.has(key)) return zipAreaCache.get(key);
+        if (zctaLayerId === null) {
+            const svc = await gmGetJson(`${TIGER_ZCTA_URL}?f=json`);
+            const layers = (svc.layers || []).filter((l) => /zip code tabulation|zcta/i.test(l.name));
+            const layer = layers.find((l) => /2020|2010/.test(l.name)) || layers[0];
+            console.log(`[${SCRIPT_NAME}] ZIP area layers on TIGERweb:`, layers.map((l) => `${l.id}: ${l.name}`));
+            if (!layer) throw new Error('ZIP area layer not found on TIGERweb');
+            zctaLayerId = layer.id;
+        }
+        const params = new URLSearchParams({
+            geometry: `${pt.lon},${pt.lat}`, geometryType: 'esriGeometryPoint', inSR: '4326', spatialRel: 'esriSpatialRelIntersects',
+            outFields: '*', returnGeometry: 'false', f: 'json'
+        });
+        const data = await gmGetJson(`${TIGER_ZCTA_URL}/${zctaLayerId}/query?${params}`);
+        const attrs = data.features && data.features[0] ? data.features[0].attributes : null;
+        const zip = attrs ? [attrs.ZCTA5, attrs.GEOID, attrs.BASENAME, attrs.ZCTA5CE20, attrs.ZCTA5CE10].map((v) => String(v || '')).find((v) => /^\d{5}$/.test(v)) || '' : '';
+        console.log(`[${SCRIPT_NAME}] ZIP area at ${key}:`, zip || '(none)', attrs);
+        zipAreaCache.set(key, zip);
+        return zip;
+    }
+    async function cityOfZip(zip) {
+        const store = zipCityLoad();
+        if (store[zip]) return store[zip];
+        const data = await gmGetJson(`https://api.zippopotam.us/us/${zip}`);
+        const place = data && data.places && data.places[0] ? String(data.places[0]['place name'] || '').trim() : '';
+        console.log(`[${SCRIPT_NAME}] City for ZIP ${zip}:`, place || '(none)');
+        if (place) {
+            store[zip] = place;
+            try { localStorage.setItem(ZIP_CITY_KEY, JSON.stringify(store)); } catch (err) { /* storage unavailable */ }
+        }
+        return place;
+    }
+    async function postalFromZipArea(coords) {
+        const mid = pointAlongLine(coords, 0.5);
+        const zip = await zipAt({ lon: mid[0], lat: mid[1] });
+        if (!zip) return null;
+        const city = await cityOfZip(zip);
+        return city ? { city, zip } : null;
     }
 
     // Counties within `miles` of a point (a box around it), lower-cased names, from the same TIGERweb county layer. Used to keep the
@@ -688,6 +743,12 @@
             console.warn(`[${SCRIPT_NAME}] Address point postal lookup failed:`, err);
         }
         if (defaultPostalCity && formatCityName(defaultPostalCity)) return { cities: [defaultPostalCity], notes: [], fromSetting: true };
+        try {
+            const area = await postalFromZipArea(coords);
+            if (area) return { cities: [area.city], notes: [], fromZipArea: area.zip };
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] ZIP area postal lookup failed:`, err);
+        }
         try {
             const near = await neighborPostal(source, coords, featureId);
             if (near) postal = { cities: near.postal.cities, notes: [], fromNeighbor: Math.round(near.dist) };
@@ -2360,6 +2421,10 @@
         }
         if (postal.fromSetting) {
             result.notes.push(`This road has no ZIP, so its alternate city came from your sidebar setting (${postal.cities[0]}).`);
+        }
+        if (postal.fromZipArea) {
+            result.warn = true;
+            result.notes.push(`This road has no ZIP or postal city of its own, so it was taken from the ZIP area it lies in (${postal.fromZipArea}: ${postal.cities[0]}); check it.`);
         }
         if (postal.fromNeighbor !== undefined) {
             result.warn = true;
@@ -6778,6 +6843,7 @@
         if (postal.fromStreet) return 'same street nearby';
         if (postal.fromAddresses) return 'address points';
         if (postal.fromSetting) return 'your default postal city';
+        if (postal.fromZipArea) return `ZIP area ${postal.fromZipArea} (check it)`;
         if (postal.fromNeighbor !== undefined) return 'nearest GIS road (check it)';
         if (postal.fromGoogle) return 'Google Maps address';
         return 'GIS ZIP / postal field';
