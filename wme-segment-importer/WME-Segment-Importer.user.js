@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026102902
+// @version      2026102903
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4014,8 +4014,15 @@
         if (nameClash && !mismatchInfo) {
             const rerun = async (extra = '') => {
                 cityCheckCache.clear();
-                const again = await fillSegmentInfo(segmentId);
+                let again;
+                try {
+                    again = await fillSegmentInfo(segmentId);
+                } catch (err) {
+                    console.warn(`[${SCRIPT_NAME}] Fill-in after the rename failed:`, err);
+                    again = { message: `Renamed, but the city check failed: ${err.message || err}.`, warn: true, error: true };
+                }
                 setStatus(`${streetNameOf(segmentId) || 'Road'}: ${again.message}${extra}`, again.error ? 'error' : again.warn ? 'warn' : again.info ? 'info' : 'ok', again.actions);
+                console.log(`[${SCRIPT_NAME}] ${streetNameOf(segmentId) || 'Road'} (segment ${segmentId}): ${again.message}${extra}`);
                 ccRequestCheck(150, true);
             };
             return {
@@ -4023,7 +4030,17 @@
                 warn: true,
                 match,
                 actions: [
-                    { label: `Apply: Rename to ${gisName} (GIS)`, primary: true, run: async () => { const cityNote = await ccApplyNameAndCity(segmentId, { kind: 'name', name: gisName }); await rerun(cityNote); } },
+                    { label: `Apply: Rename to ${gisName} (GIS)`, primary: true, run: async () => {
+                        let cityNote = '';
+                        try {
+                            cityNote = await ccApplyNameAndCity(segmentId, { kind: 'name', name: gisName });
+                        } catch (err) {
+                            console.warn(`[${SCRIPT_NAME}] Rename failed:`, err);
+                            setStatus(`${streetNameOf(segmentId) || 'Road'}: could not rename (${err.message || err}).`, 'error');
+                            return;
+                        }
+                        await rerun(cityNote);
+                    } },
                     { label: `Keep mine: ${currentName} (until reload)`, run: async () => { keptNames.add(keptKey(segmentId, gisName)); await rerun(); } }
                 ]
             };
@@ -4132,6 +4149,14 @@
         }
 
         if (!filled.length) {
+            // a named road with no city at all is not "nothing missing": say that no city could be found, and why
+            if (!cityInfo.skipCity && !currentCity && !currentAlts.some((x) => cityOf(x))) {
+                const why = [...(postal.notes || []), ...(cityInfo.notes || [])].join(' ');
+                const found = postal.cities && postal.cities.length ? ` The postal city found (${postal.cities.map(formatCityName).filter(Boolean).join(' / ') || postal.cities.join(' / ')}) was not usable.` : ' No postal city was found from the GIS ZIP, the same street nearby, the address points, or the nearest road with one.';
+                const hint = defaultPostalCity ? '' : ' Setting "Postal city for roads with no ZIP" in the sidebar gives these roads one.';
+                console.warn(`[${SCRIPT_NAME}] No city for segment ${segmentId}:`, { postal, cityInfo, props });
+                return { message: `This road has no city at all.${found}${why ? ` ${why}` : ''}${hint}`, warn: true, match, mismatch: mismatchInfo };
+            }
             return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match, mismatch: mismatchInfo };
         }
 
