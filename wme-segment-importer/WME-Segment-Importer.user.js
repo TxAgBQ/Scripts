@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026102904
+// @version      2026103001
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4569,6 +4569,33 @@
         sdk.Map.setMapCenter({ lonLat: { lon, lat } });
     }
 
+    // A sweep's stops are sized from the current view, so zoomed in tight (zoom 19) a subdivision needs many times more stops than at
+    // zoom 16 (4x per level). Zooms out to the lowest level where WME still holds every segment and returns where the map was, so the
+    // view can be put back when the run ends.
+    function areaSweepZoomOut() {
+        const b = visibleBounds();
+        const home = { lon: (b.minLon + b.maxLon) / 2, lat: (b.minLat + b.maxLat) / 2, zoom: null };
+        try {
+            home.zoom = sdk.Map.getZoomLevel();
+            if (home.zoom > AREA.MIN_ZOOM && typeof sdk.Map.setZoomLevel === 'function') {
+                sdk.Map.setZoomLevel({ zoomLevel: AREA.MIN_ZOOM });
+            }
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Could not zoom out for the sweep:`, err);
+        }
+        return home;
+    }
+
+    function areaSweepRestore(home) {
+        if (!home) return;
+        try {
+            if (home.zoom != null && typeof sdk.Map.setZoomLevel === 'function') sdk.Map.setZoomLevel({ zoomLevel: home.zoom });
+            sdk.Map.setMapCenter({ lonLat: { lon: home.lon, lat: home.lat } });
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Could not put the map view back:`, err);
+        }
+    }
+
     // Waits for WME to say its data loaded after the map moved (or a short time, if it has nothing new to load).
     async function areaWaitForData() {
         await Promise.race([sdk.Events.once({ eventName: 'wme-map-data-loaded' }).catch(() => null), sleep(AREA.DATA_WAIT_MS)]);
@@ -5036,12 +5063,14 @@
         areaSetMessage('info', 'Adding house numbers across the outline...');
         const handled = new Set();
         let failedHard = false;
+        const home = areaSweepZoomOut();
         try {
             const box = areaBox(area.points);
             areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
             await areaWaitForData();
             const centers = areaSweepCenters(box);
-            if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error('the outline is too big for one house number run');
+            console.log(`[${SCRIPT_NAME}] House number sweep: ${centers.length} map stops at zoom ${sdk.Map.getZoomLevel()}.`);
+            if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error(`the outline is too big for one house number run (${centers.length} map stops, the limit is ${AREA.MAX_SWEEP_STOPS}). Draw it in smaller parts.`);
             run.stops = centers.length;
             for (let s = 0; s < centers.length; s++) {
                 if (!(await areaGate())) break;
@@ -5096,6 +5125,7 @@
             run.stopReason = `Stopped: ${err.message || err}`;
             failedHard = true;
         }
+        areaSweepRestore(home);
         run.running = false;
         if (failedHard) areaFinishRun(run, 'error', run.stopReason);
         else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
@@ -5133,21 +5163,27 @@
     // Moves the map across the outline, stop by stop, and calls handler(view) at each stop (WME only holds the segments in view).
     // Returns false if the handler or the user ended it early.
     async function areaSweep(run, handler) {
-        const box = areaBox(area.points);
-        areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
-        await areaWaitForData();
-        const centers = areaSweepCenters(box);
-        if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error('the outline is too big for one pass over the map');
-        run.stops = centers.length;
-        for (let s = 0; s < centers.length; s++) {
-            if (!(await areaGate())) return false;
-            run.stopAt = s + 1;
-            areaMoveTo(centers[s].lon, centers[s].lat);
+        const home = areaSweepZoomOut();
+        try {
+            const box = areaBox(area.points);
+            areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
             await areaWaitForData();
-            renderAreaPanel();
-            if ((await handler(visibleBounds())) === false) return false;
+            const centers = areaSweepCenters(box);
+            console.log(`[${SCRIPT_NAME}] Area sweep: ${centers.length} map stops at zoom ${sdk.Map.getZoomLevel()}.`);
+            if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error(`the outline is too big for one pass over the map (${centers.length} map stops, the limit is ${AREA.MAX_SWEEP_STOPS}). Draw it in smaller parts.`);
+            run.stops = centers.length;
+            for (let s = 0; s < centers.length; s++) {
+                if (!(await areaGate())) return false;
+                run.stopAt = s + 1;
+                areaMoveTo(centers[s].lon, centers[s].lat);
+                await areaWaitForData();
+                renderAreaPanel();
+                if ((await handler(visibleBounds())) === false) return false;
+            }
+            return true;
+        } finally {
+            areaSweepRestore(home);
         }
-        return true;
     }
 
     // Fixes one flagged segment: the primary city the limits call for (outside every limit the primary is cleared and the postal city
