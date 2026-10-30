@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103001
+// @version      2026103002
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -211,7 +211,7 @@
     const KENDALL = GIS_SOURCES.find((s) => s.key === 'kendall');
     const GISL_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1cEG3CvXSCI4TOZyMQTI50SQGbVhJ48Xip-jjWg4blWw/gviz/tq?tqx=out:json';
     const GISL_SETTINGS_KEY = 'wme_gis_layers_fl';
-    const GISL_CACHE_KEY = 'wme_gis_importer_gisl_layers_v1';
+    const GISL_CACHE_KEY = 'wme_gis_importer_gisl_layers_v2'; // v2: parcel layers are kept in the list (v1 dropped them)
     const GISL_CACHE_HOURS = 24;
     const TIGER_URL = 'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer';
     const LEVEL_ORDER = ['city', 'county', 'state'];
@@ -338,7 +338,7 @@
     }
 
     const roleOfLayer = (id, style) => {
-        if (/parcel/i.test(id)) return null;
+        if (/parcel/i.test(id)) return 'parcel';
         if (/(pts|points|address|addr)/i.test(id)) return 'address';
         if (style === 'roads' || /(road|street|rds|route|centerline)/i.test(id)) return 'roads';
         return null;
@@ -625,11 +625,106 @@
         return { cities, notes: [], missing: !cities.length };
     }
 
+    // ----- parcels: the property's own (situs) address, a fallback where the address points do not cover a street -----
+    // A parcel layer carries the address of the property in "situs" fields. The owner's mailing address is a different set of fields
+    // (addr_*, zip) and is never used. Field names differ from county to county; these are the ones known so far.
+    const PARCEL_FIELDS = {
+        number: ['situs_num', 'situs_number', 'situs_no', 'situs_house_num', 'situsnum', 'site_num', 'site_number'],
+        preDir: ['situs_street_prefx', 'situs_street_prefix', 'situs_prefix', 'situs_predir', 'situs_dir'],
+        street: ['situs_street', 'situs_street_name', 'situs_st_name', 'situs_stname', 'site_street', 'site_street_name'],
+        suffix: ['situs_street_sufix', 'situs_street_suffix', 'situs_sufix', 'situs_suffix', 'situs_street_type', 'situs_type'],
+        full: ['situs_address', 'situs_addr', 'situs', 'situs_full', 'site_address', 'site_addr'],
+        city: ['situs_city', 'site_city', 'situs_town']
+    };
+    const PARCEL_NAME_RADIUS_M = 60; // parcel centres sit further from the road than address points, so the name vote looks further out
+
+    // "2537" -> "2537"; "0", "" and words are not house numbers
+    function parcelNumber(p) {
+        const n = fieldValue(p, PARCEL_FIELDS.number).replace(/\s+/g, '');
+        if (/^\d+[A-Za-z]?$/.test(n) && !/^0+$/.test(n)) return n.toUpperCase();
+        const split = splitAddress(fieldValue(p, PARCEL_FIELDS.full));
+        return split && !/^0+$/.test(split.number) ? split.number : '';
+    }
+
+    // The street is handed over as one string so the type is written the same way as for address points.
+    function parcelNameParts(p) {
+        const street = fieldValue(p, PARCEL_FIELDS.street);
+        if (!street) {
+            const split = splitAddress(fieldValue(p, PARCEL_FIELDS.full));
+            return { preDir: '', name: '', type: '', sufDir: '', full: split ? split.street : '' };
+        }
+        const full = [fieldValue(p, PARCEL_FIELDS.preDir), street, fieldValue(p, PARCEL_FIELDS.suffix)].filter(Boolean).join(' ');
+        return { preDir: '', name: '', type: '', sufDir: '', full };
+    }
+
+    function parcelPostalCities(p) {
+        const v = fieldValue(p, PARCEL_FIELDS.city);
+        const ok = !!(v && formatCityName(v));
+        return { cities: ok ? [v] : [], notes: [], missing: !ok };
+    }
+
+    // The middle of a parcel (area-weighted, outer ring), as [lon, lat]. Worked relative to the first corner so the numbers stay small.
+    function parcelCentre(rings) {
+        const ring = rings && rings[0];
+        if (!Array.isArray(ring) || ring.length < 3) return null;
+        const [ox, oy] = ring[0];
+        let a = 0;
+        let cx = 0;
+        let cy = 0;
+        for (let i = 0; i < ring.length - 1; i++) {
+            const x0 = ring[i][0] - ox;
+            const y0 = ring[i][1] - oy;
+            const x1 = ring[i + 1][0] - ox;
+            const y1 = ring[i + 1][1] - oy;
+            const f = x0 * y1 - x1 * y0;
+            a += f;
+            cx += (x0 + x1) * f;
+            cy += (y0 + y1) * f;
+        }
+        if (Math.abs(a) < 1e-18) {
+            const n = ring.length - 1 || 1;
+            return [ring.slice(0, n).reduce((s, p) => s + p[0], 0) / n, ring.slice(0, n).reduce((s, p) => s + p[1], 0) / n];
+        }
+        return [ox + cx / (3 * a), oy + cy / (3 * a)];
+    }
+
+    // Parcels in a box, answered as points (one per parcel, at its middle) in the shape the address point code expects.
+    async function queryParcelPoints(layers, box, used) {
+        for (const layer of layers.filter((l) => !brokenLayers.has(l.id))) {
+            let data;
+            try {
+                data = await queryGislLayer(layer, box);
+            } catch (err) {
+                console.warn(`[${SCRIPT_NAME}] Parcel query failed:`, err);
+                if (/not found|does not exist|inaccessible|request to .* failed|timed out/i.test(err.message || '')) brokenLayers.set(layer.id, err.message || 'failed');
+                continue;
+            }
+            const features = [];
+            for (const f of data.features) {
+                const centre = f.geometry && f.geometry.type === 'Polygon' ? parcelCentre(f.geometry.coordinates) : null;
+                if (centre) features.push({ type: 'Feature', id: f.id, properties: f.properties, geometry: { type: 'Point', coordinates: centre } });
+            }
+            if (features.length) {
+                used.parcel = layer.id;
+                return { features };
+            }
+        }
+        return { features: [] };
+    }
+
     // The source object every part of the importer uses, built from the GIS Layers layers that cover a county.
     function makeGislSource(countyName, layers) {
-        const used = { roads: '', address: '' };
+        const used = { roads: '', address: '', parcel: '' };
         const roads = layers.filter((l) => l.role === 'roads');
         const addresses = layers.filter((l) => l.role === 'address');
+        const parcels = layers.filter((l) => l.role === 'parcel' && !l.fallback);
+        const parcelCfg = parcels.length ? {
+            isParcel: true,
+            query: (box) => queryParcelPoints(parcels, box, used),
+            nameParts: parcelNameParts,
+            number: parcelNumber,
+            postalCities: parcelPostalCities
+        } : null;
         const source = {
             key: 'gisl',
             generic: true,
@@ -654,7 +749,9 @@
                 nameParts: genericAddressNameParts,
                 number: genericAddressNumber,
                 postalCities: genericPostalCities
-            } : null
+            } : parcelCfg,
+            // used when the address points do not cover a street (names and house numbers from the parcels' property addresses)
+            parcels: parcelCfg
         };
         return source;
     }
@@ -3065,7 +3162,7 @@
         if (segmentId < 0 && !HOUSE_NUMBERS_ON_UNSAVED_SEGMENTS) {
             return { message: 'HNs: this segment is not saved yet. Save, then click the road again to add them.', warn: false, level: 'info' };
         }
-        const cfg = source.houseNumbers;
+        let cfg = source.houseNumbers;
         const segment = sdk.DataModel.Segments.getById({ segmentId });
         if (!cfg || !segment) return { message: '', warn: false };
 
@@ -3074,7 +3171,7 @@
         const lats = coords.map((c) => c[1]);
         const pad = 0.003;
         const box = { minLon: Math.min(...lons) - pad, maxLon: Math.max(...lons) + pad, minLat: Math.min(...lats) - pad, maxLat: Math.max(...lats) + pad };
-        const data = await cfg.query(box);
+        let data = await cfg.query(box);
         if (data.error) throw new Error(data.error.message || 'address point query error');
 
         const origin = coords[0];
@@ -3093,6 +3190,29 @@
             street.push({ id: other.id, xy: c.map(project) });
         }
         const have = await existingHouseNumbers(street.map((s) => s.id));
+
+        // No address point of this street within reach of the segment (a new subdivision the address points do not cover yet): the
+        // property (situs) addresses in a checked parcel layer give the numbers instead, one per parcel, on the side of the road it is on.
+        let fromParcels = false;
+        if (source.parcels && cfg !== source.parcels) {
+            const hasPoint = (data.features || []).some((feature) => {
+                const c = feature.geometry && feature.geometry.coordinates;
+                if (!Array.isArray(c) || typeof c[0] !== 'number') return false;
+                const attrs = feature.properties || {};
+                if (!cfg.number(attrs) || normalizeName(buildStreetName(cfg.nameParts(attrs)).name) !== wanted) return false;
+                const [px, py] = project(c);
+                return xyNearest(street[0].xy, px, py).d <= 80;
+            });
+            if (!hasPoint) {
+                const parcelData = await source.parcels.query(box);
+                if (parcelData.features && parcelData.features.length) {
+                    cfg = source.parcels;
+                    data = parcelData;
+                    fromParcels = true;
+                    console.log(`[${SCRIPT_NAME}] ${name}: no address point of this street near the segment, so the house numbers come from the parcels (${source.used.parcel}).`);
+                }
+            }
+        }
 
         // The GIS centerlines of this street near the segment. The address points were keyed to these, so they
         // decide which side of the road a house is on even when the mapped road is offset from them.
@@ -3286,7 +3406,8 @@
                 if (!best || n.d < best.d) best = { ...n, id: s.id };
             }
             if (!best || best.id !== segmentId) continue;
-            const isExact = best.d >= exactFromM; // far enough from the road to be the house itself
+            // far enough from the road to be the house itself (a parcel's middle is not a house: its number goes beside the road)
+            const isExact = !fromParcels && best.d >= exactFromM;
             if (best.d > (isExact ? HOUSE_NUMBER_EXACT_MAX_M : 80)) continue;
             // nearer to a connected segment that is this street but not renamed yet: it gets this number once renamed
             let owner = null;
@@ -3430,7 +3551,8 @@
         if (flat.length) parts.push(`Could not tell the side for ${hn(flat.length)}.`);
         const nameClash = !added.length && !skipped.length && !flat.length && !beyond.length && !forNeighbour.length && !pastMapped.length && otherNames.size > 0;
         if (nameClash) parts.push(`Address points close to this road use other names: ${[...otherNames].slice(0, 4).join(', ')}.`);
-        if (source.generic && source.used.address) parts.push(`(address points: ${source.used.address})`);
+        if (fromParcels) parts.push(`(from the property addresses in the parcels: ${source.used.parcel})`);
+        else if (source.generic && source.used.address) parts.push(`(address points: ${source.used.address})`);
         // the numbers themselves go to the console only
         console.log(`[${SCRIPT_NAME}] ${name} house numbers:`, {
             added: order(added), atAddressPoint: order(exactAt), alreadyInWme: order(skipped), leftForNextSegment: order(beyond), fanned: order(fanned),
@@ -3994,10 +4116,22 @@
     const ADDRESS_NAME_MIN_POINTS = 2;
     const ADDRESS_NAME_MAJORITY = 0.6;
     const ADDRESS_NAME_BEYOND_END_M = 5;
+    // Address points first; if they give no name, the property addresses in a checked parcel layer.
     async function nameFromAddressPoints(segment, source) {
-        const cfg = source.houseNumbers;
-        if (!cfg) return { reason: `No address point layer is checked in WME GIS Layers for ${source.county || 'this'} County (or statewide), so the name could not come from address points.` };
-        const radius = addressNameRadiusM;
+        const configs = [source.houseNumbers, source.parcels].filter((c, i, all) => c && all.indexOf(c) === i);
+        if (!configs.length) return { reason: `No address point or parcel layer is checked in WME GIS Layers for ${source.county || 'this'} County (or statewide), so the name could not come from address points.` };
+        const reasons = [];
+        for (const cfg of configs) {
+            const result = await nameFromPointConfig(segment, source, cfg);
+            if (result.name) return result;
+            reasons.push(result.reason);
+        }
+        return { reason: reasons.join(' ') };
+    }
+
+    async function nameFromPointConfig(segment, source, cfg) {
+        const kind = cfg.isParcel ? 'parcels' : 'address points';
+        const radius = cfg.isParcel ? Math.max(addressNameRadiusM, PARCEL_NAME_RADIUS_M) : addressNameRadiusM;
         const coords = segment.geometry.coordinates;
         const project = makeProjector(coords[0]);
         const xy = coords.map(project);
@@ -4027,18 +4161,20 @@
             total++;
         }
         const ranked = [...tally.values()].sort((a, b) => b.n - a.n);
-        console.log(`[${SCRIPT_NAME}] address point street names within ${radius} m of the segment (points, nearest m, farthest m):`,
+        console.log(`[${SCRIPT_NAME}] ${kind} street names within ${radius} m of the segment (${kind}, nearest m, farthest m):`,
             ranked.map((e) => `${e.name}: ${e.n}, ${e.nearest.toFixed(0)}, ${e.farthest.toFixed(0)}`));
-        if (!total) return { reason: `No address points with a street name within ${radius} m of it.` };
+        if (!total) return { reason: `No ${kind} with a street name within ${radius} m of it.` };
         const top = ranked[0];
         if (top.n < ADDRESS_NAME_MIN_POINTS || top.n / total < ADDRESS_NAME_MAJORITY) {
-            return { reason: `The address points within ${radius} m do not agree on one street (${ranked.slice(0, 3).map((e) => `${e.name}: ${e.n}`).join(', ')}).` };
+            return { reason: `The ${kind} within ${radius} m do not agree on one street (${ranked.slice(0, 3).map((e) => `${e.name}: ${e.n}`).join(', ')}).` };
         }
         const second = ranked[1];
+        const layerUsed = cfg.isParcel ? source.used.parcel : source.used.address;
         return {
             name: top.name,
-            summary: `${top.n} of ${total} address point${total === 1 ? '' : 's'} within ${radius} m${source.generic && source.used.address ? `, ${source.used.address}` : ''}`,
-            note: second && second.n * 3 >= top.n ? `Address points also show ${second.name} (${second.n}) within ${radius} m; check that ${top.name} is right.` : ''
+            kind,
+            summary: `${top.n} of ${total} ${cfg.isParcel ? 'parcel' : 'address point'}${total === 1 ? '' : 's'} within ${radius} m${source.generic && layerUsed ? `, ${layerUsed}` : ''}`,
+            note: second && second.n * 3 >= top.n ? `The ${kind} also show ${second.name} (${second.n}) within ${radius} m; check that ${top.name} is right.` : ''
         };
     }
 
@@ -4253,10 +4389,10 @@
         });
         const googleNote = useGoogle ? `right-clicked ${google.ageText} ago, ${google.distM} m from this segment; Google lists it as "${google.rec.full}"` : '';
         const origin = match
-            ? `from the GIS road${source.generic ? ` (${match.layerId ? `GIS Layers: ${match.layerId}` : source.label})` : ''}.${nameFromGoogle ? ` The name came from Google Maps (${googleNote}).` : nameFromPoints ? ` The name came from the address points (${pointsInfo.summary}).` : ''}`
+            ? `from the GIS road${source.generic ? ` (${match.layerId ? `GIS Layers: ${match.layerId}` : source.label})` : ''}.${nameFromGoogle ? ` The name came from Google Maps (${googleNote}).` : nameFromPoints ? ` The name came from the ${pointsInfo.kind || 'address points'} (${pointsInfo.summary}).` : ''}`
             : useGoogle
                 ? `from Google Maps (${googleNote}).`
-                : `with no GIS road along it${nameFromPoints ? `: the name came from the address points (${pointsInfo.summary})` : ''}.`;
+                : `with no GIS road along it${nameFromPoints ? `: the name came from the ${pointsInfo.kind || 'address points'} (${pointsInfo.summary})` : ''}.`;
         return { message: `Filled in ${filled.join(', ')} ${origin}${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, match, mismatch: mismatchInfo };
     }
 
