@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103002
+// @version      2026103101
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -5024,6 +5024,50 @@
         return !area.run.stop;
     }
 
+    // WME asked "Save anyway?". The run does not answer it and does not end: it waits right here, with the popover left open, until
+    // the pending edits are saved (you click Save anyway, or fix what it names and save), then carries on from the same spot with
+    // its counts, its place in the sweep and its "needs a look" list intact. Stop ends the wait.
+    const areaSavePopoverOpen = () => {
+        const pop = document.querySelector('.save-popover');
+        const title = pop && pop.querySelector('.actions-title');
+        return !!(title && /save anyway/i.test(title.textContent || ''));
+    };
+
+    async function areaWaitForUserSave(run, why) {
+        run.waitingSave = true;
+        areaSetMessage('warn', `WME asks "Save anyway?" The run is waiting for you. Read the warning, then click Save anyway (or fix what it names and save). The run carries on by itself after the save; Stop ends it. WME says: ${why}`);
+        console.log(`[${SCRIPT_NAME}] Waiting for you to answer WME's "Save anyway?" (${run.sinceSave} change(s) pending). ${why}`);
+        renderAreaPanel();
+        let sawBusy = false;
+        try {
+            for (;;) {
+                if (run.stop) {
+                    run.stopReason = `Stopped by you while waiting for the save. ${run.sinceSave} change(s) are not saved.`;
+                    return false;
+                }
+                const btn = areaSaveButton();
+                if (!btn) {
+                    run.stop = true;
+                    run.stopReason = "WME's Save button went away while the run waited for you to save.";
+                    return false;
+                }
+                if (btn.hasAttribute('busy')) sawBusy = true;
+                if (!areaSavePopoverOpen() && btn.hasAttribute('disabled') && !btn.hasAttribute('busy')) {
+                    await sleep(600); // let WME settle (new segments get their real ids)
+                    run.sinceSave = 0;
+                    if (sawBusy) run.saves++;
+                    console.log(`[${SCRIPT_NAME}] Saved; the run continues.`);
+                    return true;
+                }
+                await sleep(300);
+            }
+        } finally {
+            run.waitingSave = false;
+            if (!run.stop) areaSetMessage('info', 'Saved. Continuing...');
+            renderAreaPanel();
+        }
+    }
+
     async function areaPeriodicSave(run) {
         const result = await areaSave();
         if (result.ok) {
@@ -5031,10 +5075,9 @@
             if (!result.nothing) run.saves++;
             return true;
         }
+        if (result.warnings) return areaWaitForUserSave(run, result.why);
         run.stop = true;
-        run.stopReason = result.warnings
-            ? `WME asks "Save anyway?" and the run stopped there so you can look. The popover is still open: read it, fix what it names, then Save yourself. WME says: ${result.why}`
-            : `Save did not finish: ${result.why}`;
+        run.stopReason = `Save did not finish: ${result.why}`;
         return false;
     }
 
@@ -5781,7 +5824,7 @@
             const bar = areaEl('div', 'height: 8px; background: #e8eaed; border-radius: 4px; overflow: hidden; margin-bottom: 4px;');
             const frac = run.kind === 'roads' ? (total ? run.done / total : 0) : (run.stops ? (run.stopAt || 0) / run.stops : 0);
             bar.appendChild(areaEl('div', `height: 100%; width: ${Math.round(Math.min(1, frac) * 100)}%; background: ${COLOUR_ROADS};`));
-            areaPanel.append(bar, areaEl('div', 'font-size: 11px; color: #5f6368; margin-bottom: 8px;', `${line}${run.paused ? ' PAUSED.' : ''}${run.stop ? ' Stopping...' : ''}`));
+            areaPanel.append(bar, areaEl('div', 'font-size: 11px; color: #5f6368; margin-bottom: 8px;', `${line}${run.paused ? ' PAUSED.' : ''}${run.waitingSave ? ' WAITING FOR YOUR SAVE.' : ''}${run.stop ? ' Stopping...' : ''}`));
         }
 
         const phase = area.phase;
