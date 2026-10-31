@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103107
+// @version      2026103109
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1219,6 +1219,9 @@
     // The city check covers every road type. Only these types are expected to have a street name (Street, Primary Street, Freeway, Major Highway,
     // Minor Highway, Private Road). Parking Lot Roads, ramps, paths and the rest are normally unnamed, so a missing name is not flagged on them.
     const NAME_EXPECTED_TYPES = new Set([1, 2, 3, 6, 7, 17]);
+    // These types are mapped with no city (and are not checked for a name): Walking Trail 5, Off-road 8, Pedestrian Boardwalk 10, Stairway 16,
+    // Railroad 18, Runway/Taxiway 19. The scan, the panel and the fixes leave them alone.
+    const CITY_EXEMPT_TYPES = new Set([5, 8, 10, 16, 18, 19]);
     const GAP_MIN_ZOOM = 16;
     const GAP_SHORT_CONNECTOR_M = 60; // an unnamed segment shorter than this is taken to be an at-grade connector, which normally has no name
     const GAP_KINDS = {
@@ -6680,6 +6683,7 @@
 
     // thorough = true (the area runs): short unnamed segments are not excused as connectors, so they get looked at too.
     function evaluateSegmentInfo(segment, places, thorough = false) {
+        if (CITY_EXEMPT_TYPES.has(segment.roadType)) return null;
         let address;
         try {
             address = sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
@@ -7096,6 +7100,10 @@
             return result;
         }
         result.name = addr.name;
+        if (CITY_EXEMPT_TYPES.has(segment.roadType)) {
+            result.rows.push({ label: 'Road type', text: 'This road type is mapped with no city, so nothing is checked.', level: 'info' });
+            return result;
+        }
         const nameExpected = NAME_EXPECTED_TYPES.has(segment.roadType);
         const coords = segment.geometry.coordinates;
         let worst = 'ok';
