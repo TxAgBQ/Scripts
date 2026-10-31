@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103101
+// @version      2026103107
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1106,6 +1106,12 @@
             return result.changed ? result.items.map((x) => x.o).join(' ') : '';
         }
 
+        // Our naming rule: Private Road 3020 (any spelling: Private Rd, Pvt Rd, PR 3020) is written PR-3020. Anything else is returned unchanged.
+        function privateRoadName(name) {
+            const m = String(name || '').trim().match(/^(?:private\s+(?:road|rd)|pvt\s+(?:road|rd)|pr)\s*[-\s]\s*(\d+[a-z]?)$/i);
+            return m ? `PR-${m[1].toUpperCase()}` : String(name || '');
+        }
+
         function buildStreetName(parts) {
             const clean = (v) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
             // Apostrophes are dropped. A single letter before one (O'BRIEN, D'ANGELO) keeps the next capital.
@@ -1128,7 +1134,7 @@
                 if (route && route.route) {
                     const direction = suf || pre;
                     const tokens = [route.route, ...route.rest.split(' ').filter(Boolean), ...(direction ? [direction] : [])];
-                    return { name: finish(tokens, true), note };
+                    return { name: privateRoadName(finish(tokens, true)), note };
                 }
                 if (route && route.ambiguousHighway) sawAmbiguousHighway = true;
             }
@@ -1140,12 +1146,12 @@
             const route = matchRoute(raw, parts.shield);
             if (route && route.route) {
                 const tokens = [route.route, ...route.rest.split(' ').filter(Boolean)];
-                return { name: finish(tokens, true), note };
+                return { name: privateRoadName(finish(tokens, true)), note };
             }
             if (sawAmbiguousHighway || (route && route.ambiguousHighway)) {
                 note = `"${raw}" is a highway - set SH or US by hand.`;
             }
-            return { name: finish(raw.split(' '), false), note };
+            return { name: privateRoadName(finish(raw.split(' '), false)), note };
         }
 
         return {
@@ -1158,11 +1164,12 @@
             formatCityName,
             DIRECTION_TOKENS,
             buildStreetName,
+            privateRoadName,
             fixRepeatedType
         };
     })();
 
-    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, fixRepeatedType } = WmeSiCore;
+    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, privateRoadName, fixRepeatedType } = WmeSiCore;
 
     const mapDiv = (typeof sdk.Map.getMapViewportElement === 'function' && sdk.Map.getMapViewportElement()) ||
         document.getElementById('map');
@@ -1209,7 +1216,9 @@
     let gapScanBusy = false;
     const gapCityCache = new Map();
     const GAP_LAYER = 'wme-segment-importer-info-gaps';
-    const GAP_ROAD_TYPES = new Set([1, 2, 3, 6, 7]); // Street, Primary Street, Freeway, Major Highway, Minor Highway (ramps and paths are left out)
+    // The city check covers every road type. Only these types are expected to have a street name (Street, Primary Street, Freeway, Major Highway,
+    // Minor Highway, Private Road). Parking Lot Roads, ramps, paths and the rest are normally unnamed, so a missing name is not flagged on them.
+    const NAME_EXPECTED_TYPES = new Set([1, 2, 3, 6, 7, 17]);
     const GAP_MIN_ZOOM = 16;
     const GAP_SHORT_CONNECTOR_M = 60; // an unnamed segment shorter than this is taken to be an at-grade connector, which normally has no name
     const GAP_KINDS = {
@@ -2801,7 +2810,7 @@
         };
     }
 
-    const normalizeName = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalizeName = (s) => privateRoadName(s).toLowerCase().replace(/[^a-z0-9]/g, '');
 
     function streetNameOf(segmentId) {
         try {
@@ -5325,7 +5334,7 @@
     function areaFlaggedInView(view, places, handled) {
         const found = [];
         for (const segment of sdk.DataModel.Segments.getAll()) {
-            if (handled.has(segment.id) || !isLiveSegment(segment) || !GAP_ROAD_TYPES.has(segment.roadType)) continue;
+            if (handled.has(segment.id) || !isLiveSegment(segment)) continue;
             const c = segment.geometry && segment.geometry.coordinates;
             if (!c || c.length < 2) continue;
             const mid = pointAlongLine(c, 0.5);
@@ -5405,7 +5414,10 @@
             notes.push(`Cleared the primary city ${originalPrimary} (it is outside every city and CDP limit).`);
         }
 
-        const fill = await fillSegmentInfo(id, { continueOnMismatch: true });
+        const fillTarget = sdk.DataModel.Segments.getById({ segmentId: id });
+        const fill = fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && !(before && before.name)
+            ? { message: '', mismatch: null }
+            : await fillSegmentInfo(id, { continueOnMismatch: true });
         const filledSomething = /^Filled in/.test(fill.message);
         if (filledSomething) {
             changed = true;
@@ -6694,7 +6706,10 @@
         const limits = places && (!name || primary) ? limitsCityOf(segment, places) : null;
         if (!name) {
             const insideLimits = !!(limits && limits.agreed && limits.name);
-            if (insideLimits && !primary) kind = shortConnector ? 'city' : 'none';
+            if (!NAME_EXPECTED_TYPES.has(segment.roadType)) {
+                // no name expected (Parking Lot Road and the like): only the primary city matters, checked below against the limits
+                if (insideLimits && !primary) kind = 'city';
+            } else if (insideLimits && !primary) kind = shortConnector ? 'city' : 'none';
             else if (!shortConnector) kind = 'name';
         } else if (!hasCity) kind = 'city';
         if (!kind && limits && gapSettings.cities && primary) {
@@ -6841,7 +6856,7 @@
             }
             const found = [];
             for (const segment of sdk.DataModel.Segments.getAll()) {
-                if (!isLiveSegment(segment) || !GAP_ROAD_TYPES.has(segment.roadType)) continue;
+                if (!isLiveSegment(segment)) continue;
                 const c = segment.geometry && segment.geometry.coordinates;
                 if (!c || c.length < 2) continue;
                 if (!inside(c[0]) && !inside(c[c.length - 1]) && !inside(c[Math.floor(c.length / 2)])) continue;
@@ -7081,10 +7096,7 @@
             return result;
         }
         result.name = addr.name;
-        if (!GAP_ROAD_TYPES.has(segment.roadType)) {
-            result.rows.push({ label: 'Road type', text: 'Ramps, paths and other types are not checked.', level: 'info' });
-            return result;
-        }
+        const nameExpected = NAME_EXPECTED_TYPES.has(segment.roadType);
         const coords = segment.geometry.coordinates;
         let worst = 'ok';
         const rank = { ok: 0, info: 0, warn: 1, error: 2 };
@@ -7102,6 +7114,7 @@
         if (addr.name) result.rows.push({ label: 'Street name', text: addr.name, level: 'ok' });
         else if (roundabout) result.rows.push({ label: 'Street name', text: 'None, which is right for a roundabout.', level: 'ok' });
         else if (shortConnector) result.rows.push({ label: 'Street name', text: `None, which is fine for a short connector (under ${GAP_SHORT_CONNECTOR_M} m).`, level: 'ok' });
+        else if (!nameExpected) result.rows.push({ label: 'Street name', text: 'None, which is right for this road type.', level: 'ok' });
         else {
             result.rows.push({ label: 'Street name', text: 'None. Name it (the Roads fill-in can do it from the GIS or Google Maps).', level: 'error' });
             raise('error');
@@ -7228,6 +7241,26 @@
             result.proposals.push({ kind: 'alt', cities, label: `${addr.alts.length ? 'Change' : 'Add'} alternate city ${addr.alts.length ? 'to ' : ''}${cities.join(' / ')} (${c.source})` });
         }
 
+        // A wrong primary city and a missing alternate city are fixed together: one button (listed first, so the hover right-click uses it)
+        // writes both in a single edit instead of two.
+        // The alternate is judged against the NEW primary city (the old primary may be the very city that should become the alternate).
+        const primaryFix = result.proposals.find((p) => p.kind === 'primary');
+        if (primaryFix && addr.name) {
+            const combined = [];
+            const seenBoth = new Set();
+            for (const c of candidates) {
+                const cities = c.cities.filter((x) => !(primaryFix.city && ccSameCity(x, primaryFix.city)));
+                const key = cities.map(normalizeName).sort().join('|');
+                if (!cities.length || seenBoth.has(key) || cities.every((x) => ccHas(addr.alts, x))) continue;
+                seenBoth.add(key);
+                combined.push({
+                    kind: 'both', city: primaryFix.city, cities,
+                    label: `${primaryFix.label} and ${addr.alts.length ? 'change' : 'add'} alternate city ${addr.alts.length ? 'to ' : ''}${cities.join(' / ')} (${c.source})`
+                });
+            }
+            result.proposals.unshift(...combined);
+        }
+
         result.level = worst;
         if (worst === 'ok') result.summary = 'Looks right.';
         else if (worst === 'error') result.summary = 'Needs attention.';
@@ -7243,12 +7276,12 @@
         }
         const addr = ccAddressOf(segmentId);
         if (!addr) throw new Error('could not read the segment\'s address');
-        if (!addr.name && proposal.kind === 'alt') throw new Error('an alternate city needs a street name');
+        if (!addr.name && (proposal.kind === 'alt' || proposal.kind === 'both')) throw new Error('an alternate city needs a street name');
         const { country, state } = regionOf(segmentId);
         if (!country || !state) throw new Error(REGION_ERROR);
         let primary = addr.primary;
         let altIds = addr.altStreets.map((x) => x.street.id);
-        if (proposal.kind === 'primary') primary = proposal.city;
+        if (proposal.kind === 'primary' || proposal.kind === 'both') primary = proposal.city;
         if (proposal.kind === 'name') {
             // the alternate streets carry the old name too: rebuild them with the new one, in the same cities
             if (!proposal.name) throw new Error('no street name to apply');
@@ -7261,7 +7294,7 @@
                 altIds.push(street.id);
             }
         }
-        if (proposal.kind === 'alt') {
+        if (proposal.kind === 'alt' || proposal.kind === 'both') {
             altIds = [];
             for (const cityName of proposal.cities) {
                 let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
