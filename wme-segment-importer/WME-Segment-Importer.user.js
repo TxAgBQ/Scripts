@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103109
+// @version      2026103111
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1222,6 +1222,7 @@
     // These types are mapped with no city (and are not checked for a name): Walking Trail 5, Off-road 8, Pedestrian Boardwalk 10, Stairway 16,
     // Railroad 18, Runway/Taxiway 19. The scan, the panel and the fixes leave them alone.
     const CITY_EXEMPT_TYPES = new Set([5, 8, 10, 16, 18, 19]);
+    const CITY_ONLY_KINDS = new Set(['badcity', 'city', 'none', 'altnocity']); // the flags the 'Fix cities only' area run works on
     const GAP_MIN_ZOOM = 16;
     const GAP_SHORT_CONNECTOR_M = 60; // an unnamed segment shorter than this is taken to be an at-grade connector, which normally has no name
     const GAP_KINDS = {
@@ -4200,7 +4201,9 @@
         }
     }
 
+    // opts.cityOnly: the street name is never changed, added or compared with the GIS; the primary and alternate cities follow the usual rules.
     async function fillSegmentInfo(segmentId, opts = {}) {
+        const cityOnly = !!opts.cityOnly;
         const segment = sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) return { message: 'Segment not found.', warn: true };
         if (isRoundabout(segment) && !(address0Name(segmentId))) return { message: 'Nothing missing. Roundabouts do not get a street name.', info: true, match: null, mismatch: null };
@@ -4222,7 +4225,7 @@
         const gisName = match ? buildStreetName(source.nameParts(props)).name : '';
         const googleName = useGoogle ? buildStreetName({ full: google.rec.name }).name : '';
 
-        const nameClash = !!(currentName && gisName && normalizeName(currentName) !== normalizeName(gisName) && !keptNames.has(keptKey(segmentId, gisName)));
+        const nameClash = !cityOnly && !!(currentName && gisName && normalizeName(currentName) !== normalizeName(gisName) && !keptNames.has(keptKey(segmentId, gisName)));
         const mismatchInfo = nameClash && opts.continueOnMismatch ? { mapped: currentName, gis: gisName } : null;
         if (nameClash && !mismatchInfo) {
             const rerun = async (extra = '') => {
@@ -4258,16 +4261,16 @@
                 ]
             };
         }
-        let name = currentName || gisName;
+        let name = cityOnly ? currentName : (currentName || gisName);
         let nameFromGoogle = false;
         let nameFromPoints = false;
         let pointsInfo = null;
-        if (!name && googleName) {
+        if (!cityOnly && !name && googleName) {
             name = googleName;
             nameFromGoogle = true;
         }
         // Still no name: the address points beside the segment (a road you mapped from the imagery, with no GIS road along it)
-        if (!name && source) {
+        if (!cityOnly && !name && source) {
             try {
                 pointsInfo = await nameFromAddressPoints(segment, source);
             } catch (err) {
@@ -4279,6 +4282,7 @@
                 nameFromPoints = true;
             }
         }
+        if (!name && cityOnly) return { message: 'Unnamed, so it can only have a primary city, which the city limits decide.', info: true, match, mismatch: null };
         if (!name) {
             const why = pointsInfo && pointsInfo.reason ? ` ${pointsInfo.reason}` : '';
             if (match) return { message: `Neither this segment nor the GIS road has a street name, so nothing was filled in.${why}`, warn: true, match };
@@ -4297,7 +4301,7 @@
             warn = true;
             notes.push(pointsInfo.note);
         }
-        if (googleName && !nameFromGoogle && normalizeName(googleName) !== normalizeName(name)) {
+        if (!cityOnly && googleName && !nameFromGoogle && normalizeName(googleName) !== normalizeName(name)) {
             warn = true;
             notes.push(`Google Maps calls it "${googleName}" (left as is).`);
         }
@@ -5382,7 +5386,10 @@
     // GIS, Google Maps or the address points as a Roads click does, then the street name (a name that differs from the GIS name is
     // renamed to the GIS name, as the "Apply: Rename" button does).
     // Returns { outcome: 'fixed' | 'review' | 'unchanged', changed, renamed, message }.
-    async function areaFixSegment(t, places) {
+    // opts.cityOnly: the cities follow all the usual rules (primary from the limits, alternate from the postal sources), but no street is renamed
+    // or given a name, and only city problems count when judging the result.
+    async function areaFixSegment(t, places, opts = {}) {
+        const cityOnly = !!opts.cityOnly;
         const id = t.id;
         const notes = [];
         let changed = false;
@@ -5392,7 +5399,7 @@
         const originalPrimary = before ? before.primary : '';
 
         // a street type written twice ("Weston Dr Drive") is written once
-        {
+        if (!cityOnly) {
             const current = ccAddressOf(id);
             const single = current && current.name ? fixRepeatedType(current.name) : '';
             if (single) {
@@ -5418,9 +5425,10 @@
         }
 
         const fillTarget = sdk.DataModel.Segments.getById({ segmentId: id });
-        const fill = fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && !(before && before.name)
+        const skipFill = !!(fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && !(before && before.name));
+        const fill = skipFill
             ? { message: '', mismatch: null }
-            : await fillSegmentInfo(id, { continueOnMismatch: true });
+            : await fillSegmentInfo(id, cityOnly ? { cityOnly: true } : { continueOnMismatch: true });
         const filledSomething = /^Filled in/.test(fill.message);
         if (filledSomething) {
             changed = true;
@@ -5446,13 +5454,15 @@
             segment = sdk.DataModel.Segments.getById({ segmentId: id });
             after = segment ? evaluateSegmentInfo(segment, places, true) : null;
         }
+        // city only: a name that is still missing or differs is not this run's business
+        if (cityOnly && after && !CITY_ONLY_KINDS.has(after.kind)) after = null;
 
         if (after) {
             notes.push(`Still flagged (${after.detail}). ${filledSomething ? '' : fill.message}`.trim());
             return { outcome: 'review', changed, renamed, message: notes.join(' ') };
         }
         if (changed) return { outcome: 'fixed', changed, renamed, message: notes.join(' ') };
-        return { outcome: 'unchanged', changed: false, renamed: false, message: fill.message };
+        return { outcome: 'unchanged', changed: false, renamed: false, message: cityOnly ? (fill.message || 'The city needs no change here, or no city could be found to set.') : fill.message };
     }
 
     // Counts the flagged segments in the outline (changes nothing).
@@ -5500,7 +5510,8 @@
     }
 
     // Fixes the flagged segments in the outline, one at a time, saving every 25 changes (same rules as the road import).
-    async function areaRunFix() {
+    async function areaRunFix(opts) {
+        const cityOnly = !!(opts && opts.cityOnly === true);
         if (area.points.length < 3 || !['ready', 'previewed', 'done'].includes(area.phase)) return;
         if (areaHasPending()) {
             areaSetMessage('warn', 'WME has unsaved edits. Save them first, so the saves during this run only hold the fixes.');
@@ -5513,7 +5524,7 @@
         areaRunning = true;
         busy = true;
         area.fix = { items: [], counts: null };
-        areaSetMessage('info', 'Fixing the flagged segments...');
+        areaSetMessage('info', cityOnly ? 'Fixing the cities only: street names are not changed...' : 'Fixing the flagged segments...');
         let failedHard = false;
         let limitHit = false;
         let errorsInRow = 0;
@@ -5523,6 +5534,7 @@
             const handled = new Set();
             await areaSweep(run, async (view) => {
                 for (const t of areaFlaggedInView(view, places, handled)) {
+                    if (cityOnly && !CITY_ONLY_KINDS.has(t.kind)) continue; // a name problem: left for Fix flagged
                     if (!(await areaGate())) return false;
                     if (run.done >= AREA.MAX_ROADS) {
                         limitHit = true;
@@ -5536,7 +5548,7 @@
                     renderAreaPanel();
                     let result;
                     try {
-                        result = await areaFixSegment(t, places);
+                        result = await areaFixSegment(t, places, { cityOnly });
                         errorsInRow = 0;
                     } catch (err) {
                         console.warn(`[${SCRIPT_NAME}] Area fix failed:`, err);
@@ -5605,7 +5617,7 @@
         scheduleGapScan(300);
         if (failedHard) areaFinishRun(run, 'error', run.stopReason);
         else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
-        else if (limitHit) areaFinishRun(run, 'warn', `Reached the limit of ${AREA.MAX_ROADS} segments for one run, so the rest are still flagged: run Fix flagged again.`);
+        else if (limitHit) areaFinishRun(run, 'warn', `Reached the limit of ${AREA.MAX_ROADS} segments for one run, so the rest are still flagged: run ${cityOnly ? 'Fix cities only' : 'Fix flagged'} again.`);
         else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
     }
 
@@ -5870,9 +5882,12 @@
             }
             rowOf('New roads', roadButtons);
             const flaggedCount = area.fix.counts ? ` (${area.fix.counts.total})` : '';
+            const cityFlagged = area.fix.counts ? [...CITY_ONLY_KINDS].reduce((n, k) => n + ((area.fix.counts.byKind || {})[k] || 0), 0) : 0;
+            const cityCount = area.fix.counts ? ` (${cityFlagged})` : '';
             rowOf('Existing segments', [
                 areaButton('Check flagged', areaRunCheck, { title: 'Counts the segments in the outline that the scan flags (no name, no city, primary city outside the limits). Changes nothing.' }),
-                areaButton(`Fix flagged${flaggedCount}`, areaRunFix, { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in missing street names and cities, corrects primary cities (outside every limit it clears the primary and uses the postal city as the alternate) and renames a street to the GIS name when it differs. Saves every 25.' }),
+                areaButton(`Fix cities only${cityCount}`, () => areaRunFix({ cityOnly: true }), { disabled: !!(area.fix.counts && !cityFlagged), title: 'Fixes only the cities of the flagged segments by the usual rules: the primary city from the city and CDP limits (outside every limit it is cleared) and the alternate city from the postal sources. Never renames a street or adds a missing name. Saves every 25.' }),
+                areaButton(`Fix flagged${flaggedCount}`, () => areaRunFix(), { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in missing street names and cities, corrects primary cities (outside every limit it clears the primary and uses the postal city as the alternate) and renames a street to the GIS name when it differs. Saves every 25.' }),
                 areaButton('House numbers', areaRunHouses, { disabled: !!(area.source && !area.source.houseNumbers), title: 'Adds the missing house numbers to the roads inside the outline (roads must be saved first).' })
             ]);
             rowOf('', [areaButton('Redraw', areaStartDrawing), areaButton('Clear', areaClear)]);
