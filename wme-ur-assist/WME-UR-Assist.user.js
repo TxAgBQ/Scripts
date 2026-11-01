@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.31.01
+// @version      2026.11.01.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -567,6 +567,10 @@
       Header.desc = ur?.description || '';
       Header.type = ur?.updateRequestType || '';
       if (ur) Meta.note(id, { desc: ur.description, type: ur.updateRequestType, reported: ur.reportedOn });
+      const kn = ur ? knownReporterOf(ur) : null;
+      Header.known = kn;
+      Header.knownId = id;
+      if (kn) markKnownReporter(id, kn);
       Header.reportedOn = ur?.reportedOn || 0;
       if (ur) reportedTimes.set(id, ur.reportedOn);
       const details = await sdk.DataModel.MapUpdateRequests.getUpdateRequestDetails({ mapUpdateRequestId: id });
@@ -2106,6 +2110,7 @@ ${list}`;
         for (let j = i + 1; j < list.length && list[j].id - list[i].id <= SEQ_ID_GAP; j++) {
           const a = list[i], b = list[j];
           if (this.loaded.has(a.id) && this.loaded.has(b.id)) continue;   // both loaded: the full check above decides
+          if (urInfo(a.id).flags.includes(EDITOR_REPORT) || urInfo(b.id).flags.includes(EDITOR_REPORT)) continue;   // editors' reports are not duplicates
           const apart = Math.abs(a.t - b.t);
           if (apart > SEQ_MINUTES * 60e3 || lonLatMeters(a, b) > seqMetersFor(apart)) continue;
           if (!found.has(a.id)) found.set(a.id, b.id);
@@ -2163,12 +2168,29 @@ ${list}`;
         const closedNow = new Set(all.filter(u => !u.isOpen).map(u => u.id));
         this.loaded = new Set(all.map(u => u.id));
         for (const u of open) reportedTimes.set(u.id, u.reportedOn);
+        // Reports recognised by KNOWN_REPORTERS get the editor marker now (popcorn from the start), and are taken out of any
+        // duplicate group they were put in before
+        let cleared = false;
+        for (const u of open) {
+          const k = knownReporterOf(u);
+          if (!k) continue;
+          markKnownReporter(u.id, k);
+          if (this.sticky[u.id]) {
+            delete this.sticky[u.id];
+            const cur = urInfo(u.id);
+            urStore[u.id] = { flags: cur.flags.filter(f => f !== DUPE_FLAG), note: cur.note || '', updated: Date.now() };
+            Sync.markDirty(u.id);
+            cleared = true;
+          }
+        }
+        if (cleared) { GM_setValue('urData', urStore); this.persist(); }
         const parent = new Map(open.map(u => [u.id, u.id]));
         const find = x => (parent.get(x) === x ? x : (parent.set(x, find(parent.get(x))), parent.get(x)));
         const paired = new Set();
         for (let i = 0; i < open.length; i++) {
           for (let j = i + 1; j < open.length; j++) {
             const a = open[i], b = open[j];
+            if (editorFiled(a) || editorFiled(b)) continue;   // editors' reports are never counted as duplicates
             const apart = Math.abs(a.reportedOn - b.reportedOn), meters = metersApart(a, b);
             const near = apart <= DUPE_HOURS * 3600e3 && meters <= DUPE_METERS;
             const backToBack = Math.abs(a.id - b.id) <= SEQ_ID_GAP && apart <= SEQ_MINUTES * 60e3 && meters <= seqMetersFor(apart);
@@ -2405,6 +2427,37 @@ ${list}`;
     return m ? { name: m[1].trim(), rank: Number(m[2]) } : null;
   }
   const isEditorReporter = r => !!r && EDITOR_RANKS.includes(r.rank) && roleOf(r.name) === 'editor';
+  // Editors whose username is missing in WME (so the panel shows no name) but whose reports are recognised by their phone,
+  // vehicle, language and route settings. Matched only when the report has no username or user number of its own.
+  // Add more as { name, rank, test(prefs) } entries.
+  const KNOWN_REPORTERS = [
+    {
+      name: 'juliansean', rank: 5,
+      test: p => p.os === 'CARPLAY' && p.vehicleType === 'PRIVATE' && p.hasEv === true && p.unpavedRoads === 'ALLOW' && p.language === 'eng' &&
+        ['epass-us', 'ez-tag-express-us', 'ezpass-us-ma', 'ezpass-us-nj', 'ezpass-us-ny', 'ezpass-us-pa', 'harriseztag-us', 'ipass-us', 'txtagtoll-us']
+          .every(x => (p.activeHovSubscriptions || []).includes(x)),
+    },
+  ];
+  function knownReporterOf(u) {
+    try {
+      const p = u?.userPreferences;
+      if (!p) return null;
+      const e = wmeExtra(u.id);
+      if (e.createdBy || Number(e.userID) > 0) return null;   // it has a real username: that wins
+      return KNOWN_REPORTERS.find(k => k.test(p)) || null;
+    } catch { return null; }
+  }
+  // Any report an editor filed, as far as we know: the saved editor marker, or recognised by KNOWN_REPORTERS
+  const editorFiled = u => !!u && (urInfo(u.id).flags.includes(EDITOR_REPORT) || !!knownReporterOf(u));
+  // A recognised report gets the editor marker (so the popcorn shows from the start and it syncs) and its name for the sheet
+  function markKnownReporter(id, k) {
+    const cur = urInfo(id);
+    if (!cur.flags.includes(EDITOR_REPORT)) {
+      saveUrInfo(id, { ...cur, flags: [...cur.flags, EDITOR_REPORT] });
+      LOG(`Report recognised as ${k.name}(${k.rank})'s by its settings: popcorn set on UR ${id}.`);
+    }
+    Meta.note(id, { reporter: `${k.name} (${k.rank})` });
+  }
   const EditorReport = {
     cand: null, // { id, name, count }: the same reporter seen on the same open report a few checks in a row (the panel can lag behind)
     check(card, id) {
@@ -2429,7 +2482,8 @@ ${list}`;
       if (this.done.has(id)) return;
       const nameEl = card.querySelector('[data-testid="issue-panel-header-username"]');
       const r = nameEl ? parseReporter(nameEl.textContent) : null;
-      const num = card.querySelector('.ua-userno')?.dataset.n;
+      const numRaw = card.querySelector('.ua-userno')?.dataset.n;
+      const num = numRaw && !numRaw.startsWith('known:') ? numRaw : '';
       const shown = r ? `${r.name} (${r.rank})` : (nameEl ? String(nameEl.textContent || '').replace(/^\s*Username:\s*/, '').replace(/\s+/g, ' ').trim() : (num ? `#${num}` : ''));
       if (!shown) { this.cand = null; return; }
       if (!this.cand || this.cand.id !== id || this.cand.shown !== shown) { this.cand = { id, shown, count: 1 }; return; }
@@ -2470,7 +2524,19 @@ ${list}`;
     // No username shown? Show the reporter's Waze user number in the same spot, if WME has one.
     reporter(card, id) {
       let tag = card.querySelector('.ua-userno');
-      const num = card.querySelector('[data-testid="issue-panel-header-username"]') ? null : reporterNumber(id, this.comments);
+      const hasName = !!card.querySelector('[data-testid="issue-panel-header-username"]');
+      const kn = !hasName && this.knownId === id ? this.known : null;
+      if (kn) {   // username missing in WME, report recognised by its settings: show the name in red
+        const label = `${kn.name}(${kn.rank})`;
+        if (tag?.dataset.n === `known:${label}`) return;
+        tag?.remove();
+        tag = el('div', { class: 'ua-userno', style: 'color:#d32f2f;font-weight:600', title: 'WME lost this reporter\'s username; recognised by their phone, vehicle and route settings' }, `Username: ${label}`);
+        tag.dataset.n = `known:${label}`;
+        const src = [...card.querySelectorAll('wz-caption')].find(c => /^Source/.test(c.textContent.trim()));
+        (src?.closest('wz-tooltip-target') || card.querySelector('[data-testid="issue-panel-header-reported"]'))?.after(tag);
+        return;
+      }
+      const num = hasName ? null : reporterNumber(id, this.comments);
       if (!num) { tag?.remove(); return; }
       if (tag?.dataset.n === String(num)) return;
       tag?.remove();
