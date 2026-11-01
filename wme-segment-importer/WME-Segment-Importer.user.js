@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103112
+// @version      2026110101
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1112,7 +1112,7 @@
             return m ? `PR-${m[1].toUpperCase()}` : String(name || '');
         }
 
-        function buildStreetName(parts) {
+        function buildStreetNameRaw(parts) {
             const clean = (v) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
             // Apostrophes are dropped. A single letter before one (O'BRIEN, D'ANGELO) keeps the next capital.
             const fixApostrophes = (t) => t.replace(/\b([A-Z])['\u2019`](?=[A-Z])/g, `$1${APOSTROPHE_MARK}`).replace(/['\u2019`]/g, '');
@@ -1154,6 +1154,33 @@
             return { name: privateRoadName(finish(raw.split(' '), false)), note };
         }
 
+        // A name that must never be written to a segment: "Unknown" (alone or with only a street type, as some GIS layers give it) is no name,
+        // and neither is a bare number ("211" is not "SH-211": a route number loses its prefix when a GIS layer keeps the prefix in another field).
+        // Returns { ok, note }. Every name made from GIS, Google Maps or address point data goes through this (buildStreetName below).
+        function checkStreetName(name) {
+            const n = String(name || '').trim();
+            if (!n) return { ok: true, note: '' };
+            if (/^(unknown|unnamed|n\/a|null|undefined)(\s+[a-z]{1,6}\.?)?$/i.test(n)) return { ok: false, note: '' };
+            if (/^\d+[a-z]?(\s+(n|s|e|w|ne|nw|se|sw))?$/i.test(n)) return { ok: false, note: `"${n}" is only a number, so it was not used as a street name.` };
+            return { ok: true, note: '' };
+        }
+
+        function buildStreetName(parts) {
+            const built = buildStreetNameRaw(parts);
+            const check = checkStreetName(built.name);
+            return check.ok ? built : { name: '', note: built.note || check.note };
+        }
+
+        const isUsableStreetName = (name) => checkStreetName(name).ok && !!String(name || '').trim();
+
+        // A name in the form used to compare names: a route written out ("County Road 123", "Farm to Market 1488", "State Highway 211") becomes
+        // CR-123, FM-1488, SH-211. Other names are returned as they are (a bare "Highway 75" can't be told apart, so it is left alone).
+        function routeForm(name) {
+            const raw = String(name || '').trim().toUpperCase().replace(/\s+/g, ' ');
+            const route = raw ? matchRoute(raw) : null;
+            return route && route.route ? [route.route, route.rest].filter(Boolean).join(' ') : String(name || '');
+        }
+
         return {
             RAD,
             EARTH_R,
@@ -1165,11 +1192,13 @@
             DIRECTION_TOKENS,
             buildStreetName,
             privateRoadName,
-            fixRepeatedType
+            fixRepeatedType,
+            isUsableStreetName,
+            routeForm
         };
     })();
 
-    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, privateRoadName, fixRepeatedType } = WmeSiCore;
+    const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, privateRoadName, fixRepeatedType, isUsableStreetName, routeForm } = WmeSiCore;
 
     const mapDiv = (typeof sdk.Map.getMapViewportElement === 'function' && sdk.Map.getMapViewportElement()) ||
         document.getElementById('map');
@@ -1216,13 +1245,14 @@
     let gapScanBusy = false;
     const gapCityCache = new Map();
     const GAP_LAYER = 'wme-segment-importer-info-gaps';
-    // The city check covers every road type. Only these types are expected to have a street name (Street, Primary Street, Freeway, Major Highway,
-    // Minor Highway, Private Road). Parking Lot Roads, ramps, paths and the rest are normally unnamed, so a missing name is not flagged on them.
-    const NAME_EXPECTED_TYPES = new Set([1, 2, 3, 6, 7, 17]);
-    // These types are mapped with no city (and are not checked for a name): Walking Trail 5, Off-road 8, Pedestrian Boardwalk 10, Stairway 16,
-    // Railroad 18, Runway/Taxiway 19. The scan, the panel and the fixes leave them alone.
-    const CITY_EXEMPT_TYPES = new Set([5, 8, 10, 16, 18, 19]);
-    const CITY_ONLY_KINDS = new Set(['badcity', 'city', 'none', 'altnocity']); // the flags the 'Fix cities only' area run works on
+    // The city check covers every road type except the exempt ones below. Only these types are expected to have a street name (Street, Primary
+    // Street, Freeway, Major Highway, Minor Highway). Parking Lot Roads, ramps, paths and the rest are normally unnamed, so a missing name is not
+    // flagged on them. A Private Road (17) is named only when a GIS road runs along most of it (the Roads click and the area fix do that look-up).
+    const NAME_EXPECTED_TYPES = new Set([1, 2, 3, 6, 7]);
+    // These types are mapped with no city (and are not checked for a name): Walking Trail 5, Off-road 8, Pedestrian Boardwalk 10, Ferry 15,
+    // Stairway 16, Railroad 18, Runway/Taxiway 19. They are only flagged when they HAVE a primary city ('exemptcity'), and the fix clears it.
+    const CITY_EXEMPT_TYPES = new Set([5, 8, 10, 15, 16, 18, 19]);
+    const CITY_ONLY_KINDS = new Set(['badcity', 'city', 'none', 'altnocity', 'exemptcity']); // the flags the 'Fix cities only' area run works on
     const GAP_MIN_ZOOM = 16;
     const GAP_SHORT_CONNECTOR_M = 60; // an unnamed segment shorter than this is taken to be an at-grade connector, which normally has no name
     const GAP_KINDS = {
@@ -1231,7 +1261,8 @@
         city: { colour: '#fbc02d', label: 'no city (primary or alternate)' },
         badcity: { colour: '#1a73e8', label: 'primary city does not fit the city limits' },
         duptype: { colour: '#8e24aa', label: 'street type or direction written twice in the name (Dr Drive, W West)' },
-        altnocity: { colour: '#00897b', label: 'an alternate street has no city (an alternate city is never blank)' }
+        altnocity: { colour: '#00897b', label: 'an alternate street has no city (an alternate city is never blank)' },
+        exemptcity: { colour: '#6d4c41', label: 'this road type is mapped with no city, but it has a primary city' }
     };
     let gapLayerReady = false;
     let gapZoomNote = '';
@@ -2838,7 +2869,7 @@
         };
     }
 
-    const normalizeName = (s) => privateRoadName(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalizeName = (s) => privateRoadName(routeForm(s)).toLowerCase().replace(/[^a-z0-9]/g, '');
 
     function streetNameOf(segmentId) {
         try {
@@ -5422,6 +5453,17 @@
         const before = ccAddressOf(id);
         const originalPrimary = before ? before.primary : '';
 
+        // an exempt road type (trail, railroad, ferry...) with a primary city: the city is cleared, nothing else is touched
+        if (t.kind === 'exemptcity') {
+            if (!before || !before.primary) return { outcome: 'unchanged', changed: false, renamed: false, message: 'It has no primary city now.' };
+            ccApply(id, { kind: 'primary', city: '' });
+            cityCheckCache.clear();
+            const seg = sdk.DataModel.Segments.getById({ segmentId: id });
+            const left = seg ? evaluateSegmentInfo(seg, places, true) : null;
+            if (left) return { outcome: 'review', changed: true, renamed: false, message: `Still flagged (${left.detail}).` };
+            return { outcome: 'fixed', changed: true, renamed: false, message: `Cleared the primary city ${before.primary} (this road type is mapped with no city).` };
+        }
+
         // a street type written twice ("Weston Dr Drive") is written once
         if (!cityOnly) {
             const current = ccAddressOf(id);
@@ -5449,7 +5491,7 @@
         }
 
         const fillTarget = sdk.DataModel.Segments.getById({ segmentId: id });
-        const skipFill = !!(fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && !(before && before.name));
+        const skipFill = !!(fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && fillTarget.roadType !== 17 && !(before && before.name));
         const fill = skipFill
             ? { message: '', mismatch: null }
             : await fillSegmentInfo(id, cityOnly ? { cityOnly: true } : { continueOnMismatch: true });
@@ -6722,7 +6764,6 @@
 
     // thorough = true (the area runs): short unnamed segments are not excused as connectors, so they get looked at too.
     function evaluateSegmentInfo(segment, places, thorough = false) {
-        if (CITY_EXEMPT_TYPES.has(segment.roadType)) return null;
         let address;
         try {
             address = sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
@@ -6732,6 +6773,11 @@
         const name = address.street && !address.street.isEmpty && address.street.name ? String(address.street.name).trim() : '';
         const cityOf = (x) => (x && x.city && !x.city.isEmpty && x.city.name ? x.city.name : '');
         const primary = cityOf(address);
+        // trails, railroads and the other exempt types need no city and no name; the only problem is a primary city they should not have
+        if (CITY_EXEMPT_TYPES.has(segment.roadType)) {
+            if (!primary) return null;
+            return { id: segment.id, kind: 'exemptcity', name, primary, detail: `primary city ${primary}, but this road type is mapped with no city` };
+        }
         const hasCity = !!primary || (address.altStreets || []).some((x) => cityOf(x));
         // Short unnamed segments (the curved at-grade connectors) are fine without a name; they still need a city.
         let shortConnector = false;
@@ -7140,7 +7186,14 @@
         }
         result.name = addr.name;
         if (CITY_EXEMPT_TYPES.has(segment.roadType)) {
-            result.rows.push({ label: 'Road type', text: 'This road type is mapped with no city, so nothing is checked.', level: 'info' });
+            if (addr.primary) {
+                result.rows.push({ label: 'Primary city', text: `${addr.primary}, but this road type is mapped with no city.`, level: 'warn' });
+                result.proposals.push({ kind: 'primary', city: '', label: 'Clear the primary city' });
+                result.level = 'warn';
+                result.summary = 'Worth a look.';
+            } else {
+                result.rows.push({ label: 'Road type', text: 'This road type is mapped with no city, so nothing is checked.', level: 'info' });
+            }
             return result;
         }
         const nameExpected = NAME_EXPECTED_TYPES.has(segment.roadType);
@@ -7161,7 +7214,7 @@
         if (addr.name) result.rows.push({ label: 'Street name', text: addr.name, level: 'ok' });
         else if (roundabout) result.rows.push({ label: 'Street name', text: 'None, which is right for a roundabout.', level: 'ok' });
         else if (shortConnector) result.rows.push({ label: 'Street name', text: `None, which is fine for a short connector (under ${GAP_SHORT_CONNECTOR_M} m).`, level: 'ok' });
-        else if (!nameExpected) result.rows.push({ label: 'Street name', text: 'None, which is right for this road type.', level: 'ok' });
+        else if (!nameExpected) result.rows.push({ label: 'Street name', text: segment.roadType === 17 ? 'None. A Private Road is only named when a GIS road runs along it (the Roads click does that look-up).' : 'None, which is right for this road type.', level: 'ok' });
         else {
             result.rows.push({ label: 'Street name', text: 'None. Name it (the Roads fill-in can do it from the GIS or Google Maps).', level: 'error' });
             raise('error');
@@ -7331,7 +7384,7 @@
         if (proposal.kind === 'primary' || proposal.kind === 'both') primary = proposal.city;
         if (proposal.kind === 'name') {
             // the alternate streets carry the old name too: rebuild them with the new one, in the same cities
-            if (!proposal.name) throw new Error('no street name to apply');
+            if (!isUsableStreetName(proposal.name)) throw new Error(`"${proposal.name || ''}" can not be used as a street name`);
             altIds = [];
             for (const cityName of addr.alts) {
                 const city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
