@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110103
+// @version      2026110104
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -2041,7 +2041,7 @@
             label.append(box, document.createTextNode(text));
             wrap.appendChild(label);
         };
-        makeCheck('Autofill: a segment I draw by hand inside city or CDP limits gets its primary city (works even when the scan is Off)', autofillEnabled, (v) => {
+        makeCheck('Autofill: a brand-new segment I draw gets its primary city, and its primary and alternate city when I name it (a city I set myself is left alone; works even when the scan is Off)', autofillEnabled, (v) => {
             autofillEnabled = v;
             try {
                 localStorage.setItem(STORAGE_KEY_AUTOFILL, v ? 'on' : 'off');
@@ -7789,8 +7789,10 @@
     }
 
     // ------------------------------------------------------------------
-    // Autofill: a segment drawn by hand inside city or CDP limits gets its primary city
+    // Autofill: a brand-new segment drawn by hand gets its primary city when it is drawn and its primary and alternate city when it is named
     // ------------------------------------------------------------------
+    // Only segments you draw (unsaved, new in this session) are touched, never saved ones. After it fills in a city the script remembers what it
+    // wrote (autoSet); a primary or alternate city you set or changed yourself is left alone, and it never overwrites one it did not write.
     // Works whatever the scan level, even Off, while the sidebar switch is on. It only touches a new (unsaved) segment, only fills a blank
     // primary city (never overwrites one), and only when the whole segment lies inside one city or CDP. Segments the importer creates
     // are left to the importer. A primary city can be set on a segment with no name; an alternate city cannot, so those are not touched here.
@@ -7799,6 +7801,11 @@
     const autofillQueue = new Set();
     let autofillTimer = null;
     let autofillRunning = false;
+    const autoSet = new Map();       // new segment id -> { primary, alts } as the script last wrote them; anything different is your override
+    const autoSeenName = new Map();  // new segment id -> the street name last looked at (the fix runs when the name changes, not on every edit)
+    const autoNameQueue = new Set();
+    let autoNameTimer = null;
+    let autoNameRunning = false;
 
     async function autofillNewSegments() {
         if (autofillRunning) {
@@ -7828,6 +7835,8 @@
                     segmentId: id,
                     addressData: { streetName: addr.name, cityName: names[1], countryId: country.id, stateId: state.id, alternateStreetIds: addr.altStreets.map((x) => x.street.id) }
                 });
+                autoSet.set(id, { primary: names[1], alts: addr.alts.slice() });
+                if (!autoSeenName.has(id)) autoSeenName.set(id, addr.name || '');
                 done.push({ name: addr.name, city: names[1] });
             }
             if (done.length) {
@@ -7846,8 +7855,104 @@
         }
     }
 
+    // The same fix the right-click applies (primary city from the limits, alternate city from the postal evidence), for a new segment that has
+    // just been named. Only blank fields, or fields the script wrote itself and you have not changed, are touched. Returns a short text, or ''.
+    async function autoFixCities(id, addr) {
+        const analysis = await ccAnalyze(id, true);
+        const wanted = (analysis.proposals || []).filter((p) => p.kind === 'both' || p.kind === 'primary' || p.kind === 'alt');
+        if (!wanted.length) return '';
+        const mine = autoSet.get(id);
+        const sameList = (a, b) => a.length === b.length && a.every((x) => ccHas(b, x));
+        const primaryOpen = !addr.primary || !!(mine && ccSameCity(addr.primary, mine.primary));
+        const altOpen = !addr.alts.length || !!(mine && sameList(addr.alts, mine.alts));
+        const applied = [];
+        const both = wanted.find((p) => p.kind === 'both');
+        if (both && primaryOpen && altOpen) {
+            await ccApply(id, both);
+            applied.push(both.label);
+        } else {
+            const primary = wanted.find((p) => p.kind === 'primary');
+            if (primary && primaryOpen) {
+                await ccApply(id, primary);
+                applied.push(primary.label);
+            }
+            if (altOpen) {
+                // judged again, against the primary city as it is now
+                const again = primary && primaryOpen ? await ccAnalyze(id, true) : analysis;
+                const alt = (again.proposals || []).find((p) => p.kind === 'alt');
+                if (alt) {
+                    await ccApply(id, alt);
+                    applied.push(alt.label);
+                }
+            }
+        }
+        if (!applied.length) return '';
+        const now = await ccAddressOf(id);
+        if (now) autoSet.set(id, { primary: now.primary, alts: now.alts.slice() });
+        return applied.join('; ');
+    }
+
+    // Runs for new segments whose street name has just been set or changed (not for a city you edit).
+    async function autoFixNamedSegments() {
+        if (autoNameRunning) {
+            clearTimeout(autoNameTimer);
+            autoNameTimer = setTimeout(autoFixNamedSegments, 500);
+            return;
+        }
+        const ids = [...autoNameQueue];
+        autoNameQueue.clear();
+        if (!autofillEnabled || !ids.length) return;
+        autoNameRunning = true;
+        try {
+            const done = [];
+            for (const id of ids) {
+                if (importerMadeIds.has(id) || Number(id) >= 0) continue;
+                const segment = await sdk.DataModel.Segments.getById({ segmentId: id });
+                if (!segment || !isLiveSegment(segment) || !segment.geometry) continue;
+                const addr = await ccAddressOf(id);
+                if (!addr) continue;
+                const seen = autoSeenName.get(id) || '';
+                if (!addr.name) {
+                    autoSeenName.set(id, '');
+                    continue;
+                }
+                if (normalizeName(addr.name) === normalizeName(seen)) continue; // the name did not change: your edits to the cities stay
+                autoSeenName.set(id, addr.name);
+                try {
+                    const text = await autoFixCities(id, addr);
+                    if (text) done.push({ name: addr.name, text });
+                } catch (err) {
+                    console.warn(`[${SCRIPT_NAME}] Auto city fix failed for segment ${id}:`, err);
+                }
+            }
+            if (done.length) {
+                setStatus(done.length === 1
+                    ? `${done[0].name}: ${done[0].text}.`
+                    : `${done.length} new segments: cities filled in.`, 'ok');
+                console.log(`[${SCRIPT_NAME}] auto city fix:`, done);
+                cityCheckCache.clear();
+                scheduleGapScan(150);
+                if (scanLevel !== 'off') ccRequestCheck(150, true);
+            }
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Auto city fix failed:`, err);
+        } finally {
+            autoNameRunning = false;
+        }
+    }
+
     try {
         await sdk.Events.trackDataModelEvents({ dataModelName: 'segments' });
+        await sdk.Events.on({
+            eventName: 'wme-data-model-objects-changed',
+            eventHandler: (e) => {
+                if (!autofillEnabled || !e || e.dataModelName !== 'segments') return;
+                for (const id of e.objectIds || []) if (Number(id) < 0 && !importerMadeIds.has(id)) autoNameQueue.add(id);
+                if (!autoNameQueue.size) return;
+                clearTimeout(autoNameTimer);
+                autoNameTimer = setTimeout(autoFixNamedSegments, AUTOFILL_DELAY_MS + 300);
+            }
+        });
         await sdk.Events.on({
             eventName: 'wme-data-model-objects-added',
             eventHandler: (e) => {
