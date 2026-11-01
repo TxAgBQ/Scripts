@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026103111
+// @version      2026103112
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -2581,38 +2581,62 @@
         return result;
     }
 
-    // The country and state to write an address with. WME's "top" country/state is empty at times (zoomed out, area still
-    // loading), so fall back to the segment's own address, then to any loaded segment's, then to the only one WME knows.
+    // Only United States addresses are written. Set to '' to allow any country.
+    const ONLY_COUNTRY = 'US';
+
+    // The country and state to write an address with.
+    // WME's "top" country and state follow the map view, so near a border they can name the neighbouring country (the view a
+    // few km from Socorro, TX reports Mexico / Chihuahua) and the two load at different times. They are not used here, and
+    // WME's state outlines overlap at the border, so those are not used either.
+    // A segment keeps the country and state it already has, taken together. A segment with no address gets the pair most of
+    // its five nearest addressed segments use.
     function regionOf(segmentId) {
         const ok = (x) => !!x && x.id !== undefined && x.id !== null && !x.isEmpty;
-        let country = null;
-        let state = null;
-        try { country = sdk.DataModel.Countries.getTopCountry(); } catch (err) { /* not available */ }
-        try { state = sdk.DataModel.States.getTopState(); } catch (err) { /* not available */ }
-        if (!ok(country) || !ok(state)) {
-            const ids = [segmentId];
-            try {
-                for (const other of sdk.DataModel.Segments.getAll().slice(0, 300)) ids.push(other.id);
-            } catch (err) { /* not available */ }
-            for (const id of ids) {
-                if (id === undefined || id === null) continue;
-                try {
-                    const a = sdk.DataModel.Segments.getAddress({ segmentId: id });
-                    if (!ok(country) && ok(a.country)) country = a.country;
-                    if (!ok(state) && ok(a.state)) state = a.state;
-                } catch (err) { /* next */ }
-                if (ok(country) && ok(state)) break;
+        const allowed = (c) => !ONLY_COUNTRY || (!!c && c.abbr === ONLY_COUNTRY);
+        const none = { country: null, state: null };
+
+        // 1. the segment's own country and state
+        try {
+            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            if (a && ok(a.country) && ok(a.state)) return allowed(a.country) ? { country: a.country, state: a.state } : none;
+        } catch (err) { /* next */ }
+
+        // 2. a segment with no address yet: its nearest addressed neighbours
+        let pt = null;
+        try {
+            const c = sdk.DataModel.Segments.getById({ segmentId }).geometry.coordinates;
+            pt = c[Math.floor(c.length / 2)];
+        } catch (err) { /* no geometry */ }
+        if (!pt) return none;
+        const k = Math.cos((pt[1] * Math.PI) / 180);
+        const near = [];
+        try {
+            for (const other of sdk.DataModel.Segments.getAll()) {
+                if (other.id === segmentId || !other.geometry) continue;
+                const c = other.geometry.coordinates;
+                const m = c[Math.floor(c.length / 2)];
+                near.push({ id: other.id, d: Math.hypot((m[0] - pt[0]) * k, m[1] - pt[1]) });
             }
+        } catch (err) { /* not available */ }
+        near.sort((x, y) => x.d - y.d);
+        const votes = new Map();
+        let used = 0;
+        for (const n of near) {
+            if (used >= 5) break;
+            let a = null;
+            try { a = sdk.DataModel.Segments.getAddress({ segmentId: n.id }); } catch (err) { continue; }
+            if (!a || !ok(a.country) || !ok(a.state)) continue;
+            used++;
+            const key = `${a.country.id}/${a.state.id}`;
+            const v = votes.get(key) || { country: a.country, state: a.state, n: 0 };
+            v.n++;
+            votes.set(key, v);
         }
-        if (!ok(country)) {
-            try { const all = sdk.DataModel.Countries.getAll(); if (all.length === 1) country = all[0]; } catch (err) { /* not available */ }
-        }
-        if (!ok(state)) {
-            try { const all = sdk.DataModel.States.getAll(); if (all.length === 1) state = all[0]; } catch (err) { /* not available */ }
-        }
-        return { country: ok(country) ? country : null, state: ok(state) ? state : null };
+        let best = null;
+        for (const v of votes.values()) if (!best || v.n > best.n) best = v;
+        return best && allowed(best.country) ? { country: best.country, state: best.state } : none;
     }
-    const REGION_ERROR = 'WME has not told the script which state this is yet; pan or zoom the map a little so the area loads, then try again';
+    const REGION_ERROR = 'The script could not work out which United States state this segment is in (it only edits US addresses); pan or zoom the map a little so the area loads, then try again';
 
     // Sets the primary street/city and alternate cities on a segment.
     function applyAddress(segmentId, streetName, primaryCity, alternateCities) {
