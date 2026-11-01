@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110105
+// @version      2026110106
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -206,12 +206,13 @@
     // ------------------------------------------------------------------
     // Where the data comes from
     // ------------------------------------------------------------------
-    // Kendall County uses its own tuned source above. Everywhere else in Texas, the road and address point layers you
+    // Kendall County uses its own tuned source above. Everywhere else in Texas and Arkansas, the road and address point layers you
     // have switched on in WME GIS Layers are used: the most local one that has data wins (city, then county, then state).
     const KENDALL = GIS_SOURCES.find((s) => s.key === 'kendall');
     const GISL_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1cEG3CvXSCI4TOZyMQTI50SQGbVhJ48Xip-jjWg4blWw/gviz/tq?tqx=out:json';
     const GISL_SETTINGS_KEY = 'wme_gis_layers_fl';
-    const GISL_CACHE_KEY = 'wme_gis_importer_gisl_layers_v2'; // v2: parcel layers are kept in the list (v1 dropped them)
+    const GISL_CACHE_KEY = 'wme_gis_importer_gisl_layers_v3'; // v3: Arkansas layers kept and each layer carries its state (v2 was Texas only)
+    const GIS_STATES = { '48': 'TX', '05': 'AR' }; // Census state FIPS -> the states the importer has GIS sources for
     const GISL_CACHE_HOURS = 24;
     const TIGER_URL = 'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer';
     const LEVEL_ORDER = ['city', 'county', 'state'];
@@ -316,8 +317,8 @@
     // fallback to neighbouring layers local. Returns null if the lookup fails (then no neighbouring layers are used).
     const NEARBY_MILES = 30;
     const nearbyCache = new Map();
-    async function countiesNear(pt, miles = NEARBY_MILES) {
-        const key = `${pt.lon.toFixed(1)},${pt.lat.toFixed(1)},${miles}`;
+    async function countiesNear(pt, stateFips = '48', miles = NEARBY_MILES) {
+        const key = `${stateFips},${pt.lon.toFixed(1)},${pt.lat.toFixed(1)},${miles}`;
         if (nearbyCache.has(key)) return nearbyCache.get(key);
         try {
             if (tigerCountyLayerId === null) await countyAt(pt);
@@ -328,7 +329,7 @@
                 spatialRel: 'esriSpatialRelIntersects', outFields: 'BASENAME,STATE', returnGeometry: 'false', f: 'json'
             });
             const data = await gmGetJson(`${TIGER_URL}/${tigerCountyLayerId}/query?${params}`);
-            const names = new Set((data.features || []).filter((f) => String(f.attributes.STATE) === '48').map((f) => String(f.attributes.BASENAME).toLowerCase()));
+            const names = new Set((data.features || []).filter((f) => String(f.attributes.STATE) === stateFips).map((f) => String(f.attributes.BASENAME).toLowerCase()));
             nearbyCache.set(key, names);
             return names;
         } catch (err) {
@@ -345,7 +346,7 @@
     };
     const levelOfLayer = (id) => (/-city-/i.test(id) ? 'city' : /statewide|-state-/i.test(id) ? 'state' : 'county');
 
-    // GIS Layers' layer list (its public sheet): only the Texas road and address point layers on ArcGIS are kept.
+    // GIS Layers' layer list (its public sheet): only the Texas and Arkansas road and address point layers on ArcGIS are kept.
     let gislLayersPromise = null;
     function loadGislLayers() {
         if (gislLayersPromise) return gislLayersPromise;
@@ -376,11 +377,12 @@
             for (const r of rows.slice(hi + 1)) {
                 const id = r[C.id];
                 const url = (r[C.url] || '').replace(/\/$/, '');
-                if (!id || !/^TX$/i.test(r[C.subL1]) || !/\/(MapServer|FeatureServer)\/\d+$/i.test(url)) continue;
+                const st = String(r[C.subL1] || '').toUpperCase();
+                if (!id || !Object.values(GIS_STATES).includes(st) || !/\/(MapServer|FeatureServer)\/\d+$/i.test(url)) continue;
                 const role = roleOfLayer(id, r[C.style]);
                 if (!role) continue;
                 layers.push({
-                    id, url, role, level: levelOfLayer(id), where: r[C.where] || '',
+                    id, url, role, state: st, level: levelOfLayer(id), where: r[C.where] || '',
                     counties: (r[C.subL2] || '').split(/[,;]/).map((c) => c.trim().toLowerCase()).filter(Boolean),
                     labelFields: (r[C.labelFields] || '').split(',').map((f) => f.trim()).filter(Boolean)
                 });
@@ -548,14 +550,14 @@
     const FIELDS = {
         preDir: ['st_predir', 'predir', 'pre_dir', 'dir1', 'prefixdir', 'fedirp', 'prefix_dir'],
         preType: ['st_pretyp', 'pretype', 'pre_type'],
-        name: ['st_name', 'street', 'situsst', 'streetname', 'street_nam', 'st_nm', 'stname'],
-        type: ['st_postyp', 'st_type', 'street_type', 'sfx', 'sttype', 'streettype', 'street_typ', 'fetype', 'suf_type'],
-        sufDir: ['st_posdir', 'dir2', 'sfxdir', 'suf_dir', 'sufdir', 'fedirs', 'suffixdir'],
-        full: ['full_name', 'fullname', 'map_lbl', 'rd_name', 'street_full', 'fullstreet', 'label'],
-        number: ['add_number', 'situsnum', 'addr_num', 'address_nu', 'addressnum', 'addnum', 'house_num', 'hse_num', 'st_num', 'housenum'],
+        name: ['st_name', 'street', 'situsst', 'streetname', 'street_nam', 'st_nm', 'stname', 'pstr_nam', 'pstrnam'],
+        type: ['st_postyp', 'st_type', 'street_type', 'sfx', 'sttype', 'streettype', 'street_typ', 'fetype', 'suf_type', 'pstr_type', 'pstrtype'],
+        sufDir: ['st_posdir', 'dir2', 'sfxdir', 'suf_dir', 'sufdir', 'fedirs', 'suffixdir', 'psuf_dir', 'psufdir'],
+        full: ['full_name', 'fullname', 'map_lbl', 'rd_name', 'street_full', 'fullstreet', 'label', 'pstr_fulnam'],
+        number: ['add_number', 'situsnum', 'addr_num', 'address_nu', 'addressnum', 'addnum', 'house_num', 'hse_num', 'st_num', 'housenum', 'adrnum'],
         numberSuffix: ['addnum_suf', 'add_num_suf', 'numsuffix', 'num_suffix'],
         fullAddress: ['full_addr', 'siteaddress', 'situsaddr', 'address', 'fulladdr', 'full_address', 'site_addr'],
-        postal: ['postcomm_l', 'postcomm_r', 'post_comm', 'l_postal_c', 'r_postal_c', 'postal_city', 'msagcomm_l', 'msagcomm_r', 'city', 'zip_city'],
+        postal: ['postcomm_l', 'postcomm_r', 'post_comm', 'l_postal_c', 'r_postal_c', 'postal_city', 'msagcomm_l', 'msagcomm_r', 'city', 'zip_city', 'city_l', 'city_r', 'adrcity'],
         oneWay: ['oneway', 'one_way', 'lgcyoneway']
     };
 
@@ -778,8 +780,9 @@
             return null;
         }
         if (/^kendall$/i.test(county.name) && county.stateFips === '48') return KENDALL;
-        if (county.stateFips !== '48') {
-            sourceProblem = 'The importer only has GIS sources for Texas so far.';
+        const stateAbbr = GIS_STATES[county.stateFips];
+        if (!stateAbbr) {
+            sourceProblem = 'The importer only has GIS sources for Texas and Arkansas so far.';
             return null;
         }
         const problem = gislProblem();
@@ -791,17 +794,17 @@
         const all = await loadGislLayers();
         const wanted = county.name.toLowerCase();
         const byLevel = (a, b) => LEVEL_ORDER.indexOf(a.level) - LEVEL_ORDER.indexOf(b.level);
-        const checked = all.filter((l) => visible.has(l.id) && !brokenLayers.has(l.id));
+        const checked = all.filter((l) => l.state === stateAbbr && visible.has(l.id) && !brokenLayers.has(l.id));
         // Layers for this county (or statewide) come first. Checked layers of other counties go last, as a fallback: a county's layer
         // often covers a bit past its border (a road on the line can be in only the neighbour's layer).
-        const near = await countiesNear(pt);
+        const near = await countiesNear(pt, county.stateFips);
         const layers = [
             ...checked.filter((l) => !l.counties.length || l.counties.includes(wanted)).sort(byLevel),
             // only layers of counties within about NEARBY_MILES; none if the nearby counties could not be looked up
             ...checked.filter((l) => l.counties.length && !l.counties.includes(wanted) && near && l.counties.some((c) => near.has(c))).sort(byLevel).map((l) => ({ ...l, fallback: true }))
         ];
         if (!layers.some((l) => l.role === 'roads')) {
-            sourceProblem = `No road layer is checked in WME GIS Layers for ${county.name} County (or statewide).`;
+            sourceProblem = `No road layer is checked in WME GIS Layers for ${county.name} County, ${stateAbbr} (or statewide).`;
             return null;
         }
         return makeGislSource(county.name, layers);
@@ -2195,7 +2198,7 @@
 
         const hint = document.createElement('div');
         hint.style.cssText = 'margin-top: 10px; font-size: 11px; color: #5f6368; line-height: 1.35;';
-        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. The same outline can also fix the existing segments the scan flags: Check flagged counts them, Fix flagged fills in names and cities, corrects primary cities (clearing one and using the postal city as the alternate when the limits call for it) and renames a street to the GIS name when it differs. A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere in Texas the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
+        hint.textContent = 'Roads on: click a GIS road to import it or extend a stub; click a mapped road to fill in its missing street name and city from the GIS (nothing it already has is changed). HNs on: click an existing road to add the house numbers it is missing. Both on: existing roads get house numbers, and roads not mapped yet are imported. Snap on: clicking a mapped road snaps it onto the GIS centerline (Ctrl+Z undoes it; hand mapping is often better, so it starts off). Hold Shift while clicking to import a road anyway. Area (the dotted outline button on the toolbar): click the corners of an area and double-click to close it, Preview to see which GIS roads it would import, Go to import them one at a time (saving every 25; Pause and Stop are on its panel, Escape stops), then House numbers for the second run. Roads that cross the outline are imported whole. The same outline can also fix the existing segments the scan flags: Check flagged counts them, Fix flagged fills in names and cities, corrects primary cities (clearing one and using the postal city as the alternate when the limits call for it) and renames a street to the GIS name when it differs. A road with no GIS data and no name can be named from Google Maps: right-click the street there (this script runs on Google Maps too), then click the segment here with Roads on. Kendall County uses its own county data; elsewhere (Texas and Arkansas) the road and address point layers you have switched on in WME GIS Layers are used (city first, then county, then statewide).';
         wrap.appendChild(hint);
 
         tabPane.appendChild(wrap);
@@ -2404,7 +2407,7 @@
     // City / CDP limits and postal cities
     // ------------------------------------------------------------------
     // Same boundary file the WME Cities Overlay script draws (cities and Census Designated Places).
-    // Texas only for now; other states use their own file in the same folder.
+    // Texas and Arkansas; each state has its own file in the same folder.
     // City and CDP limits come from the WME Cities Overlay KMLs, one file per state. To add a state, add its two-letter code here
     // (the file must exist at KMLs/US/<code>_Cities.kml in that repository).
     const CITY_KML_STATES = ['TX', 'AR'];
