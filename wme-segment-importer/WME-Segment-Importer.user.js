@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110102
+// @version      2026110103
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -720,7 +720,7 @@
         const parcels = layers.filter((l) => l.role === 'parcel' && !l.fallback);
         const parcelCfg = parcels.length ? {
             isParcel: true,
-            query: (box) => queryParcelPoints(parcels, box, used),
+            query: async (box) => await queryParcelPoints(parcels, box, used),
             nameParts: parcelNameParts,
             number: parcelNumber,
             postalCities: parcelPostalCities
@@ -732,7 +732,7 @@
             county: countyName,
             roadLayers: roads,
             get label() { return used.roads ? `GIS Layers: ${used.roads}` : `GIS Layers (${countyName} Co)`; },
-            query: (box) => queryFirstWithData(roads, box, used, 'roads'),
+            query: async (box) => await queryFirstWithData(roads, box, used, 'roads'),
             // every road layer you have on, merged: the block beyond a segment can live in another layer (county vs city)
             queryAll: async (box) => {
                 const answers = await Promise.all(roads.filter((l) => !l.fallback && !brokenLayers.has(l.id)).map((l) => queryGislLayer(l, box).catch((err) => {
@@ -745,7 +745,7 @@
             oneWay: (p) => fieldValue(p, FIELDS.oneWay),
             postalCities: genericPostalCities,
             houseNumbers: addresses.length ? {
-                query: (box) => queryFirstWithData(addresses, box, used, 'address'),
+                query: async (box) => await queryFirstWithData(addresses, box, used, 'address'),
                 nameParts: genericAddressNameParts,
                 number: genericAddressNumber,
                 postalCities: genericPostalCities
@@ -831,7 +831,7 @@
     async function resolvePostal(source, props, name, coords, featureId, excludeSegmentId = null) {
         let postal = source.postalCities(props || {});
         if (!postal.missing) return postal;
-        const sameStreet = postalCityFromSameStreet(name, coords, excludeSegmentId);
+        const sameStreet = await postalCityFromSameStreet(name, coords, excludeSegmentId);
         if (sameStreet) return { cities: sameStreet.cities, notes: [], fromStreet: { id: sameStreet.segmentId, name } };
         try {
             const fromPoints = await postalFromAddressPoints(source, coords, name);
@@ -861,9 +861,9 @@
         await pageWin.SDK_INITIALIZED;
     }
 
-    const sdk = pageWin.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
+    const sdk = pageWin.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME, mode: 'async' });
 
-    const isReady = typeof sdk.State?.isReady === 'function' ? sdk.State.isReady() : sdk.State?.isReady;
+    const isReady = await sdk.State.isReady();
     if (!isReady) {
         await sdk.Events.once({ eventName: 'wme-ready' });
     }
@@ -1200,7 +1200,7 @@
 
     const { RAD, EARTH_R, distanceMeters, distanceToLine, linePartsOf, pointAlongLine, formatCityName, DIRECTION_TOKENS, buildStreetName, privateRoadName, fixRepeatedType, isUsableStreetName, routeForm } = WmeSiCore;
 
-    const mapDiv = (typeof sdk.Map.getMapViewportElement === 'function' && sdk.Map.getMapViewportElement()) ||
+    const mapDiv = (typeof sdk.Map.getMapViewportElement === 'function' && await sdk.Map.getMapViewportElement()) ||
         document.getElementById('map');
 
     if (!mapDiv) {
@@ -1908,9 +1908,9 @@
         if (!st.checked) return 'No layers are checked in WME GIS Layers, so the importer has no GIS layers to use outside Kendall County.';
         return '';
     }
-    function inKendallView() {
+    async function inKendallView() {
         try {
-            const [a, b, c, d] = sdk.Map.getMapExtent();
+            const [a, b, c, d] = await sdk.Map.getMapExtent();
             const lon = (a + c) / 2;
             const lat = (b + d) / 2;
             return lon >= KENDALL.bounds.minLon && lon <= KENDALL.bounds.maxLon && lat >= KENDALL.bounds.minLat && lat <= KENDALL.bounds.maxLat;
@@ -1918,38 +1918,38 @@
             return false;
         }
     }
-    function warnIfGisLayersOff() {
+    async function warnIfGisLayersOff() {
         const problem = gislProblem();
-        if (problem && !inKendallView()) setStatus(problem, 'warn');
+        if (problem && !await inKendallView()) setStatus(problem, 'warn');
     }
 
-    function setRoadsOn(on) {
+    async function setRoadsOn(on) {
         importRoadsEnabled = on;
         applyToggleState();
         setStatus(describeToggles(), 'info');
-        if (on) warnIfGisLayersOff();
+        if (on) await warnIfGisLayersOff();
         console.log(`[${SCRIPT_NAME}] roads ${on ? 'on' : 'off'}.`);
     }
 
-    function setHousesOn(on) {
+    async function setHousesOn(on) {
         houseNumbersEnabled = on;
         applyToggleState();
         setStatus(describeToggles(), 'info');
-        if (on) warnIfGisLayersOff();
+        if (on) await warnIfGisLayersOff();
         console.log(`[${SCRIPT_NAME}] HNs ${on ? 'on' : 'off'}.`);
     }
 
-    function setCleanUpOn(on) {
+    async function setCleanUpOn(on) {
         cleanUpEnabled = on;
         applyToggleState();
         setStatus(describeToggles(), 'info');
-        if (on) warnIfGisLayersOff();
+        if (on) await warnIfGisLayersOff();
         console.log(`[${SCRIPT_NAME}] snap ${on ? 'on' : 'off'}.`);
     }
 
-    btnRoads.addEventListener('click', () => setRoadsOn(!importRoadsEnabled));
-    btnCleanUp.addEventListener('click', () => setCleanUpOn(!cleanUpEnabled));
-    btnHouses.addEventListener('click', () => setHousesOn(!houseNumbersEnabled));
+    btnRoads.addEventListener('click', async () => await setRoadsOn(!importRoadsEnabled));
+    btnCleanUp.addEventListener('click', async () => await setCleanUpOn(!cleanUpEnabled));
+    btnHouses.addEventListener('click', async () => await setHousesOn(!houseNumbersEnabled));
     applyToggleState();
 
     // ------------------------------------------------------------------
@@ -2019,12 +2019,12 @@
         const gisWarning = document.createElement('div');
         gisWarning.style.cssText = 'display: none; margin-bottom: 12px; padding: 6px 8px; border-left: 4px solid #f29900; border-radius: 3px; background: #fff3e0; color: #9a5200; font-size: 12px; line-height: 1.35;';
         wrap.appendChild(gisWarning);
-        const refreshGisWarning = () => {
-            const problem = inKendallView() ? '' : gislProblem();
+        const refreshGisWarning = async () => {
+            const problem = await inKendallView() ? '' : gislProblem();
             gisWarning.textContent = problem;
             gisWarning.style.display = problem ? 'block' : 'none';
         };
-        refreshGisWarning();
+        await refreshGisWarning();
         setInterval(refreshGisWarning, 5000);
 
         const gapsLabel = document.createElement('div');
@@ -2201,9 +2201,9 @@
         tabPane.appendChild(wrap);
 
         sidebarUi = { label: tabLabel, dot, roads: roadsUi, houses: housesUi, cleanup: cleanupUi, statusBox, toolbarBtn, gapsSummary };
-        roadsUi.switchBtn.addEventListener('click', () => setRoadsOn(!importRoadsEnabled));
-        housesUi.switchBtn.addEventListener('click', () => setHousesOn(!houseNumbersEnabled));
-        cleanupUi.switchBtn.addEventListener('click', () => setCleanUpOn(!cleanUpEnabled));
+        roadsUi.switchBtn.addEventListener('click', async () => await setRoadsOn(!importRoadsEnabled));
+        housesUi.switchBtn.addEventListener('click', async () => await setHousesOn(!houseNumbersEnabled));
+        cleanupUi.switchBtn.addEventListener('click', async () => await setCleanUpOn(!cleanUpEnabled));
         applyToggleState(); // paint the initial state
         applyToolbarState();
     } catch (err) {
@@ -2215,10 +2215,10 @@
     // ------------------------------------------------------------------
 
     // Lon/lat bounds of the visible map area.
-    function visibleBounds() {
+    async function visibleBounds() {
         const r = mapDiv.getBoundingClientRect();
-        const topLeft = sdk.Map.getLonLatFromPixel({ x: r.left, y: r.top });
-        const bottomRight = sdk.Map.getLonLatFromPixel({ x: r.right, y: r.bottom });
+        const topLeft = await sdk.Map.getLonLatFromPixel({ x: r.left, y: r.top });
+        const bottomRight = await sdk.Map.getLonLatFromPixel({ x: r.right, y: r.bottom });
         return {
             minLon: Math.min(topLeft.lon, bottomRight.lon),
             maxLon: Math.max(topLeft.lon, bottomRight.lon),
@@ -2235,13 +2235,13 @@
     // ------------------------------------------------------------------
     // Node sharing
     // ------------------------------------------------------------------
-    function findNearestNode(lon, lat, tolerance = SNAP_TOLERANCE_M) {
+    async function findNearestNode(lon, lat, tolerance = SNAP_TOLERANCE_M) {
         const latWindow = (tolerance * 2) / 111000;
         const lonWindow = latWindow / Math.max(Math.cos(lat * RAD), 0.01);
 
         let best = null;
         let bestDist = Infinity;
-        for (const node of sdk.DataModel.Nodes.getAll()) {
+        for (const node of await sdk.DataModel.Nodes.getAll()) {
             if (!node.connectedSegmentIds.length) continue; // a deleted node lingers with no segments
             const [nx, ny] = node.geometry.coordinates;
             if (Math.abs(ny - lat) > latWindow || Math.abs(nx - lon) > lonWindow) continue;
@@ -2277,9 +2277,9 @@
         return best;
     }
 
-    function findNearestSegment(lon, lat, tolerance = SNAP_TOLERANCE_M) {
+    async function findNearestSegment(lon, lat, tolerance = SNAP_TOLERANCE_M) {
         let best = null;
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (!isLiveSegment(segment)) continue; // a deleted segment lingers with no nodes
             const hit = nearestPointOnLine({ lon, lat }, segment.geometry.coordinates);
             if (hit.dist <= tolerance && (!best || hit.dist < best.dist)) {
@@ -2293,22 +2293,22 @@
     // existing segment (which WME then splits). The endpoint is moved onto that exact spot and a
     // "snapped feature" record is built, the same record WME's own drawing tool hands to its
     // AddSegment action.
-    function snapEndpoints(coords, tolerances = {}) {
+    async function snapEndpoints(coords, tolerances = {}) {
         const last = coords.length - 1;
         const snaps = {};
         const snappedFeatures = [];
         const nativeModel = pageWin.W && pageWin.W.model;
 
-        const trySnap = (index, key, other) => {
+        const trySnap = async (index, key, other) => {
             const c = coords[index];
             let snap = null;
 
             const tol = tolerances[key] || SNAP_TOLERANCE_M;
-            const nodeHit = findNearestNode(c[0], c[1], tol);
+            const nodeHit = await findNearestNode(c[0], c[1], tol);
             if (nodeHit) {
                 snap = { kind: 'node', targetId: nodeHit.node.id, coord: [...nodeHit.node.geometry.coordinates] };
             } else {
-                const edgeHit = findNearestSegment(c[0], c[1], tol);
+                const edgeHit = await findNearestSegment(c[0], c[1], tol);
                 if (edgeHit) snap = { kind: 'edge', targetId: edgeHit.segment.id, coord: [...edgeHit.point] };
             }
             if (!snap) return;
@@ -2329,20 +2329,20 @@
             }
         };
 
-        trySnap(0, 'from', null);
-        trySnap(last, 'to', snaps.from);
+        await trySnap(0, 'from', null);
+        await trySnap(last, 'to', snaps.from);
         return { snaps, snappedFeatures };
     }
 
     // SDK addSegment never connects to existing nodes on its own (it leaves the native action's
     // snappedFeatures empty). This attaches them to the native AddSegment action for the duration
     // of the call, then restores the original method. Non-SDK, so failures fall back to a plain add.
-    function addSegmentWithSnaps(coords, snappedFeatures, roadType = ROAD_TYPE_STREET) {
+    async function addSegmentWithSnaps(coords, snappedFeatures, roadType = ROAD_TYPE_STREET) {
         const args = { geometry: { type: 'LineString', coordinates: coords }, roadType };
         const actionManager = pageWin.W && pageWin.W.model && pageWin.W.model.actionManager;
 
         if (!snappedFeatures.length || !actionManager || typeof actionManager.add !== 'function') {
-            const segmentId = sdk.DataModel.Segments.addSegment(args);
+            const segmentId = await sdk.DataModel.Segments.addSegment(args);
             importerMadeIds.add(segmentId);
             return { segmentId, patched: false };
         }
@@ -2357,7 +2357,7 @@
             return originalAdd.call(this, action, ...rest);
         };
         try {
-            const segmentId = sdk.DataModel.Segments.addSegment(args);
+            const segmentId = await sdk.DataModel.Segments.addSegment(args);
             importerMadeIds.add(segmentId);
             return { segmentId, patched };
         } finally {
@@ -2370,24 +2370,25 @@
     // ------------------------------------------------------------------
     // WME's AddSegment already opens turns when it joins. This confirms it and fixes anything left closed.
     async function verifyTurns(nodeId, newSegmentId) {
-        const { Turns } = sdk.DataModel;
+        const Turns = sdk.DataModel.Turns;
         await sleep(300);
 
-        const involved = () => Turns.getTurnsThroughNode({ nodeId })
+        const involved = async () => (await Turns.getTurnsThroughNode({ nodeId }))
             .filter((t) => (t.fromSegmentId === newSegmentId || t.toSegmentId === newSegmentId) && t.fromSegmentId !== t.toSegmentId);
 
         try {
-            for (const turn of involved()) {
+            for (const turn of await involved()) {
                 if (turn.isAllowed) continue;
                 const args = { fromSegmentId: turn.fromSegmentId, toSegmentId: turn.toSegmentId, nodeId };
-                if (Turns.isTurnAllowedBySegmentDirections(args)) {
-                    Turns.updateTurn({ turnId: turn.id, isAllowed: true });
+                if (await Turns.isTurnAllowedBySegmentDirections(args)) {
+                    await Turns.updateTurn({ turnId: turn.id, isAllowed: true });
                 }
             }
-            const turns = involved();
-            const blocked = turns.filter((t) => !t.isAllowed && Turns.isTurnAllowedBySegmentDirections({
-                fromSegmentId: t.fromSegmentId, toSegmentId: t.toSegmentId, nodeId
-            }));
+            const turns = await involved();
+            const blocked = [];
+            for (const t of turns) {
+                if (!t.isAllowed && await Turns.isTurnAllowedBySegmentDirections({ fromSegmentId: t.fromSegmentId, toSegmentId: t.toSegmentId, nodeId })) blocked.push(t);
+            }
             return { total: turns.length, allowed: turns.filter((t) => t.isAllowed).length, blocked: blocked.length };
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Turn verification failed:`, err);
@@ -2495,20 +2496,20 @@
     // city if it has one (the road is outside city limits), otherwise its city. Nearest segment wins.
     const SAME_STREET_POSTAL_RADIUS_M = 1500;
 
-    function postalCityFromSameStreet(name, coords, excludeSegmentId = null) {
+    async function postalCityFromSameStreet(name, coords, excludeSegmentId = null) {
         const wanted = normalizeName(name);
         if (!wanted) return null;
         const project = makeProjector(coords[0]);
         const mid = project(pointAlongLine(coords, 0.5));
         let best = null;
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (!isLiveSegment(segment) || segment.id === excludeSegmentId) continue;
             const d = xyNearest(segment.geometry.coordinates.map(project), mid[0], mid[1]).d;
             if (d > SAME_STREET_POSTAL_RADIUS_M || (best && d >= best.dist)) continue;
-            if (normalizeName(streetNameOf(segment.id)) !== wanted) continue;
+            if (normalizeName(await streetNameOf(segment.id)) !== wanted) continue;
             let address;
             try {
-                address = sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
+                address = await sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
             } catch (err) {
                 continue;
             }
@@ -2621,28 +2622,28 @@
     // WME's state outlines overlap at the border, so those are not used either.
     // A segment keeps the country and state it already has, taken together. A segment with no address gets the pair most of
     // its five nearest addressed segments use.
-    function regionOf(segmentId) {
+    async function regionOf(segmentId) {
         const ok = (x) => !!x && x.id !== undefined && x.id !== null && !x.isEmpty;
         const allowed = (c) => !ONLY_COUNTRY || (!!c && c.abbr === ONLY_COUNTRY);
         const none = { country: null, state: null };
 
         // 1. the segment's own country and state
         try {
-            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            const a = await sdk.DataModel.Segments.getAddress({ segmentId });
             if (a && ok(a.country) && ok(a.state)) return allowed(a.country) ? { country: a.country, state: a.state } : none;
         } catch (err) { /* next */ }
 
         // 2. a segment with no address yet: its nearest addressed neighbours
         let pt = null;
         try {
-            const c = sdk.DataModel.Segments.getById({ segmentId }).geometry.coordinates;
+            const c = (await sdk.DataModel.Segments.getById({ segmentId })).geometry.coordinates;
             pt = c[Math.floor(c.length / 2)];
         } catch (err) { /* no geometry */ }
         if (!pt) return none;
         const k = Math.cos((pt[1] * Math.PI) / 180);
         const near = [];
         try {
-            for (const other of sdk.DataModel.Segments.getAll()) {
+            for (const other of await sdk.DataModel.Segments.getAll()) {
                 if (other.id === segmentId || !other.geometry) continue;
                 const c = other.geometry.coordinates;
                 const m = c[Math.floor(c.length / 2)];
@@ -2655,7 +2656,7 @@
         for (const n of near) {
             if (used >= 5) break;
             let a = null;
-            try { a = sdk.DataModel.Segments.getAddress({ segmentId: n.id }); } catch (err) { continue; }
+            try { a = await sdk.DataModel.Segments.getAddress({ segmentId: n.id }); } catch (err) { continue; }
             if (!a || !ok(a.country) || !ok(a.state)) continue;
             used++;
             const key = `${a.country.id}/${a.state.id}`;
@@ -2671,8 +2672,8 @@
         // loaded for this area. Used only when exactly one state is loaded (checked in the console: Texas, with no segments loaded);
         // with two or more (near a state line) it is a guess, so it is left to the error message.
         try {
-            const states = sdk.DataModel.States.getAll();
-            const country = sdk.DataModel.Countries.getAll().find((c) => ok(c) && c.abbr === ONLY_COUNTRY);
+            const states = await sdk.DataModel.States.getAll();
+            const country = (await sdk.DataModel.Countries.getAll()).find((c) => ok(c) && c.abbr === ONLY_COUNTRY);
             const loaded = states.filter(ok);
             if (country && loaded.length === 1) return { country, state: loaded[0] };
         } catch (err) { /* not available */ }
@@ -2681,20 +2682,21 @@
     const REGION_ERROR = 'The script could not work out which United States state this segment is in (it only edits US addresses); pan or zoom the map a little so the area loads, then try again';
 
     // Sets the primary street/city and alternate cities on a segment.
-    function applyAddress(segmentId, streetName, primaryCity, alternateCities) {
-        const { country, state } = regionOf(segmentId);
+    async function applyAddress(segmentId, streetName, primaryCity, alternateCities) {
+        const { country, state } = await regionOf(segmentId);
         if (!country || !state) throw new Error(REGION_ERROR);
 
         // An alternate is the same street name in another city, so each needs its city and street to exist.
-        const alternateStreetIds = alternateCities.map((cityName) => {
-            let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
-            if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
-            let street = sdk.DataModel.Streets.getStreet({ streetName, cityId: city.id });
-            if (!street) street = sdk.DataModel.Streets.addStreet({ streetName, cityId: city.id });
-            return street.id;
-        });
+        const alternateStreetIds = [];
+        for (const cityName of alternateCities) {
+            let city = await sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+            if (!city) city = await sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
+            let street = await sdk.DataModel.Streets.getStreet({ streetName, cityId: city.id });
+            if (!street) street = await sdk.DataModel.Streets.addStreet({ streetName, cityId: city.id });
+            alternateStreetIds.push(street.id);
+        }
 
-        sdk.DataModel.Segments.updateAddress({
+        await sdk.DataModel.Segments.updateAddress({
             segmentId,
             addressData: { streetName, cityName: primaryCity, countryId: country.id, stateId: state.id, alternateStreetIds }
         });
@@ -2798,7 +2800,7 @@
     }
 
     // How much of a candidate line ([lon, lat] pairs) already lies along existing WME segments.
-    function analyzeOverlap(coords, excludeIds = []) {
+    async function analyzeOverlap(coords, excludeIds = []) {
         const project = makeProjector(coords[0]);
         const cand = coords.map(project);
         const samples = xyResample(cand, OVERLAP_STEP_M);
@@ -2812,7 +2814,7 @@
         const candLen = xyLengths(cand).reduce((a, b) => a + b, 0);
         const matches = [];
 
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (excludeIds.includes(segment.id) || !isLiveSegment(segment) || OVERLAP_IGNORED_ROAD_TYPES.has(segment.roadType)) continue;
             const sxy = segment.geometry.coordinates.map(project);
             const sx = sxy.map((c) => c[0]);
@@ -2833,21 +2835,22 @@
     }
 
     // If `stub` lies along the GIS road and has a dead end with road left beyond it, work out the extension.
-    function planExtension(coords, stub) {
+    async function planExtension(coords, stub) {
         const project = makeProjector(coords[0]);
         const gxy = coords.map(project);
         const cum = xyCumulative(gxy);
         const total = cum[cum.length - 1];
         const stubCoords = stub.geometry.coordinates;
 
-        const ends = [
+        const ends = [];
+        for (const end of [
             { label: 'A', nodeId: stub.fromNodeId, coord: stubCoords[0] },
             { label: 'B', nodeId: stub.toNodeId, coord: stubCoords[stubCoords.length - 1] }
-        ].map((end) => {
-            const node = sdk.DataModel.Nodes.getById({ nodeId: end.nodeId });
+        ]) {
+            const node = await sdk.DataModel.Nodes.getById({ nodeId: end.nodeId });
             const p = project(end.coord);
-            return { ...end, node, degree: node ? node.connectedSegmentIds.length : 0, pos: xyNearest(gxy, p[0], p[1], cum).pos };
-        });
+            ends.push({ ...end, node, degree: node ? node.connectedSegmentIds.length : 0, pos: xyNearest(gxy, p[0], p[1], cum).pos });
+        }
 
         const lo = Math.min(ends[0].pos, ends[1].pos);
         const hi = Math.max(ends[0].pos, ends[1].pos);
@@ -2882,9 +2885,9 @@
 
     const normalizeName = (s) => privateRoadName(routeForm(s)).toLowerCase().replace(/[^a-z0-9]/g, '');
 
-    function streetNameOf(segmentId) {
+    async function streetNameOf(segmentId) {
         try {
-            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            const a = await sdk.DataModel.Segments.getAddress({ segmentId });
             return a.street && a.street.name ? a.street.name : '';
         } catch (err) {
             return '';
@@ -2892,8 +2895,8 @@
     }
 
     // Copies what a merge insists on matching (speeds, direction, lock, ...) and the street/city from the stub.
-    function copyStubAttributes(stub, pieceId) {
-        const piece = sdk.DataModel.Segments.getById({ segmentId: pieceId });
+    async function copyStubAttributes(stub, pieceId) {
+        const piece = await sdk.DataModel.Segments.getById({ segmentId: pieceId });
         const update = { segmentId: pieceId, fwdSpeedLimit: stub.fwdSpeedLimit ?? null, revSpeedLimit: stub.revSpeedLimit ?? null };
         const direction = stub.isTwoWay ? 'TWO_WAY' : stub.isAtoB ? 'A_TO_B' : 'B_TO_A';
         if (piece && ((direction === 'TWO_WAY' && !piece.isTwoWay) || (direction === 'A_TO_B' && !piece.isAtoB) || (direction === 'B_TO_A' && !piece.isBtoA))) {
@@ -2902,16 +2905,16 @@
         if (stub.lockRank !== undefined && stub.lockRank !== null) update.lockRank = stub.lockRank;
         if (stub.elevationLevel !== undefined && stub.elevationLevel !== piece.elevationLevel) update.elevationLevel = stub.elevationLevel;
         try {
-            sdk.DataModel.Segments.updateSegment(update);
+            await sdk.DataModel.Segments.updateSegment(update);
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Copying all stub attributes failed, trying speeds only:`, err);
-            sdk.DataModel.Segments.updateSegment({ segmentId: pieceId, fwdSpeedLimit: update.fwdSpeedLimit, revSpeedLimit: update.revSpeedLimit });
+            await sdk.DataModel.Segments.updateSegment({ segmentId: pieceId, fwdSpeedLimit: update.fwdSpeedLimit, revSpeedLimit: update.revSpeedLimit });
         }
 
-        const a = sdk.DataModel.Segments.getAddress({ segmentId: stub.id });
+        const a = await sdk.DataModel.Segments.getAddress({ segmentId: stub.id });
         if (a.street && a.street.name) {
-            const { country, state } = regionOf(stub.id);
-            sdk.DataModel.Segments.updateAddress({
+            const { country, state } = await regionOf(stub.id);
+            await sdk.DataModel.Segments.updateAddress({
                 segmentId: pieceId,
                 addressData: {
                     streetName: a.street.name,
@@ -2933,41 +2936,41 @@
         let finalId = stub.id;
         const metersBeyond = Math.round(plan.end.remainder);
 
-        const farNode = findNearestNode(plan.farCoord[0], plan.farCoord[1]);
-        const farEdge = farNode ? null : findNearestSegment(plan.farCoord[0], plan.farCoord[1]);
+        const farNode = await findNearestNode(plan.farCoord[0], plan.farCoord[1]);
+        const farEdge = farNode ? null : await findNearestSegment(plan.farCoord[0], plan.farCoord[1]);
         const needsJoin = !!farNode || !!(farEdge && farEdge.segment.id !== stub.id);
 
         if (!needsJoin) {
-            sdk.DataModel.Segments.updateSegment({
+            await sdk.DataModel.Segments.updateSegment({
                 segmentId: stub.id,
                 geometry: { type: 'LineString', coordinates: plan.newCoords }
             });
             messages.push(`Extended the existing road by ${metersBeyond} m instead of creating a new one.`);
         } else {
             const otherEndNodeId = plan.end.label === 'B' ? stub.fromNodeId : stub.toNodeId;
-            const otherNode = sdk.DataModel.Nodes.getById({ nodeId: otherEndNodeId });
+            const otherNode = await sdk.DataModel.Nodes.getById({ nodeId: otherEndNodeId });
             const before = new Set(otherNode ? otherNode.connectedSegmentIds : []);
 
             // the missing part, running the same way as the stub
             const pieceCoords = plan.end.label === 'B'
                 ? plan.outward.map((c) => [...c])
                 : [...plan.outward].reverse().map((c) => [...c]);
-            const { snaps, snappedFeatures } = snapEndpoints(pieceCoords);
-            const { segmentId: pieceId, patched } = addSegmentWithSnaps(pieceCoords, snappedFeatures, stub.roadType);
+            const { snaps, snappedFeatures } = await snapEndpoints(pieceCoords);
+            const { segmentId: pieceId, patched } = await addSegmentWithSnaps(pieceCoords, snappedFeatures, stub.roadType);
             finalId = pieceId;
             if (!patched) {
                 level = 'warn';
                 messages.push('Created the missing part but could not join it; delete it or join it by hand.');
             } else {
                 try {
-                    copyStubAttributes(stub, pieceId);
+                    await copyStubAttributes(stub, pieceId);
                 } catch (err) {
                     console.warn(`[${SCRIPT_NAME}] copyStubAttributes failed:`, err);
                 }
                 try {
-                    sdk.DataModel.Segments.mergeSegments({ segmentIds: [stub.id, pieceId] });
+                    await sdk.DataModel.Segments.mergeSegments({ segmentIds: [stub.id, pieceId] });
                     await sleep(300);
-                    const node = sdk.DataModel.Nodes.getById({ nodeId: otherEndNodeId });
+                    const node = await sdk.DataModel.Nodes.getById({ nodeId: otherEndNodeId });
                     const fresh = node ? node.connectedSegmentIds.filter((id) => !before.has(id)) : [];
                     if (fresh.length === 1) finalId = fresh[0];
                     messages.push(`Extended the existing road by ${metersBeyond} m and merged it with the new part.`);
@@ -2978,10 +2981,10 @@
 
                 // far end: confirm the join and the turns
                 const farSnap = plan.end.label === 'B' ? snaps.to : snaps.from;
-                const finalSeg = sdk.DataModel.Segments.getById({ segmentId: finalId });
+                const finalSeg = await sdk.DataModel.Segments.getById({ segmentId: finalId });
                 if (farSnap && finalSeg) {
                     const farNodeId = plan.end.label === 'B' ? finalSeg.toNodeId : finalSeg.fromNodeId;
-                    const node = sdk.DataModel.Nodes.getById({ nodeId: farNodeId });
+                    const node = await sdk.DataModel.Nodes.getById({ nodeId: farNodeId });
                     const connected = node ? node.connectedSegmentIds.length : 0;
                     const joined = farSnap.kind === 'node' ? farNodeId === farSnap.targetId : connected >= 3;
                     if (joined) {
@@ -3022,7 +3025,7 @@
         setStatus(`${stubName || 'Road'}: ${messages.join(' ')}`, level);
         console.log(`[${SCRIPT_NAME}] ${stubName || 'Road'} (segment ${finalId}): ${messages.join(' ')}`);
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [finalId] } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [finalId] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select segment:`, err);
         }
@@ -3032,7 +3035,7 @@
     async function handleOverlap(ctx) {
         const { coords, name } = ctx;
         const hnHint = ctx.source && ctx.source.houseNumbers ? ' To add its house numbers instead, turn on the HNs button and click the road again.' : '';
-        const analysis = analyzeOverlap(coords);
+        const analysis = await analyzeOverlap(coords);
         if (analysis.unionLen < OVERLAP_MIN_M) return false;
         const percent = Math.round(analysis.unionFraction * 100);
 
@@ -3040,17 +3043,17 @@
         const stubMatch = analysis.matches
             .filter((m) => m.segFraction >= STUB_FRACTION && m.segCovered >= OVERLAP_MIN_M)
             .sort((a, b) => b.segCovered - a.segCovered)[0];
-        const plan = stubMatch ? planExtension(coords, stubMatch.segment) : null;
+        const plan = stubMatch ? await planExtension(coords, stubMatch.segment) : null;
 
         if (plan) {
             const stub = stubMatch.segment;
-            const stubName = streetNameOf(stub.id);
+            const stubName = await streetNameOf(stub.id);
             if (stubName && name && normalizeName(stubName) !== normalizeName(name)) {
                 setStatus(`${name || 'This road'}: not imported, because the existing segment is named "${stubName}" but the GIS road is "${name}". Shift-click to import anyway.`, 'warn');
                 return true;
             }
             // the part beyond the stub must be clear of other existing segments
-            const beyond = analyzeOverlap(plan.outward, [stub.id]);
+            const beyond = await analyzeOverlap(plan.outward, [stub.id]);
             if (beyond.unionFraction >= PARTIAL_OVERLAP_FRACTION && beyond.unionLen >= OVERLAP_MIN_M) {
                 setStatus(`${name || 'This road'}: not imported, because the road beyond the existing segment also overlaps other existing segments. Shift-click to import anyway.`, 'warn');
                 return true;
@@ -3065,7 +3068,7 @@
         //     (but a tiny segment on a long road, e.g. a short crossover, must not block the whole road)
         if (stubMatch && analysis.unionFraction >= PARTIAL_OVERLAP_FRACTION) {
             const stub = stubMatch.segment;
-            const stubLabel = streetNameOf(stub.id);
+            const stubLabel = await streetNameOf(stub.id);
             setStatus(analysis.unionFraction >= DUPLICATE_FRACTION
                 ? `${name || 'This road'}: already mapped (${percent}% of it lies along ${stubLabel || 'an unnamed segment'}). Not imported; Shift-click to import anyway.${hnHint}`
                 : `${name || 'This road'}: not imported, because an existing segment${stubLabel ? ` ("${stubLabel}")` : ''} already lies along it and has no free end to extend. Shift-click to import anyway.${hnHint}`, 'warn');
@@ -3076,7 +3079,7 @@
         if (analysis.unionFraction >= PARTIAL_OVERLAP_FRACTION) {
             const top = analysis.matches.slice().sort((a, b) => b.candCovered - a.candCovered)[0];
             const what = analysis.unionFraction >= DUPLICATE_FRACTION ? 'already mapped' : 'partly overlaps existing segments';
-            setStatus(`${name || 'This road'}: ${what} (${percent}% of it lies along ${streetNameOf(top.segment.id) || 'an unnamed segment'}). Not imported; Shift-click to import anyway.${hnHint}`, 'warn');
+            setStatus(`${name || 'This road'}: ${what} (${percent}% of it lies along ${await streetNameOf(top.segment.id) || 'an unnamed segment'}). Not imported; Shift-click to import anyway.${hnHint}`, 'warn');
             return true;
         }
         return false;
@@ -3112,7 +3115,7 @@
     }
 
     // How far (meters) the start of `coords` keeps running along existing segments. 0 if it doesn't.
-    function runInLength(coords) {
+    async function runInLength(coords) {
         const project = makeProjector(coords[0]);
         const line = coords.map(project);
         const cum = xyCumulative(line);
@@ -3126,7 +3129,7 @@
             minY: Math.min(...probe.map((q) => q.y)) - limit - 10, maxY: Math.max(...probe.map((q) => q.y)) + limit + 10
         };
         const nearby = [];
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (!isLiveSegment(segment) || OVERLAP_IGNORED_ROAD_TYPES.has(segment.roadType)) continue;
             const sxy = segment.geometry.coordinates.map(project);
             const sx = sxy.map((c) => c[0]);
@@ -3152,12 +3155,12 @@
 
     // Cuts off any stretch at either end that just runs along an existing road, so the new road starts where
     // it actually leaves that road. Returns the new coordinates and how many meters were cut from each end.
-    function trimRunIns(coords) {
+    async function trimRunIns(coords) {
         const trimmed = {};
         let line = coords.map((c) => [...c]);
         for (const key of ['from', 'to']) {
             const oriented = key === 'from' ? line : [...line].reverse();
-            const run = runInLength(oriented);
+            const run = await runInLength(oriented);
             const xy = oriented.map(makeProjector(oriented[0]));
             const cum = xyCumulative(xy);
             const total = cum[cum.length - 1];
@@ -3242,7 +3245,7 @@
             return { message: 'HNs: this segment is not saved yet. Save, then click the road again to add them.', warn: false, level: 'info' };
         }
         let cfg = source.houseNumbers;
-        const segment = sdk.DataModel.Segments.getById({ segmentId });
+        const segment = await sdk.DataModel.Segments.getById({ segmentId });
         if (!cfg || !segment) return { message: '', warn: false };
 
         const coords = segment.geometry.coordinates;
@@ -3261,11 +3264,11 @@
 
         // every segment of this street near the new one; each address point goes to the nearest of them
         const street = [{ id: segmentId, xy: coords.map(project) }];
-        for (const other of sdk.DataModel.Segments.getAll()) {
+        for (const other of await sdk.DataModel.Segments.getAll()) {
             if (other.id === segmentId || !isLiveSegment(other)) continue;
             const c = other.geometry.coordinates;
             if (c.every((p) => p[0] < box.minLon || p[0] > box.maxLon || p[1] < box.minLat || p[1] > box.maxLat)) continue;
-            if (normalizeName(streetNameOf(other.id)) !== wanted) continue;
+            if (normalizeName(await streetNameOf(other.id)) !== wanted) continue;
             street.push({ id: other.id, xy: c.map(project) });
         }
         const have = await existingHouseNumbers(street.map((s) => s.id));
@@ -3350,10 +3353,10 @@
         const neighbours = [];
         if (sameStreetRoads.length) {
             const myNodes = new Set([segment.fromNodeId, segment.toNodeId]);
-            for (const other of sdk.DataModel.Segments.getAll()) {
+            for (const other of await sdk.DataModel.Segments.getAll()) {
                 if (other.id === segmentId || !isLiveSegment(other) || OVERLAP_IGNORED_ROAD_TYPES.has(other.roadType)) continue;
                 if (!myNodes.has(other.fromNodeId) && !myNodes.has(other.toNodeId)) continue;
-                const otherName = streetNameOf(other.id) || '';
+                const otherName = await streetNameOf(other.id) || '';
                 if (normalizeName(otherName) === wanted) continue; // already part of `street`
                 const xy = other.geometry.coordinates.map(project);
                 const samples = xyResample(xy, 5);
@@ -3380,13 +3383,13 @@
         const segXY = street[0].xy;
         const segCum = xyCumulative(segXY);
         const segLen = segCum[segCum.length - 1];
-        const isDeadEnd = (nodeId) => {
-            const node = sdk.DataModel.Nodes.getById({ nodeId });
+        const isDeadEnd = async (nodeId) => {
+            const node = await sdk.DataModel.Nodes.getById({ nodeId });
             return !!node && node.connectedSegmentIds.length === 1;
         };
         const deadEnds = [];
-        if (isDeadEnd(segment.fromNodeId)) deadEnds.push({ pos: 0, p: segXY[0] });
-        if (isDeadEnd(segment.toNodeId)) deadEnds.push({ pos: segLen, p: segXY[segXY.length - 1] });
+        if (await isDeadEnd(segment.fromNodeId)) deadEnds.push({ pos: 0, p: segXY[0] });
+        if (await isDeadEnd(segment.toNodeId)) deadEnds.push({ pos: segLen, p: segXY[segXY.length - 1] });
 
         // Does the GIS road this segment follows carry on past one of its ends? Then the road is not finished there: a
         // dead end is not a cul-de-sac, and houses beyond the end belong to the next segment, which is not in WME yet.
@@ -3422,7 +3425,7 @@
             }
             if (!found && alongContinues[end.pos === 0 ? 'start' : 'end']) found = { d: 0, what: 'the same GIS road' };
             if (!found) {
-                for (const other of sdk.DataModel.Segments.getAll()) {
+                for (const other of await sdk.DataModel.Segments.getAll()) {
                     if (other.id === segmentId || !isLiveSegment(other) || OVERLAP_IGNORED_ROAD_TYPES.has(other.roadType)) continue;
                     const d = xyNearest(other.geometry.coordinates.map(project), end.p[0], end.p[1]).d;
                     if (d <= 10 && (!found || d < found.d)) found = { d, what: 'a WME segment' };
@@ -3438,13 +3441,13 @@
         const endPoints = { start: segXY[0], end: segXY[segXY.length - 1] };
         for (const side of ['start', 'end']) {
             const nodeId = side === 'start' ? segment.fromNodeId : segment.toNodeId;
-            for (const other of sdk.DataModel.Segments.getAll()) {
+            for (const other of await sdk.DataModel.Segments.getAll()) {
                 if (other.id === segmentId || !isLiveSegment(other) || OVERLAP_IGNORED_ROAD_TYPES.has(other.roadType)) continue;
                 if (street.some((st) => st.id === other.id)) continue; // same street: houses go to the nearest of them anyway
                 const joined = other.fromNodeId === nodeId || other.toNodeId === nodeId;
                 const near = !joined && xyNearest(other.geometry.coordinates.map(project), endPoints[side][0], endPoints[side][1]).d <= TOUCHING_END_M;
                 if (joined || near) {
-                    const otherName = streetNameOf(other.id) || '';
+                    const otherName = await streetNameOf(other.id) || '';
                     touching[side] = touching[side] || [];
                     if (!touching[side].includes(otherName)) touching[side].push(otherName);
                 }
@@ -3608,7 +3611,7 @@
             }
             placed.push([tx, ty]);
             const target = [origin[0] + tx / mx, origin[1] + ty / my];
-            sdk.DataModel.HouseNumbers.addHouseNumber({ number, point: { type: 'Point', coordinates: target }, segmentId });
+            await sdk.DataModel.HouseNumbers.addHouseNumber({ number, point: { type: 'Point', coordinates: target }, segmentId });
             have.add(number.toLowerCase());
             added.push(number);
         }
@@ -3662,7 +3665,7 @@
     // road plus at most one other segment) is moved onto the line too, which reshapes that neighbour's last stretch;
     // an end at a real junction (3 or more segments) stays where it is so nothing else is disturbed.
     async function cleanUpRoad(segmentId) {
-        const segment = sdk.DataModel.Segments.getById({ segmentId });
+        const segment = await sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) return { message: 'Segment not found.', warn: true, error: true, failed: true, notFound: true };
         const coords = segment.geometry.coordinates;
         const source = await resolveSource({ lon: coords[0][0], lat: coords[0][1] });
@@ -3704,17 +3707,18 @@
         }
         if (!best) return { message: 'No GIS centerline runs along this road (within 30 m and parallel), so it was left alone.', warn: true, failed: true };
 
-        const ends = [
+        const ends = [];
+        for (const end of [
             { label: 'A', nodeId: segment.fromNodeId, p: P[0] },
             { label: 'B', nodeId: segment.toNodeId, p: P[P.length - 1] }
-        ].map((end) => {
-            const node = sdk.DataModel.Nodes.getById({ nodeId: end.nodeId });
+        ]) {
+            const node = await sdk.DataModel.Nodes.getById({ nodeId: end.nodeId });
             const n = xyNearest(best.G, end.p[0], end.p[1], best.cumG);
             const neighbours = node ? node.connectedSegmentIds.filter((id) => id !== segmentId) : [];
             const movable = neighbours.length <= 1;
             const at = xyPointAt(best.G, best.cumG, n.pos);
-            return { ...end, neighbours, movable, off: n.d, pos: n.pos, target: movable ? [at.x, at.y] : end.p };
-        });
+            ends.push({ ...end, neighbours, movable, off: n.d, pos: n.pos, target: movable ? [at.x, at.y] : end.p });
+        }
 
         const maxOffset = Math.max(...best.dists, ...ends.map((e) => e.off));
         if (maxOffset < CLEANUP_MIN_SHIFT_M) return { message: `Already on the GIS centerline (within ${CLEANUP_MIN_SHIFT_M} m).`, warn: false, info: true };
@@ -3751,15 +3755,15 @@
         const movedEnds = [];
         for (const end of ends) {
             if (end.movable && end.off > 0.3) {
-                sdk.DataModel.Nodes.moveNode({ id: end.nodeId, geometry: { type: 'Point', coordinates: toLL(end.target) } });
+                await sdk.DataModel.Nodes.moveNode({ id: end.nodeId, geometry: { type: 'Point', coordinates: toLL(end.target) } });
                 movedEnds.push(end);
             }
         }
         await sleep(300);
-        sdk.DataModel.Segments.updateSegment({ segmentId, geometry: { type: 'LineString', coordinates: newCoords } });
+        await sdk.DataModel.Segments.updateSegment({ segmentId, geometry: { type: 'LineString', coordinates: newCoords } });
         await sleep(400);
 
-        const after = sdk.DataModel.Segments.getById({ segmentId });
+        const after = await sdk.DataModel.Segments.getById({ segmentId });
         const parts = [`Snapped onto the GIS centerline by up to ${Math.max(maxShift, ...movedEnds.map((e) => e.off)).toFixed(1)} m (${coords.length} to ${newCoords.length} points).`];
         for (const end of movedEnds) {
             parts.push(`End ${end.label} moved ${end.off.toFixed(1)} m${end.neighbours.length ? ' and reshaped the neighbouring segment' : ''}.`);
@@ -3782,7 +3786,7 @@
     // Clean up mode: click an existing road to move it onto the GIS centerline (and add its house numbers if that is on too).
     async function cleanUpAt(click, existing) {
         const segmentId = existing.segment.id;
-        const name = streetNameOf(segmentId) || 'Road';
+        const name = await streetNameOf(segmentId) || 'Road';
         setStatus(`Snapping ${name}...`, 'info');
         const result = await cleanUpRoad(segmentId);
         const parts = [result.message];
@@ -3790,7 +3794,7 @@
 
         if (houseNumbersEnabled && !result.notFound) {
             const source = await resolveSource(click);
-            const streetName = streetNameOf(segmentId);
+            const streetName = await streetNameOf(segmentId);
             if (source && source.houseNumbers && streetName) {
                 try {
                     const hn = await addHouseNumbers(source, segmentId, streetName);
@@ -3807,17 +3811,17 @@
         setStatus(`${name}: ${parts.join(' ')}`, level);
         console.log(`[${SCRIPT_NAME}] ${name} (segment ${segmentId}): ${parts.join(' ')}`);
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select segment:`, err);
         }
     }
 
     // The nearest live, real road segment within `tolerance` meters of the click, or null.
-    function findExistingRoadAt(click, tolerance = 12) {
+    async function findExistingRoadAt(click, tolerance = 12) {
         const project = makeProjector([click.lon, click.lat]);
         let best = null;
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (!isLiveSegment(segment) || OVERLAP_IGNORED_ROAD_TYPES.has(segment.roadType)) continue;
             const near = xyNearest(segment.geometry.coordinates.map(project), 0, 0);
             if (near.d <= tolerance && (!best || near.d < best.d)) best = { segment, d: near.d };
@@ -3836,13 +3840,13 @@
             setStatus(`No address point layer is checked in WME GIS Layers for ${source.county || 'this'} County (or statewide).`, 'warn');
             return;
         }
-        const best = findExistingRoadAt(click);
+        const best = await findExistingRoadAt(click);
         if (!best) {
             setStatus('No WME road under that click. Click right on the road.', 'warn');
             return;
         }
         const segmentId = best.segment.id;
-        const name = streetNameOf(segmentId);
+        const name = await streetNameOf(segmentId);
         if (!name) {
             setStatus("This segment has no street name, so its house numbers can't be matched. Name it first.", 'warn');
             return;
@@ -3852,7 +3856,7 @@
         setStatus(`${name}: ${result.message}`, result.level || (result.warn ? 'warn' : 'ok'));
         console.log(`[${SCRIPT_NAME}] ${name} (segment ${segmentId}): ${result.message}`);
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select segment:`, err);
         }
@@ -3861,8 +3865,8 @@
     // ------------------------------------------------------------------
     // Import
     // ------------------------------------------------------------------
-    function queryGis(source, lon, lat, buffer = 0.00015) {
-        return source.query({ minLon: lon - buffer, maxLon: lon + buffer, minLat: lat - buffer, maxLat: lat + buffer });
+    async function queryGis(source, lon, lat, buffer = 0.00015) {
+        return await source.query({ minLon: lon - buffer, maxLon: lon + buffer, minLat: lat - buffer, maxLat: lat + buffer });
     }
 
     async function importAt(click, options = {}) {
@@ -3905,7 +3909,7 @@
         }
 
         const { feature, coords } = ranked[0];
-        return importFeature({ source, feature, coords, options });
+        return await importFeature({ source, feature, coords, options });
     }
 
     // Imports one chosen GIS road (the part of importAt after the road is picked). Also used by the area import, which passes
@@ -3937,7 +3941,7 @@
 
         // Both ends must be visible so nearby existing nodes are loaded and can be joined.
         if (REQUIRE_ENDS_ON_SCREEN) {
-            const bounds = visibleBounds();
+            const bounds = await visibleBounds();
             const ends = [coords[0], coords[coords.length - 1]];
             const off = ends.map((c, i) => (isOnScreen(c, bounds) ? null : i === 0 ? 'A' : 'B')).filter(Boolean);
             if (off.length) {
@@ -3957,7 +3961,7 @@
         // A start or end that just runs along an existing road is cut off, so the new road joins where it leaves.
         let trimmed = {};
         if (!options.force) {
-            const result = trimRunIns(coords);
+            const result = await trimRunIns(coords);
             if (Object.keys(result.trimmed).length) {
                 coords.splice(0, coords.length, ...result.coords);
                 trimmed = result.trimmed;
@@ -3968,12 +3972,12 @@
         if (trimmed.to) joinTolerances.to = RUN_IN_JOIN_M;
 
         // 1. Snap endpoints onto loaded nodes, or onto the middle of loaded segments
-        const { snaps, snappedFeatures } = snapEndpoints(coords, joinTolerances);
+        const { snaps, snappedFeatures } = await snapEndpoints(coords, joinTolerances);
 
         // 2. Create the segment, attaching snap info so WME joins nodes / splits segments
         let created;
         try {
-            created = addSegmentWithSnaps(coords, snappedFeatures);
+            created = await addSegmentWithSnaps(coords, snappedFeatures);
         } catch (err) {
             console.error(`[${SCRIPT_NAME}] addSegment failed:`, err);
             return say('failed', 'error', `${name || 'New road'}: could not create segment: ${err.message || err}`);
@@ -3981,7 +3985,7 @@
         const { segmentId, patched } = created;
         if (feature.id !== undefined) importedFeatureIds.add(featureKey);
 
-        let segment = sdk.DataModel.Segments.getById({ segmentId });
+        let segment = await sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) {
             return say('failed', 'error', `${name || 'New road'}: the new segment was created but could not be read back from WME.`, { segmentId });
         }
@@ -3991,8 +3995,8 @@
         const alreadyRight = isOneWay ? segment.isAtoB : segment.isTwoWay;
         if (!alreadyRight) {
             try {
-                sdk.DataModel.Segments.updateSegment({ segmentId, direction: isOneWay ? 'A_TO_B' : 'TWO_WAY' });
-                segment = sdk.DataModel.Segments.getById({ segmentId });
+                await sdk.DataModel.Segments.updateSegment({ segmentId, direction: isOneWay ? 'A_TO_B' : 'TWO_WAY' });
+                segment = await sdk.DataModel.Segments.getById({ segmentId });
             } catch (err) {
                 directionFailed = true;
                 directionNote = `Could not set direction: ${err.message || err}.`;
@@ -4033,7 +4037,7 @@
                 console.warn(`[${SCRIPT_NAME}] resolveCities failed:`, err);
             }
             try {
-                applyAddress(segmentId, name, cityInfo.primaryCity, cityInfo.alternateCities);
+                await applyAddress(segmentId, name, cityInfo.primaryCity, cityInfo.alternateCities);
                 if (cityInfo.summary) messages.push(cityInfo.summary);
             } catch (err) {
                 level = 'warn';
@@ -4049,7 +4053,7 @@
 
         // A split happens synchronously, but give WME a moment to settle before reading node links.
         if (Object.values(snaps).some((sn) => sn.kind === 'edge')) await sleep(300);
-        segment = sdk.DataModel.Segments.getById({ segmentId }) || segment;
+        segment = await sdk.DataModel.Segments.getById({ segmentId }) || segment;
 
         const ends = [
             { label: 'A', snap: snaps.from, actual: segment.fromNodeId },
@@ -4059,7 +4063,7 @@
         for (const end of ends) {
             if (!end.snap) continue;
 
-            const node = sdk.DataModel.Nodes.getById({ nodeId: end.actual });
+            const node = await sdk.DataModel.Nodes.getById({ nodeId: end.actual });
             const connectedCount = node ? node.connectedSegmentIds.length : 0;
             // Node target: the new segment must end on that exact node.
             // Segment target: the split leaves the two halves plus the new segment on one node.
@@ -4111,7 +4115,7 @@
         // 4. Select the new segment (the area import skips this: it would select hundreds of segments in a row)
         if (!quiet) {
             try {
-                sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
+                await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
             } catch (err) {
                 console.warn(`[${SCRIPT_NAME}] Could not select new segment:`, err);
             }
@@ -4258,9 +4262,9 @@
     }
 
     // opts.continueOnMismatch: when the mapped name differs from the GIS name, fill in the cities anyway (the name is left alone) and report it in `mismatch`.
-    function address0Name(segmentId) {
+    async function address0Name(segmentId) {
         try {
-            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            const a = await sdk.DataModel.Segments.getAddress({ segmentId });
             return a.street && !a.street.isEmpty && a.street.name ? String(a.street.name).trim() : '';
         } catch (err) {
             return '';
@@ -4270,12 +4274,12 @@
     // opts.cityOnly: the street name is never changed, added or compared with the GIS; the primary and alternate cities follow the usual rules.
     async function fillSegmentInfo(segmentId, opts = {}) {
         const cityOnly = !!opts.cityOnly;
-        const segment = sdk.DataModel.Segments.getById({ segmentId });
+        const segment = await sdk.DataModel.Segments.getById({ segmentId });
         if (!segment) return { message: 'Segment not found.', warn: true };
-        if (isRoundabout(segment) && !(address0Name(segmentId))) return { message: 'Nothing missing. Roundabouts do not get a street name.', info: true, match: null, mismatch: null };
+        if (isRoundabout(segment) && !(await address0Name(segmentId))) return { message: 'Nothing missing. Roundabouts do not get a street name.', info: true, match: null, mismatch: null };
         const coords = segment.geometry.coordinates;
         const source = await resolveSource({ lon: coords[0][0], lat: coords[0][1] });
-        const address = sdk.DataModel.Segments.getAddress({ segmentId });
+        const address = await sdk.DataModel.Segments.getAddress({ segmentId });
         const cityOf = (x) => (x && x.city && !x.city.isEmpty && x.city.name ? x.city.name : '');
         const currentName = address.street && address.street.name ? address.street.name : '';
         const currentCity = cityOf(address);
@@ -4303,8 +4307,8 @@
                     console.warn(`[${SCRIPT_NAME}] Fill-in after the rename failed:`, err);
                     again = { message: `Renamed, but the city check failed: ${err.message || err}.`, warn: true, error: true };
                 }
-                setStatus(`${streetNameOf(segmentId) || 'Road'}: ${again.message}${extra}`, again.error ? 'error' : again.warn ? 'warn' : again.info ? 'info' : 'ok', again.actions);
-                console.log(`[${SCRIPT_NAME}] ${streetNameOf(segmentId) || 'Road'} (segment ${segmentId}): ${again.message}${extra}`);
+                setStatus(`${await streetNameOf(segmentId) || 'Road'}: ${again.message}${extra}`, again.error ? 'error' : again.warn ? 'warn' : again.info ? 'info' : 'ok', again.actions);
+                console.log(`[${SCRIPT_NAME}] ${await streetNameOf(segmentId) || 'Road'} (segment ${segmentId}): ${again.message}${extra}`);
                 ccRequestCheck(150, true);
             };
             return {
@@ -4318,7 +4322,7 @@
                             cityNote = await ccApplyNameAndCity(segmentId, { kind: 'name', name: gisName });
                         } catch (err) {
                             console.warn(`[${SCRIPT_NAME}] Rename failed:`, err);
-                            setStatus(`${streetNameOf(segmentId) || 'Road'}: could not rename (${err.message || err}).`, 'error');
+                            setStatus(`${await streetNameOf(segmentId) || 'Road'}: could not rename (${err.message || err}).`, 'error');
                             return;
                         }
                         await rerun(cityNote);
@@ -4443,29 +4447,29 @@
             return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match, mismatch: mismatchInfo };
         }
 
-        const { country, state } = regionOf(segmentId);
+        const { country, state } = await regionOf(segmentId);
         if (!country || !state) return { message: `Could not fill in the address: ${REGION_ERROR}.`, warn: true, match };
         const alternateStreetIds = [];
         for (const x of currentAlts) {
             let id = x.street.id;
             if (blankAltFix && !cityOf(x)) {
                 const cityName = blankAltFix.city;
-                let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
-                if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
-                let street = sdk.DataModel.Streets.getStreet({ streetName: x.street.name, cityId: city.id });
-                if (!street) street = sdk.DataModel.Streets.addStreet({ streetName: x.street.name, cityId: city.id });
+                let city = await sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+                if (!city) city = await sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
+                let street = await sdk.DataModel.Streets.getStreet({ streetName: x.street.name, cityId: city.id });
+                if (!street) street = await sdk.DataModel.Streets.addStreet({ streetName: x.street.name, cityId: city.id });
                 id = street.id;
             }
             if (!alternateStreetIds.includes(id)) alternateStreetIds.push(id);
         }
         for (const cityName of newAltCities) {
-            let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
-            if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
-            let street = sdk.DataModel.Streets.getStreet({ streetName: name, cityId: city.id });
-            if (!street) street = sdk.DataModel.Streets.addStreet({ streetName: name, cityId: city.id });
+            let city = await sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+            if (!city) city = await sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
+            let street = await sdk.DataModel.Streets.getStreet({ streetName: name, cityId: city.id });
+            if (!street) street = await sdk.DataModel.Streets.addStreet({ streetName: name, cityId: city.id });
             alternateStreetIds.push(street.id);
         }
-        sdk.DataModel.Segments.updateAddress({
+        await sdk.DataModel.Segments.updateAddress({
             segmentId,
             addressData: { streetName: name, cityName: primary, countryId: country.id, stateId: state.id, alternateStreetIds }
         });
@@ -4489,12 +4493,12 @@
             console.warn(`[${SCRIPT_NAME}] fillSegmentInfo failed:`, err);
             result = { message: `Could not fill in info: ${err.message || err}.`, warn: true, error: true };
         }
-        const label = `${streetNameOf(segmentId) || 'Road'}:`;
+        const label = `${await streetNameOf(segmentId) || 'Road'}:`;
         const text = `${label} ${result.message}`;
         setStatus(text, result.error ? 'error' : result.warn ? 'warn' : result.info ? 'info' : 'ok', result.actions);
         console.log(`[${SCRIPT_NAME}] ${label.slice(0, -1)} (segment ${segmentId}): ${result.message}`);
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [segmentId] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select segment:`, err);
         }
@@ -4564,10 +4568,10 @@
 
         try {
             // getLonLatFromPixel expects page (client) pixel coordinates, not map-relative ones.
-            const click = sdk.Map.getLonLatFromPixel({ x: e.clientX, y: e.clientY });
+            const click = await sdk.Map.getLonLatFromPixel({ x: e.clientX, y: e.clientY });
             // a click this close to a mapped road counts as clicking that road (tighter for Roads, so an unmapped GIS
             // road that starts beside a mapped one can still be clicked to import it)
-            const existing = cleanUpEnabled ? findExistingRoadAt(click) : importRoadsEnabled ? findExistingRoadAt(click, 8) : null;
+            const existing = cleanUpEnabled ? await findExistingRoadAt(click) : importRoadsEnabled ? await findExistingRoadAt(click, 8) : null;
             if (importRoadsEnabled && e.shiftKey) {
                 await importAt(click, { force: true });
             } else if (cleanUpEnabled && existing) {
@@ -4581,8 +4585,8 @@
                     prependStatus(fill.text, fill.warn ? 'warn' : 'ok');
                 } else if (fill.match) {
                     // ...and if it is a stub the GIS road continues past, extend it as before
-                    const stub = sdk.DataModel.Segments.getById({ segmentId: existing.segment.id });
-                    if (stub && planExtension(fill.match.part, stub)) {
+                    const stub = await sdk.DataModel.Segments.getById({ segmentId: existing.segment.id });
+                    if (stub && await planExtension(fill.match.part, stub)) {
                         await importAt(click, {});
                         prependStatus(fill.text, fill.warn ? 'warn' : 'ok');
                     }
@@ -4703,10 +4707,10 @@
 
     // ----- map layer (SDK) -----
     let areaLayerReady = false;
-    function ensureAreaLayer() {
+    async function ensureAreaLayer() {
         if (areaLayerReady) return true;
         try {
-            sdk.Map.addLayer({
+            await sdk.Map.addLayer({
                 layerName: AREA.LAYER,
                 styleRules: [
                     { predicate: (p) => p.kind === 'fill', style: { fillColor: COLOUR_ROADS, fillOpacity: 0.07, strokeOpacity: 0, strokeWidth: 0 } },
@@ -4736,10 +4740,10 @@
         return areaLayerReady;
     }
 
-    function drawAreaLayer() {
-        if (!ensureAreaLayer()) return;
+    async function drawAreaLayer() {
+        if (!await ensureAreaLayer()) return;
         try {
-            sdk.Map.removeAllFeaturesFromLayer({ layerName: AREA.LAYER });
+            await sdk.Map.removeAllFeaturesFromLayer({ layerName: AREA.LAYER });
         } catch (err) { /* layer empty */ }
         const pts = area.points;
         const features = [];
@@ -4760,43 +4764,43 @@
         if (nowCoords) features.push({ type: 'Feature', id: 'halo', geometry: { type: 'LineString', coordinates: nowCoords }, properties: { kind: 'halo' } });
         if (!features.length) return;
         try {
-            sdk.Map.addFeaturesToLayer({ layerName: AREA.LAYER, features });
+            await sdk.Map.addFeaturesToLayer({ layerName: AREA.LAYER, features });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not draw the area import layer:`, err);
         }
     }
 
     // ----- the map: zoom, move, wait for WME's data -----
-    function areaZoomOk() {
+    async function areaZoomOk() {
         try {
-            return sdk.Map.getZoomLevel() >= AREA.MIN_ZOOM;
+            return await sdk.Map.getZoomLevel() >= AREA.MIN_ZOOM;
         } catch (e) {
             return true;
         }
     }
 
-    function areaMoveTo(lon, lat) {
-        if (!areaZoomOk()) {
+    async function areaMoveTo(lon, lat) {
+        if (!await areaZoomOk()) {
             if (typeof sdk.Map.setZoomLevel === 'function') {
-                sdk.Map.setZoomLevel({ zoomLevel: AREA.WORK_ZOOM });
+                await sdk.Map.setZoomLevel({ zoomLevel: AREA.WORK_ZOOM });
             } else {
-                sdk.Map.zoomToExtent({ bbox: [lon - 0.003, lat - 0.002, lon + 0.003, lat + 0.002] });
+                await sdk.Map.zoomToExtent({ bbox: [lon - 0.003, lat - 0.002, lon + 0.003, lat + 0.002] });
                 return;
             }
         }
-        sdk.Map.setMapCenter({ lonLat: { lon, lat } });
+        await sdk.Map.setMapCenter({ lonLat: { lon, lat } });
     }
 
     // A sweep's stops are sized from the current view, so zoomed in tight (zoom 19) a subdivision needs many times more stops than at
     // zoom 16 (4x per level). Zooms out to the lowest level where WME still holds every segment and returns where the map was, so the
     // view can be put back when the run ends.
-    function areaSweepZoomOut() {
-        const b = visibleBounds();
+    async function areaSweepZoomOut() {
+        const b = await visibleBounds();
         const home = { lon: (b.minLon + b.maxLon) / 2, lat: (b.minLat + b.maxLat) / 2, zoom: null };
         try {
-            home.zoom = sdk.Map.getZoomLevel();
+            home.zoom = await sdk.Map.getZoomLevel();
             if (home.zoom > AREA.MIN_ZOOM && typeof sdk.Map.setZoomLevel === 'function') {
-                sdk.Map.setZoomLevel({ zoomLevel: AREA.MIN_ZOOM });
+                await sdk.Map.setZoomLevel({ zoomLevel: AREA.MIN_ZOOM });
             }
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not zoom out for the sweep:`, err);
@@ -4804,11 +4808,11 @@
         return home;
     }
 
-    function areaSweepRestore(home) {
+    async function areaSweepRestore(home) {
         if (!home) return;
         try {
-            if (home.zoom != null && typeof sdk.Map.setZoomLevel === 'function') sdk.Map.setZoomLevel({ zoomLevel: home.zoom });
-            sdk.Map.setMapCenter({ lonLat: { lon: home.lon, lat: home.lat } });
+            if (home.zoom != null && typeof sdk.Map.setZoomLevel === 'function') await sdk.Map.setZoomLevel({ zoomLevel: home.zoom });
+            await sdk.Map.setMapCenter({ lonLat: { lon: home.lon, lat: home.lat } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not put the map view back:`, err);
         }
@@ -4821,9 +4825,9 @@
     }
 
     // Both ends (and the middle) of a road well inside the view, and the map zoomed in enough that WME holds every segment there?
-    function areaRoadInView(coords) {
-        if (!areaZoomOk()) return false;
-        const b = visibleBounds();
+    async function areaRoadInView(coords) {
+        if (!await areaZoomOk()) return false;
+        const b = await visibleBounds();
         const w = (b.maxLon - b.minLon) * AREA.VIEW_MARGIN;
         const h = (b.maxLat - b.minLat) * AREA.VIEW_MARGIN;
         const inner = { minLon: b.minLon + w, maxLon: b.maxLon - w, minLat: b.minLat + h, maxLat: b.maxLat - h };
@@ -4833,14 +4837,14 @@
 
     // Brings a road into view (zooming out to fit it when it is longer than the view) and lets WME load around it.
     async function areaShowRoad(coords) {
-        if (areaRoadInView(coords)) return;
+        if (await areaRoadInView(coords)) return;
         const box = areaBox(coords);
-        const view = visibleBounds();
+        const view = await visibleBounds();
         const fits = (box.maxLon - box.minLon) < (view.maxLon - view.minLon) * 0.8 && (box.maxLat - box.minLat) < (view.maxLat - view.minLat) * 0.8;
         if (fits) {
-            areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
+            await areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
         } else {
-            sdk.Map.zoomToExtent({ bbox: [box.minLon, box.minLat, box.maxLon, box.maxLat] });
+            await sdk.Map.zoomToExtent({ bbox: [box.minLon, box.minLat, box.maxLon, box.maxLat] });
         }
         await areaWaitForData();
     }
@@ -4936,17 +4940,17 @@
     }
 
     // What importing this road would do, without doing it. Mirrors the decisions in handleOverlap().
-    function areaClassify(coords, name) {
-        const analysis = analyzeOverlap(coords);
+    async function areaClassify(coords, name) {
+        const analysis = await analyzeOverlap(coords);
         if (analysis.unionLen < OVERLAP_MIN_M) return 'new';
         const stubMatch = analysis.matches
             .filter((m) => m.segFraction >= STUB_FRACTION && m.segCovered >= OVERLAP_MIN_M)
             .sort((a, b) => b.segCovered - a.segCovered)[0];
-        const plan = stubMatch ? planExtension(coords, stubMatch.segment) : null;
+        const plan = stubMatch ? await planExtension(coords, stubMatch.segment) : null;
         if (plan) {
-            const stubName = streetNameOf(stubMatch.segment.id);
+            const stubName = await streetNameOf(stubMatch.segment.id);
             if (stubName && name && normalizeName(stubName) !== normalizeName(name)) return 'mapped';
-            const beyond = analyzeOverlap(plan.outward, [stubMatch.segment.id]);
+            const beyond = await analyzeOverlap(plan.outward, [stubMatch.segment.id]);
             if (beyond.unionFraction >= PARTIAL_OVERLAP_FRACTION && beyond.unionLen >= OVERLAP_MIN_M) return 'mapped';
             return 'extend';
         }
@@ -4956,7 +4960,7 @@
 
     // Import order: roads that touch the existing network first, then roads that touch those, and so on, so every batch that
     // is saved is connected to something (a batch of loose roads makes WME warn about isolated segments).
-    function areaOrder(items) {
+    async function areaOrder(items) {
         const touches = (a, b) => {
             const ends = [a.coords[0], a.coords[a.coords.length - 1]];
             if (ends.some((c) => distanceToLine({ lon: c[0], lat: c[1] }, b.coords) <= AREA.CONNECT_M)) return true;
@@ -4966,18 +4970,18 @@
         if (items.length > 600) return items; // too many to sort by connection quickly; keep the order the GIS gave them
         const seeds = [];
         const rest = [];
-        items.forEach((it, i) => {
+        for (const [i, it] of items.entries()) {
             it.idx = i;
             let seeded = it.kind === 'extend';
             if (!seeded && it.kind !== 'unchecked') {
                 try {
-                    seeded = Object.keys(snapEndpoints(it.coords.map((c) => [...c])).snaps).length > 0;
+                    seeded = Object.keys((await snapEndpoints(it.coords.map((c) => [...c]))).snaps).length > 0;
                 } catch (e) {
                     seeded = false;
                 }
             }
             (seeded ? seeds : rest).push(it);
-        });
+        }
         const ordered = [];
         const seen = new Set();
         const walk = (start) => {
@@ -5025,7 +5029,7 @@
             area.source = picked.source;
             const box = areaBox(area.points);
             // Fit the map to the outline, so WME loads the segments there and "already in WME" can be judged.
-            sdk.Map.zoomToExtent({ bbox: [box.minLon, box.minLat, box.maxLon, box.maxLat] });
+            await sdk.Map.zoomToExtent({ bbox: [box.minLon, box.minLat, box.maxLon, box.maxLat] });
             await areaWaitForData();
 
             const gis = await areaQueryRoads(area.source, box, (n, total) => areaSetMessage('info', `Asking the GIS for roads... ${n} of ${total} areas.`));
@@ -5050,11 +5054,11 @@
             for (const it of items) {
                 if (importedFeatureIds.has(it.key)) {
                     it.kind = 'mapped';
-                } else if (!areaRoadInView(it.coords)) {
+                } else if (!await areaRoadInView(it.coords)) {
                     it.kind = 'unchecked';
                 } else {
                     try {
-                        it.kind = areaClassify(it.coords, it.name);
+                        it.kind = await areaClassify(it.coords, it.name);
                     } catch (err) {
                         console.warn(`[${SCRIPT_NAME}] Could not compare a road with WME:`, err);
                         it.kind = 'unchecked';
@@ -5062,9 +5066,9 @@
                 }
                 it.draw = it.kind;
             }
-            area.roads = areaOrder(items);
+            area.roads = await areaOrder(items);
             area.phase = 'previewed';
-            drawAreaLayer();
+            await drawAreaLayer();
             const c = areaCounts();
             const extra = gis.truncated ? ' Some areas returned the GIS limit of 2000 roads, so roads may be missing: draw a smaller outline.' : '';
             if (!c.total) {
@@ -5157,7 +5161,7 @@
             if (!result.nothing) run.saves++;
             return true;
         }
-        if (result.warnings) return areaWaitForUserSave(run, result.why);
+        if (result.warnings) return await areaWaitForUserSave(run, result.why);
         run.stop = true;
         run.stopReason = `Save did not finish: ${result.why}`;
         return false;
@@ -5178,7 +5182,7 @@
         return `${ending} ${what} (${time}).${saved}${look}`;
     }
 
-    function areaFinishRun(run, level, ending) {
+    async function areaFinishRun(run, level, ending) {
         // after roads: done. After anything else: back to where the outline was (so Go is still there when the roads are not imported yet)
         area.phase = run.kind === 'roads' ? 'done' : area.roads.length ? (area.roadsDone ? 'done' : 'previewed') : 'ready';
         area.nowIndex = -1;
@@ -5186,7 +5190,7 @@
         area.run = run;
         busy = false;
         areaRunning = false;
-        drawAreaLayer();
+        await drawAreaLayer();
         const summary = areaRunSummary(run, ending);
         console.log(`[${SCRIPT_NAME}] Area ${run.kind} run: ${summary}`);
         for (const entry of run.needLook) console.log(`[${SCRIPT_NAME}]   needs a look: ${entry.name}: ${entry.message}`);
@@ -5228,7 +5232,7 @@
             for (const item of todo) {
                 if (!(await areaGate())) break;
                 area.nowIndex = area.roads.indexOf(item);
-                drawAreaLayer();
+                await drawAreaLayer();
                 renderAreaPanel();
                 let result;
                 try {
@@ -5268,14 +5272,14 @@
         }
         run.running = false;
         if (run.created || run.extended) area.roadsDone = true;
-        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
-        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
-        else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
+        if (failedHard) await areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) await areaFinishRun(run, 'warn', 'Stopped by you.');
+        else await areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
     }
 
     // House numbers: sweeps the map across the outline and, at each stop, adds the missing numbers to the named segments inside it.
-    function areaSweepCenters(box) {
-        const view = visibleBounds();
+    async function areaSweepCenters(box) {
+        const view = await visibleBounds();
         const w = (view.maxLon - view.minLon) * 0.7;
         const h = (view.maxLat - view.minLat) * 0.7;
         const cols = Math.max(1, Math.ceil((box.maxLon - box.minLon) / w));
@@ -5324,24 +5328,24 @@
         areaSetMessage('info', 'Adding house numbers across the outline...');
         const handled = new Set();
         let failedHard = false;
-        const home = areaSweepZoomOut();
+        const home = await areaSweepZoomOut();
         try {
             const box = areaBox(area.points);
-            areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
+            await areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
             await areaWaitForData();
-            const centers = areaSweepCenters(box);
-            console.log(`[${SCRIPT_NAME}] House number sweep: ${centers.length} map stops at zoom ${sdk.Map.getZoomLevel()}.`);
+            const centers = await areaSweepCenters(box);
+            console.log(`[${SCRIPT_NAME}] House number sweep: ${centers.length} map stops at zoom ${await sdk.Map.getZoomLevel()}.`);
             if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error(`the outline is too big for one house number run (${centers.length} map stops, the limit is ${AREA.MAX_SWEEP_STOPS}). Draw it in smaller parts.`);
             run.stops = centers.length;
             for (let s = 0; s < centers.length; s++) {
                 if (!(await areaGate())) break;
                 run.stopAt = s + 1;
-                areaMoveTo(centers[s].lon, centers[s].lat);
+                await areaMoveTo(centers[s].lon, centers[s].lat);
                 await areaWaitForData();
                 renderAreaPanel();
-                const view = visibleBounds();
+                const view = await visibleBounds();
                 const targets = [];
-                for (const segment of sdk.DataModel.Segments.getAll()) {
+                for (const segment of await sdk.DataModel.Segments.getAll()) {
                     if (handled.has(segment.id) || !isLiveSegment(segment) || OVERLAP_IGNORED_ROAD_TYPES.has(segment.roadType)) continue;
                     const mid = pointAlongLine(segment.geometry.coordinates, 0.5);
                     if (!isOnScreen(mid, view) || !areaPointInRing(mid, area.points)) continue;
@@ -5350,7 +5354,7 @@
                 for (const target of targets) {
                     if (!(await areaGate())) break;
                     handled.add(target.id);
-                    const name = streetNameOf(target.id);
+                    const name = await streetNameOf(target.id);
                     run.done++;
                     if (!name) {
                         run.skipped++;
@@ -5386,11 +5390,11 @@
             run.stopReason = `Stopped: ${err.message || err}`;
             failedHard = true;
         }
-        areaSweepRestore(home);
+        await areaSweepRestore(home);
         run.running = false;
-        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
-        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
-        else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
+        if (failedHard) await areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) await areaFinishRun(run, 'warn', 'Stopped by you.');
+        else await areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
     }
 
     // ----- existing segments the scan flags: Check flagged (counts them) and Fix flagged (fixes them) -----
@@ -5404,18 +5408,18 @@
     }
 
     // Segments in this view whose midpoint is inside the outline and that the scan would flag (the scan's own rules).
-    function areaFlaggedInView(view, places, handled) {
+    async function areaFlaggedInView(view, places, handled) {
         const found = [];
-        for (const segment of sdk.DataModel.Segments.getAll()) {
+        for (const segment of await sdk.DataModel.Segments.getAll()) {
             if (handled.has(segment.id) || !isLiveSegment(segment)) continue;
             const c = segment.geometry && segment.geometry.coordinates;
             if (!c || c.length < 2) continue;
             const mid = pointAlongLine(c, 0.5);
             if (!isOnScreen(mid, view) || !areaPointInRing(mid, area.points)) continue;
-            const hit = evaluateSegmentInfo(segment, places, true);
+            const hit = await evaluateSegmentInfo(segment, places, true);
             if (!hit) continue;
             // extra = only flagged because the area runs also look at the short segments the map scan excuses
-            const extra = !evaluateSegmentInfo(segment, places);
+            const extra = !await evaluateSegmentInfo(segment, places);
             found.push({ ...hit, extra, coords: c.map((p) => [p[0], p[1]]), mid, draw: `gap-${hit.kind}` });
         }
         return found;
@@ -5424,26 +5428,26 @@
     // Moves the map across the outline, stop by stop, and calls handler(view) at each stop (WME only holds the segments in view).
     // Returns false if the handler or the user ended it early.
     async function areaSweep(run, handler) {
-        const home = areaSweepZoomOut();
+        const home = await areaSweepZoomOut();
         try {
             const box = areaBox(area.points);
-            areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
+            await areaMoveTo((box.minLon + box.maxLon) / 2, (box.minLat + box.maxLat) / 2);
             await areaWaitForData();
-            const centers = areaSweepCenters(box);
-            console.log(`[${SCRIPT_NAME}] Area sweep: ${centers.length} map stops at zoom ${sdk.Map.getZoomLevel()}.`);
+            const centers = await areaSweepCenters(box);
+            console.log(`[${SCRIPT_NAME}] Area sweep: ${centers.length} map stops at zoom ${await sdk.Map.getZoomLevel()}.`);
             if (centers.length > AREA.MAX_SWEEP_STOPS) throw new Error(`the outline is too big for one pass over the map (${centers.length} map stops, the limit is ${AREA.MAX_SWEEP_STOPS}). Draw it in smaller parts.`);
             run.stops = centers.length;
             for (let s = 0; s < centers.length; s++) {
                 if (!(await areaGate())) return false;
                 run.stopAt = s + 1;
-                areaMoveTo(centers[s].lon, centers[s].lat);
+                await areaMoveTo(centers[s].lon, centers[s].lat);
                 await areaWaitForData();
                 renderAreaPanel();
-                if ((await handler(visibleBounds())) === false) return false;
+                if ((await handler(await visibleBounds())) === false) return false;
             }
             return true;
         } finally {
-            areaSweepRestore(home);
+            await areaSweepRestore(home);
         }
     }
 
@@ -5461,26 +5465,26 @@
         let changed = false;
         let renamed = false;
         let cleared = false;
-        const before = ccAddressOf(id);
+        const before = await ccAddressOf(id);
         const originalPrimary = before ? before.primary : '';
 
         // an exempt road type (trail, railroad, ferry...) with a primary city: the city is cleared, nothing else is touched
         if (t.kind === 'exemptcity') {
             if (!before || !before.primary) return { outcome: 'unchanged', changed: false, renamed: false, message: 'It has no primary city now.' };
-            ccApply(id, { kind: 'primary', city: '' });
+            await ccApply(id, { kind: 'primary', city: '' });
             cityCheckCache.clear();
-            const seg = sdk.DataModel.Segments.getById({ segmentId: id });
-            const left = seg ? evaluateSegmentInfo(seg, places, true) : null;
+            const seg = await sdk.DataModel.Segments.getById({ segmentId: id });
+            const left = seg ? await evaluateSegmentInfo(seg, places, true) : null;
             if (left) return { outcome: 'review', changed: true, renamed: false, message: `Still flagged (${left.detail}).` };
             return { outcome: 'fixed', changed: true, renamed: false, message: `Cleared the primary city ${before.primary} (this road type is mapped with no city).` };
         }
 
         // a street type written twice ("Weston Dr Drive") is written once
         if (!cityOnly) {
-            const current = ccAddressOf(id);
+            const current = await ccAddressOf(id);
             const single = current && current.name ? fixRepeatedType(current.name) : '';
             if (single) {
-                ccApply(id, { kind: 'name', name: single });
+                await ccApply(id, { kind: 'name', name: single });
                 changed = true;
                 renamed = true;
                 notes.push(`Renamed "${current.name}" to "${single}" (type or direction was written twice).`);
@@ -5491,17 +5495,17 @@
         const analysis = await ccAnalyze(id, false);
         const primary = (analysis.proposals || []).find((p) => p.kind === 'primary');
         if (primary && primary.city) {
-            ccApply(id, primary);
+            await ccApply(id, primary);
             changed = true;
             notes.push(`${primary.label}.`);
         } else if (primary && t.kind === 'badcity' && originalPrimary) {
-            ccApply(id, primary);
+            await ccApply(id, primary);
             changed = true;
             cleared = true;
             notes.push(`Cleared the primary city ${originalPrimary} (it is outside every city and CDP limit).`);
         }
 
-        const fillTarget = sdk.DataModel.Segments.getById({ segmentId: id });
+        const fillTarget = await sdk.DataModel.Segments.getById({ segmentId: id });
         const skipFill = !!(fillTarget && !NAME_EXPECTED_TYPES.has(fillTarget.roadType) && fillTarget.roadType !== 17 && !(before && before.name));
         const fill = skipFill
             ? { message: '', mismatch: null }
@@ -5513,23 +5517,23 @@
         }
 
         if (fill.mismatch) {
-            ccApply(id, { kind: 'name', name: fill.mismatch.gis });
+            await ccApply(id, { kind: 'name', name: fill.mismatch.gis });
             changed = true;
             renamed = true;
             notes.push(`Renamed "${fill.mismatch.mapped}" to "${fill.mismatch.gis}" (GIS).`);
         }
         if (changed) cityCheckCache.clear();
 
-        let segment = sdk.DataModel.Segments.getById({ segmentId: id });
-        let after = segment ? evaluateSegmentInfo(segment, places, true) : null;
+        let segment = await sdk.DataModel.Segments.getById({ segmentId: id });
+        let after = segment ? await evaluateSegmentInfo(segment, places, true) : null;
 
         // the primary was cleared but no city took its place: a segment with no city at all is worse, so put it back
         if (cleared && after && (after.kind === 'city' || after.kind === 'none')) {
-            ccApply(id, { kind: 'primary', city: originalPrimary });
+            await ccApply(id, { kind: 'primary', city: originalPrimary });
             cityCheckCache.clear();
             notes.push(`No postal city was found to take its place, so ${originalPrimary} was put back.`);
-            segment = sdk.DataModel.Segments.getById({ segmentId: id });
-            after = segment ? evaluateSegmentInfo(segment, places, true) : null;
+            segment = await sdk.DataModel.Segments.getById({ segmentId: id });
+            after = segment ? await evaluateSegmentInfo(segment, places, true) : null;
         }
         // city only: a name that is still missing or differs is not this run's business
         if (cityOnly && after && !CITY_ONLY_KINDS.has(after.kind)) after = null;
@@ -5558,12 +5562,12 @@
             const places = await areaPlaces();
             const handled = new Set();
             await areaSweep(run, async (view) => {
-                for (const t of areaFlaggedInView(view, places, handled)) {
+                for (const t of await areaFlaggedInView(view, places, handled)) {
                     handled.add(t.id);
                     area.fix.items.push(t);
                     run.found++;
                 }
-                drawAreaLayer();
+                await drawAreaLayer();
             });
             const byKind = {};
             area.fix.items.forEach((t) => { byKind[t.kind] = (byKind[t.kind] || 0) + 1; });
@@ -5581,9 +5585,9 @@
             failedHard = true;
         }
         run.running = false;
-        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
-        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
-        else areaFinishRun(run, area.fix.items.length ? 'warn' : 'ok', 'Done.');
+        if (failedHard) await areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) await areaFinishRun(run, 'warn', 'Stopped by you.');
+        else await areaFinishRun(run, area.fix.items.length ? 'warn' : 'ok', 'Done.');
     }
 
     // Fixes the flagged segments in the outline, one at a time, saving every 25 changes (same rules as the road import).
@@ -5610,7 +5614,7 @@
             places = await areaPlaces();
             const handled = new Set();
             await areaSweep(run, async (view) => {
-                for (const t of areaFlaggedInView(view, places, handled)) {
+                for (const t of await areaFlaggedInView(view, places, handled)) {
                     if (cityOnly && !CITY_ONLY_KINDS.has(t.kind)) continue; // a name problem: left for Fix flagged
                     if (!(await areaGate())) return false;
                     if (run.done >= AREA.MAX_ROADS) {
@@ -5621,7 +5625,7 @@
                     run.done++;
                     area.fix.items.push(t);
                     area.nowCoords = t.coords;
-                    drawAreaLayer();
+                    await drawAreaLayer();
                     renderAreaPanel();
                     let result;
                     try {
@@ -5680,26 +5684,28 @@
         }
         run.running = false;
         // fixed segments lose their mark (the green is only for while the run is going); a mark stays only on a segment that is still flagged
-        area.fix.items = area.fix.items.filter((t) => {
-            if (t.draw === 'ok') return false;
+        const stillFlagged = [];
+        for (const t of area.fix.items) {
+            if (t.draw === 'ok') continue;
             try {
-                const seg = sdk.DataModel.Segments.getById({ segmentId: t.id });
-                return !!(seg && evaluateSegmentInfo(seg, places, true));
+                const seg = await sdk.DataModel.Segments.getById({ segmentId: t.id });
+                if (seg && await evaluateSegmentInfo(seg, places, true)) stillFlagged.push(t);
             } catch (err) {
-                return false;
+                /* no longer there: dropped */
             }
-        });
+        }
+        area.fix.items = stillFlagged;
         area.fix.counts = null;
         gapSignature = ''; // forces the scan to redraw its highlights from the segments as they are now
         scheduleGapScan(300);
-        if (failedHard) areaFinishRun(run, 'error', run.stopReason);
-        else if (run.stop) areaFinishRun(run, 'warn', 'Stopped by you.');
-        else if (limitHit) areaFinishRun(run, 'warn', `Reached the limit of ${AREA.MAX_ROADS} segments for one run, so the rest are still flagged: run ${cityOnly ? 'Fix cities only' : 'Fix flagged'} again.`);
-        else areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
+        if (failedHard) await areaFinishRun(run, 'error', run.stopReason);
+        else if (run.stop) await areaFinishRun(run, 'warn', 'Stopped by you.');
+        else if (limitHit) await areaFinishRun(run, 'warn', `Reached the limit of ${AREA.MAX_ROADS} segments for one run, so the rest are still flagged: run ${cityOnly ? 'Fix cities only' : 'Fix flagged'} again.`);
+        else await areaFinishRun(run, run.needLook.length ? 'warn' : 'ok', 'Done.');
     }
 
     // ----- drawing the outline -----
-    function areaStartDrawing() {
+    async function areaStartDrawing() {
         if (area.phase === 'running' || area.phase === 'previewing') return;
         area.phase = 'drawing';
         areaDrawing = true;
@@ -5712,11 +5718,11 @@
         area.fix = { items: [], counts: null };
         area.lastClick = null;
         areaSetMessage('info', 'Click the corners of the area on the map. Double-click the last corner (or press Finish) to close the outline. Escape cancels.');
-        drawAreaLayer();
+        await drawAreaLayer();
         applyToggleState(); // hides the cursor ring and the hover tip's reasons while drawing
     }
 
-    function areaFinishDrawing() {
+    async function areaFinishDrawing() {
         if (area.phase !== 'drawing') return;
         areaDrawing = false;
         if (area.points.length < 3) {
@@ -5726,11 +5732,11 @@
             area.phase = 'ready';
             areaSetMessage('info', 'Outline closed. Press Preview to see which GIS roads it would import. Roads that cross the outline are imported whole, so draw it close to the edge you want.');
         }
-        drawAreaLayer();
+        await drawAreaLayer();
         applyToggleState();
     }
 
-    function areaClear() {
+    async function areaClear() {
         if (area.phase === 'running') return;
         areaDrawing = false;
         area.phase = 'idle';
@@ -5743,12 +5749,12 @@
         area.roadsDone = false;
         area.fix = { items: [], counts: null };
         area.message = { level: 'info', text: '' };
-        drawAreaLayer();
+        await drawAreaLayer();
         applyToggleState();
         renderAreaPanel();
     }
 
-    mapDiv.addEventListener('click', (e) => {
+    mapDiv.addEventListener('click', async (e) => {
         if (area.phase !== 'drawing') return;
         if (!e.isTrusted || typeof e.clientX !== 'number' || typeof e.clientY !== 'number') return;
         if (pressWasDrag()) return; // the map was being panned: not a corner
@@ -5760,34 +5766,34 @@
         // the second click of a double-click lands on the same spot a moment after the first
         if (last && now - last.t < 450 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 8) return;
         area.lastClick = { t: now, x: e.clientX, y: e.clientY };
-        const ll = sdk.Map.getLonLatFromPixel({ x: e.clientX, y: e.clientY });
+        const ll = await sdk.Map.getLonLatFromPixel({ x: e.clientX, y: e.clientY });
         area.points.push([ll.lon, ll.lat]);
-        drawAreaLayer();
+        await drawAreaLayer();
         renderAreaPanel();
     }, true);
 
-    mapDiv.addEventListener('dblclick', (e) => {
+    mapDiv.addEventListener('dblclick', async (e) => {
         if (area.phase !== 'drawing') return;
         e.stopImmediatePropagation();
         e.stopPropagation();
         e.preventDefault();
-        areaFinishDrawing();
+        await areaFinishDrawing();
     }, true);
 
-    document.addEventListener('keydown', (e) => {
+    document.addEventListener('keydown', async (e) => {
         if (e.key === 'Escape') {
             if (area.phase === 'running' && area.run && !area.run.stop) {
                 area.run.stop = true;
                 areaSetMessage('info', 'Stopping after the road in progress...');
             } else if (area.phase === 'drawing') {
-                areaClear();
+                await areaClear();
             } else if (area.phase === 'previewing') {
                 area.phase = 'ready';
             }
         } else if (e.key === 'Backspace' && area.phase === 'drawing' && !/^(input|textarea|select)$/i.test((document.activeElement && document.activeElement.tagName) || '')) {
             e.preventDefault();
             area.points.pop();
-            drawAreaLayer();
+            await drawAreaLayer();
             renderAreaPanel();
         }
     });
@@ -5869,10 +5875,10 @@
         if (!entry.at) return;
         (async () => {
             try {
-                areaMoveTo(entry.at[0], entry.at[1]);
+                await areaMoveTo(entry.at[0], entry.at[1]);
                 await areaWaitForData();
-                const hit = findExistingRoadAt({ lon: entry.at[0], lat: entry.at[1] }, 15);
-                if (hit) sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.segment.id] } });
+                const hit = await findExistingRoadAt({ lon: entry.at[0], lat: entry.at[1] }, 15);
+                if (hit) await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.segment.id] } });
             } catch (err) {
                 console.warn(`[${SCRIPT_NAME}] Could not go to that road:`, err);
             }
@@ -5896,11 +5902,11 @@
             saveAreaPanelPos();
             positionAreaPanel();
         });
-        const close = areaButton('×', () => {
+        const close = areaButton('×', async () => {
             if (area.phase === 'running') area.panelOpen = false;
             else {
                 area.panelOpen = false;
-                areaClear();
+                await areaClear();
             }
             renderAreaPanel();
         }, { title: area.phase === 'running' ? 'Hide this panel (the run continues; the Area button brings it back)' : 'Close and clear the outline' });
@@ -5946,7 +5952,7 @@
         } else if (phase === 'drawing') {
             rowOf('', [
                 areaButton('Finish', areaFinishDrawing, { primary: true, disabled: area.points.length < 3 }),
-                areaButton('Undo point', () => { area.points.pop(); drawAreaLayer(); renderAreaPanel(); }, { disabled: !area.points.length }),
+                areaButton('Undo point', async () => { area.points.pop(); await drawAreaLayer(); renderAreaPanel(); }, { disabled: !area.points.length }),
                 areaButton('Cancel', areaClear)
             ]);
         } else if (phase === 'previewing') {
@@ -5963,8 +5969,8 @@
             const cityCount = area.fix.counts ? ` (${cityFlagged})` : '';
             rowOf('Existing segments', [
                 areaButton('Check flagged', areaRunCheck, { title: 'Counts the segments in the outline that the scan flags (no name, no city, primary city outside the limits). Changes nothing.' }),
-                areaButton(`Fix cities only${cityCount}`, () => areaRunFix({ cityOnly: true }), { disabled: !!(area.fix.counts && !cityFlagged), title: 'Fixes only the cities of the flagged segments by the usual rules: the primary city from the city and CDP limits (outside every limit it is cleared) and the alternate city from the postal sources. Never renames a street or adds a missing name. Saves every 25.' }),
-                areaButton(`Fix flagged${flaggedCount}`, () => areaRunFix(), { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in missing street names and cities, corrects primary cities (outside every limit it clears the primary and uses the postal city as the alternate) and renames a street to the GIS name when it differs. Saves every 25.' }),
+                areaButton(`Fix cities only${cityCount}`, async () => await areaRunFix({ cityOnly: true }), { disabled: !!(area.fix.counts && !cityFlagged), title: 'Fixes only the cities of the flagged segments by the usual rules: the primary city from the city and CDP limits (outside every limit it is cleared) and the alternate city from the postal sources. Never renames a street or adds a missing name. Saves every 25.' }),
+                areaButton(`Fix flagged${flaggedCount}`, async () => await areaRunFix(), { primary: true, disabled: !!(area.fix.counts && !area.fix.counts.total), title: 'Fills in missing street names and cities, corrects primary cities (outside every limit it clears the primary and uses the postal city as the alternate) and renames a street to the GIS name when it differs. Saves every 25.' }),
                 areaButton('House numbers', areaRunHouses, { disabled: !!(area.source && !area.source.houseNumbers), title: 'Adds the missing house numbers to the roads inside the outline (roads must be saved first).' })
             ]);
             rowOf('', [areaButton('Redraw', areaStartDrawing), areaButton('Clear', areaClear)]);
@@ -6001,14 +6007,14 @@
         positionAreaPanel();
     }
 
-    btnArea.addEventListener('click', () => {
+    btnArea.addEventListener('click', async () => {
         if (area.panelOpen && area.phase !== 'idle') {
             area.panelOpen = false; // second click hides the panel; the outline stays
             renderAreaPanel();
             return;
         }
         area.panelOpen = true;
-        if (area.phase === 'idle') areaStartDrawing();
+        if (area.phase === 'idle') await areaStartDrawing();
         renderAreaPanel();
     });
     renderAreaPanel();
@@ -6016,9 +6022,9 @@
 
     // Start downloading the city limits now so the first import doesn't wait for them.
     loadCityBoundaries()
-        .then((places) => {
+        .then(async (places) => {
             setStatus(`Ready. City limits loaded (${places.length} places).`, 'ok');
-            const problem = inKendallView() ? '' : gislProblem();
+            const problem = await inKendallView() ? '' : gislProblem();
             if (problem) setStatus(problem, 'warn');
         })
         .catch((err) => {
@@ -6212,12 +6218,12 @@
     // --- scanning ---------------------------------------------------------------------
     async function scanMissingRoads() {
         if (missingScanBusy) return;
-        const zoom = sdk.Map.getZoomLevel();
+        const zoom = await sdk.Map.getZoomLevel();
         if (zoom < MISSING.MIN_ZOOM) {
             setMissingStatus(`Zoom in to ${MISSING.MIN_ZOOM} or closer (now ${zoom}) so WME loads every road in view, then scan.`, 'warn');
             return;
         }
-        const [minLon, minLat, maxLon, maxLat] = sdk.Map.getMapExtent();
+        const [minLon, minLat, maxLon, maxLat] = await sdk.Map.getMapExtent();
         const center = { lon: (minLon + maxLon) / 2, lat: (minLat + maxLat) / 2 };
         let source = null;
         try {
@@ -6249,7 +6255,7 @@
 
             // WME road segments loaded around the view (unsaved ones included, so a road you just drew counts)
             const segs = [];
-            for (const segment of sdk.DataModel.Segments.getAll()) {
+            for (const segment of await sdk.DataModel.Segments.getAll()) {
                 if (!isLiveSegment(segment) || OVERLAP_IGNORED_ROAD_TYPES.has(segment.roadType)) continue;
                 const xy = segment.geometry.coordinates.map(project);
                 const xs = xy.map((c) => c[0]);
@@ -6344,7 +6350,7 @@
         } finally {
             missingScanBusy = false;
             missingPanel.scanBtn.disabled = false;
-            renderMissing();
+            await renderMissing();
         }
     }
 
@@ -6385,10 +6391,10 @@
 
     // --- map layer (SDK) ------------------------------------------------------------------
     let missingLayerReady = false;
-    function ensureMissingLayer() {
+    async function ensureMissingLayer() {
         if (missingLayerReady) return true;
         try {
-            sdk.Map.addLayer({
+            await sdk.Map.addLayer({
                 layerName: MISSING.LAYER,
                 styleRules: [
                     { predicate: (p) => p.kind === 'halo', style: { strokeColor: '#ffd400', strokeWidth: 16, strokeOpacity: 0.6, strokeLinecap: 'round' } },
@@ -6401,13 +6407,13 @@
             console.warn(`[${SCRIPT_NAME}] Could not add the missing roads layer:`, err);
         }
         try {
-            sdk.Events.trackLayerEvents({ layerName: MISSING.LAYER });
-            sdk.Events.on({
+            await sdk.Events.trackLayerEvents({ layerName: MISSING.LAYER });
+            await sdk.Events.on({
                 eventName: 'wme-layer-feature-clicked',
-                eventHandler: (e) => {
+                eventHandler: async (e) => {
                     if (!e || e.layerName !== MISSING.LAYER) return;
                     const key = String(e.featureId).split('#')[0];
-                    if (missingCandidates.some((c) => c.key === key)) selectMissing(key, false);
+                    if (missingCandidates.some((c) => c.key === key)) await selectMissing(key, false);
                 }
             });
         } catch (err) {
@@ -6417,10 +6423,10 @@
     }
 
     // Each unmapped stretch is drawn in pieces: solid where GPS shows traffic, dashed where it doesn't.
-    function drawMissingLayer() {
-        if (!ensureMissingLayer()) return;
+    async function drawMissingLayer() {
+        if (!await ensureMissingLayer()) return;
         try {
-            sdk.Map.removeAllFeaturesFromLayer({ layerName: MISSING.LAYER });
+            await sdk.Map.removeAllFeaturesFromLayer({ layerName: MISSING.LAYER });
         } catch (err) { /* layer empty */ }
         if (!missingUi.open || !missingUi.showOnMap) return;
 
@@ -6458,48 +6464,48 @@
         }
         if (!features.length) return;
         try {
-            sdk.Map.addFeaturesToLayer({ layerName: MISSING.LAYER, features });
+            await sdk.Map.addFeaturesToLayer({ layerName: MISSING.LAYER, features });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not draw missing roads:`, err);
         }
     }
 
-    function centerOnCandidate(c) {
+    async function centerOnCandidate(c) {
         const pts = c.stretches.flatMap((s) => s.samples);
         if (!pts.length) return;
         const lons = pts.map((p) => p.lon);
         const lats = pts.map((p) => p.lat);
         const box = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
-        const [minLon, minLat, maxLon, maxLat] = sdk.Map.getMapExtent();
+        const [minLon, minLat, maxLon, maxLat] = await sdk.Map.getMapExtent();
         const fits = (box[2] - box[0]) < (maxLon - minLon) * 0.9 && (box[3] - box[1]) < (maxLat - minLat) * 0.9;
         try {
             if (fits && typeof sdk.Map.setMapCenter === 'function') {
-                sdk.Map.setMapCenter({ lonLat: { lon: (box[0] + box[2]) / 2, lat: (box[1] + box[3]) / 2 } });
+                await sdk.Map.setMapCenter({ lonLat: { lon: (box[0] + box[2]) / 2, lat: (box[1] + box[3]) / 2 } });
             } else {
-                sdk.Map.zoomToExtent({ bbox: box });
+                await sdk.Map.zoomToExtent({ bbox: box });
             }
         } catch (err) {
             try {
-                sdk.Map.zoomToExtent({ bbox: box });
+                await sdk.Map.zoomToExtent({ bbox: box });
             } catch (err2) {
                 console.warn(`[${SCRIPT_NAME}] Could not move the map to the road:`, err2);
             }
         }
     }
 
-    function selectMissing(key, moveMap = true) {
+    async function selectMissing(key, moveMap = true) {
         missingSelectedKey = key;
         const c = missingCandidates.find((x) => x.key === key);
-        if (c && moveMap) centerOnCandidate(c);
-        renderMissing();
+        if (c && moveMap) await centerOnCandidate(c);
+        await renderMissing();
     }
 
-    function stepMissing(delta) {
+    async function stepMissing(delta) {
         const list = visibleMissing();
         if (!list.length) return;
         const i = list.findIndex((c) => c.key === missingSelectedKey);
         const next = i < 0 ? (delta > 0 ? 0 : list.length - 1) : (i + delta + list.length) % list.length;
-        selectMissing(list[next].key);
+        await selectMissing(list[next].key);
     }
 
     // --- panel ------------------------------------------------------------------------
@@ -6542,15 +6548,15 @@
             options.appendChild(wrapLabel);
             return box;
         };
-        const mapCheck = makeCheck('Show on map', missingUi.showOnMap, (v) => {
+        const mapCheck = makeCheck('Show on map', missingUi.showOnMap, async (v) => {
             missingUi.showOnMap = v;
             saveMissingUi();
-            drawMissingLayer();
+            await drawMissingLayer();
         });
-        const hiddenCheck = makeCheck('Show snoozed / ignored', missingUi.showHidden, (v) => {
+        const hiddenCheck = makeCheck('Show snoozed / ignored', missingUi.showHidden, async (v) => {
             missingUi.showHidden = v;
             saveMissingUi();
-            renderMissing();
+            await renderMissing();
         });
         body.appendChild(options);
 
@@ -6628,15 +6634,15 @@
             });
         };
         makeDraggable(header, null);
-        makeDraggable(icon, () => setMissingPanel(true, false));
+        makeDraggable(icon, async () => await setMissingPanel(true, false));
 
-        scanBtn.addEventListener('click', () => scanMissingRoads());
-        minBtn.addEventListener('click', () => setMissingPanel(true, true));
-        closeBtn.addEventListener('click', () => setMissingPanel(false, false));
-        prevBtn.addEventListener('click', () => stepMissing(-1));
-        nextBtn.addEventListener('click', () => stepMissing(1));
+        scanBtn.addEventListener('click', async () => await scanMissingRoads());
+        minBtn.addEventListener('click', async () => await setMissingPanel(true, true));
+        closeBtn.addEventListener('click', async () => await setMissingPanel(false, false));
+        prevBtn.addEventListener('click', async () => await stepMissing(-1));
+        nextBtn.addEventListener('click', async () => await stepMissing(1));
 
-        const actOnSelected = (status) => {
+        const actOnSelected = async (status) => {
             const c = missingCandidates.find((x) => x.key === missingSelectedKey);
             if (!c) return;
             const list = visibleMissing();
@@ -6647,14 +6653,14 @@
                 // move on to the next road in the queue
                 const next = after[Math.min(i, after.length - 1)];
                 missingSelectedKey = next ? next.key : null;
-                if (next) centerOnCandidate(next);
+                if (next) await centerOnCandidate(next);
             }
             setMissingStatus(status === 'snoozed' ? `Snoozed ${c.name}.` : status === 'ignored' ? `${c.name} will not be shown again.` : `${c.name} is back in the queue.`, 'ok');
-            renderMissing();
+            await renderMissing();
         };
-        snoozeBtn.addEventListener('click', () => actOnSelected('snoozed'));
-        ignoreBtn.addEventListener('click', () => actOnSelected('ignored'));
-        restoreBtn.addEventListener('click', () => actOnSelected(null));
+        snoozeBtn.addEventListener('click', async () => await actOnSelected('snoozed'));
+        ignoreBtn.addEventListener('click', async () => await actOnSelected('ignored'));
+        restoreBtn.addEventListener('click', async () => await actOnSelected(null));
 
         place();
         return { panel, icon, badge, status, listBox, counter, detail, detailText, snoozeBtn, ignoreBtn, restoreBtn, scanBtn, mapCheck, hiddenCheck };
@@ -6665,18 +6671,18 @@
         paintStatus(missingPanel.status, level);
     }
 
-    function setMissingPanel(open, minimized) {
+    async function setMissingPanel(open, minimized) {
         missingUi.open = open;
         missingUi.minimized = minimized;
         saveMissingUi();
         missingPanel.panel.style.display = open && !minimized ? 'flex' : 'none';
         paintToggleButton(btnMissing, open, COLOUR_ROADS);
         missingPanel.icon.style.display = open && minimized ? 'block' : 'none';
-        drawMissingLayer();
+        await drawMissingLayer();
         scheduleGapScan();
     }
 
-    function renderMissing() {
+    async function renderMissing() {
         const p = missingPanel;
         const list = visibleMissing();
         const waiting = missingCandidates.filter((c) => !markOf(c)).length;
@@ -6714,7 +6720,7 @@
             chip.textContent = tier.label;
             chip.style.cssText = `padding: 1px 6px; border-radius: 8px; font-size: 10px; color: ${tier.colour}; background: ${tier.background};`;
             tierCell.appendChild(chip);
-            tr.addEventListener('click', () => selectMissing(c.key));
+            tr.addEventListener('click', async () => await selectMissing(c.key));
             table.appendChild(tr);
         });
         if (list.length) p.listBox.appendChild(table);
@@ -6744,14 +6750,14 @@
             const row = p.listBox.querySelectorAll('tr')[i];
             if (row) row.scrollIntoView({ block: 'nearest' });
         }
-        drawMissingLayer();
+        await drawMissingLayer();
     }
 
     // The 🔎 button on the toolbar opens the missing roads panel.
-    btnMissing.addEventListener('click', () => setMissingPanel(!(missingUi.open && !missingUi.minimized), false));
+    btnMissing.addEventListener('click', async () => await setMissingPanel(!(missingUi.open && !missingUi.minimized), false));
 
-    setMissingPanel(missingUi.open, missingUi.minimized);
-    renderMissing();
+    await setMissingPanel(missingUi.open, missingUi.minimized);
+    await renderMissing();
 
     // ------------------------------------------------------------------
     // Segments that need info: no street name, no city (primary or alternate), or a primary city that does not fit the limits
@@ -6774,10 +6780,10 @@
     }
 
     // thorough = true (the area runs): short unnamed segments are not excused as connectors, so they get looked at too.
-    function evaluateSegmentInfo(segment, places, thorough = false) {
+    async function evaluateSegmentInfo(segment, places, thorough = false) {
         let address;
         try {
-            address = sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
+            address = await sdk.DataModel.Segments.getAddress({ segmentId: segment.id });
         } catch (err) {
             return null;
         }
@@ -6844,10 +6850,10 @@
         return scanLevel !== 'off';
     }
 
-    function ensureGapLayer() {
+    async function ensureGapLayer() {
         if (gapLayerReady) return true;
         try {
-            sdk.Map.addLayer({
+            await sdk.Map.addLayer({
                 layerName: GAP_LAYER,
                 styleRules: Object.entries(GAP_KINDS).map(([kind, k]) => ({
                     predicate: (p) => p.kind === kind,
@@ -6861,14 +6867,14 @@
         return gapLayerReady;
     }
 
-    function drawGaps() {
-        if (!ensureGapLayer()) return;
+    async function drawGaps() {
+        if (!await ensureGapLayer()) return;
         try {
-            sdk.Map.removeAllFeaturesFromLayer({ layerName: GAP_LAYER });
+            await sdk.Map.removeAllFeaturesFromLayer({ layerName: GAP_LAYER });
         } catch (err) { /* layer empty */ }
         if (!gapList.length) return;
         try {
-            sdk.Map.addFeaturesToLayer({
+            await sdk.Map.addFeaturesToLayer({
                 layerName: GAP_LAYER,
                 features: gapList.map((h) => ({ type: 'Feature', id: `gap:${h.id}`, geometry: { type: 'LineString', coordinates: h.coords }, properties: { kind: h.kind } }))
             });
@@ -6899,11 +6905,9 @@
         }
     }
 
-    function setGapList(found) {
-        const center = (() => {
-            const [a, b, c, d] = sdk.Map.getMapExtent();
-            return [(a + c) / 2, (b + d) / 2];
-        })();
+    async function setGapList(found) {
+        const [extA, extB, extC, extD] = await sdk.Map.getMapExtent();
+        const center = [(extA + extC) / 2, (extB + extD) / 2];
         const dist = (h) => Math.hypot((h.mid[0] - center[0]) * Math.cos(center[1] * RAD), h.mid[1] - center[1]);
         found.sort((x, y) => dist(x) - dist(y));
         const signature = found.map((h) => `${h.id}:${h.kind}`).join(',');
@@ -6911,17 +6915,17 @@
         gapSignature = signature;
         gapList = found;
         gapHistory = gapHistory.filter((id) => found.some((h) => h.id === id)); // ones already fixed drop out
-        if (changed) drawGaps();
+        if (changed) await drawGaps();
         paintGapsButton();
         ccRenderNav();
     }
 
-    function clearGaps() {
+    async function clearGaps() {
         if (gapList.length || gapSignature) {
             gapList = [];
             gapSignature = '';
             gapHistory = [];
-            drawGaps();
+            await drawGaps();
         }
         gapZoomNote = '';
         paintGapsButton();
@@ -6930,19 +6934,19 @@
     async function scanGaps() {
         if (gapScanBusy || !gapsReady) return;
         if (!gapsWanted()) {
-            clearGaps();
+            await clearGaps();
             return;
         }
         gapScanBusy = true;
         const started = Date.now();
         try {
-            if (sdk.Map.getZoomLevel() < GAP_MIN_ZOOM) {
+            if (await sdk.Map.getZoomLevel() < GAP_MIN_ZOOM) {
                 gapZoomNote = `Zoom in to ${GAP_MIN_ZOOM} or closer to check the segments.`;
-                setGapList([]);
+                await setGapList([]);
                 return;
             }
             gapZoomNote = '';
-            const [minLon, minLat, maxLon, maxLat] = sdk.Map.getMapExtent();
+            const [minLon, minLat, maxLon, maxLat] = await sdk.Map.getMapExtent();
             const padLon = (maxLon - minLon) * 0.1;
             const padLat = (maxLat - minLat) * 0.1;
             const inside = (p) => p[0] >= minLon - padLon && p[0] <= maxLon + padLon && p[1] >= minLat - padLat && p[1] <= maxLat + padLat;
@@ -6955,18 +6959,18 @@
                 }
             }
             const found = [];
-            for (const segment of sdk.DataModel.Segments.getAll()) {
+            for (const segment of await sdk.DataModel.Segments.getAll()) {
                 if (!isLiveSegment(segment)) continue;
                 const c = segment.geometry && segment.geometry.coordinates;
                 if (!c || c.length < 2) continue;
                 if (!inside(c[0]) && !inside(c[c.length - 1]) && !inside(c[Math.floor(c.length / 2)])) continue;
-                const hit = evaluateSegmentInfo(segment, places);
+                const hit = await evaluateSegmentInfo(segment, places);
                 if (!hit) continue;
                 hit.coords = c.map((p) => [p[0], p[1]]);
                 hit.mid = pointAlongLine(c, 0.5);
                 found.push(hit);
             }
-            setGapList(found);
+            await setGapList(found);
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Segment check failed:`, err);
         } finally {
@@ -6983,14 +6987,14 @@
     }
     function pollGaps() {
         clearTimeout(gapPollTimer);
-        gapPollTimer = setTimeout(() => {
-            if (gapsWanted()) scanGaps();
+        gapPollTimer = setTimeout(async () => {
+            if (gapsWanted()) await scanGaps();
             pollGaps();
         }, gapPollMs);
     }
 
     // Next in the triangle panel: go to the nearest segment that needs info that you have not been to yet. Prev: back.
-    function stepGaps(back) {
+    async function stepGaps(back) {
         if (!gapsWanted()) {
             setStatus('The scan is off. Click the scan button on the toolbar to turn it on.', 'info');
             return;
@@ -7009,7 +7013,7 @@
             }
         } else {
             const current = gapList.find((h) => h.id === gapHistory[gapHistory.length - 1]);
-            const [a, b, c, d] = sdk.Map.getMapExtent();
+            const [a, b, c, d] = await sdk.Map.getMapExtent();
             const from = current ? current.mid : [(a + c) / 2, (b + d) / 2];
             let pool = gapList.filter((h) => !gapHistory.includes(h.id));
             if (!pool.length) {
@@ -7022,12 +7026,12 @@
             gapHistory.push(hit.id);
         }
         try {
-            sdk.Map.setMapCenter({ lonLat: { lon: hit.mid[0], lat: hit.mid[1] } });
+            await sdk.Map.setMapCenter({ lonLat: { lon: hit.mid[0], lat: hit.mid[1] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not move the map to the segment:`, err);
         }
         try {
-            sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.id] } });
+            await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.id] } });
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select the segment:`, err);
         }
@@ -7036,7 +7040,7 @@
 
     for (const eventName of ['wme-map-move-end', 'wme-map-zoom-changed', 'wme-map-data-loaded']) {
         try {
-            sdk.Events.on({ eventName, eventHandler: () => scheduleGapScan() });
+            await sdk.Events.on({ eventName, eventHandler: () => scheduleGapScan() });
         } catch (err) { /* this WME version does not announce it; the timer covers it */ }
     }
 
@@ -7081,9 +7085,9 @@
     const ccSameCity = (a, b) => normalizeName(a) === normalizeName(b);
     const ccHas = (list, city) => list.some((c) => ccSameCity(c, city));
 
-    function ccAddressOf(segmentId) {
+    async function ccAddressOf(segmentId) {
         try {
-            const a = sdk.DataModel.Segments.getAddress({ segmentId });
+            const a = await sdk.DataModel.Segments.getAddress({ segmentId });
             const name = a.street && !a.street.isEmpty && a.street.name ? String(a.street.name).trim() : '';
             const primary = ccCityOf(a);
             const altStreets = (a.altStreets || []).filter((x) => x && x.street);
@@ -7097,10 +7101,10 @@
     // The postal city a segment stands for: its alternate city if it has one, otherwise its primary city.
     const ccPostalOf = (addr) => (addr.alts.length ? addr.alts : addr.primary ? [addr.primary] : []);
 
-    function ccSelection() {
+    async function ccSelection() {
         let sel = null;
         try {
-            sel = sdk.Editing.getSelection();
+            sel = await sdk.Editing.getSelection();
         } catch (err) {
             return null;
         }
@@ -7109,19 +7113,21 @@
     }
 
     // Something short that changes when the selection, or the address or shape of a selected segment, changes.
-    function ccSignature(ids) {
-        return ids.slice(0, CC_MAX_MULTI).map((id) => {
-            const seg = sdk.DataModel.Segments.getById({ segmentId: id });
-            const a = seg ? ccAddressOf(id) : null;
+    async function ccSignature(ids) {
+        const parts = [];
+        for (const id of ids.slice(0, CC_MAX_MULTI)) {
+            const seg = await sdk.DataModel.Segments.getById({ segmentId: id });
+            const a = seg ? await ccAddressOf(id) : null;
             const c = seg && seg.geometry ? seg.geometry.coordinates : [];
-            return `${id}:${a ? `${a.name}|${a.primary}|${a.alts.join('/')}` : '?'}:${c.length}:${c[0] || ''}:${c[c.length - 1] || ''}`;
-        }).join(';');
+            parts.push(`${id}:${a ? `${a.name}|${a.primary}|${a.alts.join('/')}` : '?'}:${c.length}:${c[0] || ''}:${c[c.length - 1] || ''}`);
+        }
+        return parts.join(';');
     }
 
     const isNewSegment = (segment) => Number(segment.id) < 0;
 
     // Nearby evidence from segments already loaded in WME: the segments it connects to, and the same street name within the radius.
-    function ccNearby(segment, name) {
+    async function ccNearby(segment, name) {
         const coords = segment.geometry.coordinates;
         const project = makeProjector(coords[0]);
         const mid = project(pointAlongLine(coords, 0.5));
@@ -7130,7 +7136,7 @@
         const pad = (CC_NEARBY_RADIUS_M + 300) / 110540;
         const mine = new Set([segment.fromNodeId, segment.toNodeId].filter((n) => n !== null && n !== undefined));
         const pool = [];
-        for (const other of sdk.DataModel.Segments.getAll()) {
+        for (const other of await sdk.DataModel.Segments.getAll()) {
             if (other.id === segment.id || !isLiveSegment(other) || OVERLAP_IGNORED_ROAD_TYPES.has(other.roadType)) continue;
             const oc = other.geometry.coordinates;
             const connected = mine.has(other.fromNodeId) || mine.has(other.toNodeId);
@@ -7145,11 +7151,11 @@
                     if (c[1] > maxLat) maxLat = c[1];
                 }
                 if (midLL[0] < minLon - pad || midLL[0] > maxLon + pad || midLL[1] < minLat - pad || midLL[1] > maxLat + pad) continue;
-                if (normalizeName(streetNameOf(other.id)) !== wanted) continue;
+                if (normalizeName(await streetNameOf(other.id)) !== wanted) continue;
                 near = xyNearest(oc.map(project), mid[0], mid[1]).d <= CC_NEARBY_RADIUS_M;
                 if (!near) continue;
             }
-            const addr = ccAddressOf(other.id);
+            const addr = await ccAddressOf(other.id);
             if (!addr) continue;
             const postal = ccPostalOf(addr);
             if (!postal.length) continue;
@@ -7182,14 +7188,14 @@
     // The whole check for one segment. Returns { name, isNew, full, rows[], proposals[], level, summary }.
     // A row is { label, text, level }; a proposal is { kind, label, city, ... } shown as a button.
     async function ccAnalyze(segmentId, full) {
-        const segment = sdk.DataModel.Segments.getById({ segmentId });
+        const segment = await sdk.DataModel.Segments.getById({ segmentId });
         const result = { segmentId, name: '', isNew: false, full, rows: [], proposals: [], level: 'info', summary: '' };
         if (!segment || !segment.geometry) {
             result.rows.push({ label: 'Segment', text: 'Not available.', level: 'info' });
             return result;
         }
         result.isNew = isNewSegment(segment);
-        const addr = ccAddressOf(segmentId);
+        const addr = await ccAddressOf(segmentId);
         if (!addr) {
             result.rows.push({ label: 'Address', text: 'Could not read this segment\'s address.', level: 'error' });
             result.level = 'error';
@@ -7271,7 +7277,7 @@
         }
 
         // Nearby segments (sanity check)
-        const nearby = full && addr.name ? ccNearby(segment, addr.name) : { total: 0, top: null, connected: 0 }; // the nearby comparison is part of Full
+        const nearby = full && addr.name ? await ccNearby(segment, addr.name) : { total: 0, top: null, connected: 0 }; // the nearby comparison is part of Full
         const mine = ccPostalOf(addr);
         let nearbyCandidate = null;
         if (nearby.total >= 2 && nearby.top && nearby.top.n / nearby.total >= CC_MAJORITY) {
@@ -7380,15 +7386,15 @@
     }
 
     // Writes a proposal to the segment. Keeps the alternates it has, except when asked to change them.
-    function ccApply(segmentId, proposal) {
+    async function ccApply(segmentId, proposal) {
         if (proposal.kind === 'keep') {
             keptNames.add(keptKey(segmentId, proposal.gisName));
             return;
         }
-        const addr = ccAddressOf(segmentId);
+        const addr = await ccAddressOf(segmentId);
         if (!addr) throw new Error('could not read the segment\'s address');
         if (!addr.name && (proposal.kind === 'alt' || proposal.kind === 'both')) throw new Error('an alternate city needs a street name');
-        const { country, state } = regionOf(segmentId);
+        const { country, state } = await regionOf(segmentId);
         if (!country || !state) throw new Error(REGION_ERROR);
         let primary = addr.primary;
         let altIds = addr.altStreets.map((x) => x.street.id);
@@ -7398,24 +7404,24 @@
             if (!isUsableStreetName(proposal.name)) throw new Error(`"${proposal.name || ''}" can not be used as a street name`);
             altIds = [];
             for (const cityName of addr.alts) {
-                const city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+                const city = await sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
                 if (!city) continue;
-                let street = sdk.DataModel.Streets.getStreet({ streetName: proposal.name, cityId: city.id });
-                if (!street) street = sdk.DataModel.Streets.addStreet({ streetName: proposal.name, cityId: city.id });
+                let street = await sdk.DataModel.Streets.getStreet({ streetName: proposal.name, cityId: city.id });
+                if (!street) street = await sdk.DataModel.Streets.addStreet({ streetName: proposal.name, cityId: city.id });
                 altIds.push(street.id);
             }
         }
         if (proposal.kind === 'alt' || proposal.kind === 'both') {
             altIds = [];
             for (const cityName of proposal.cities) {
-                let city = sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
-                if (!city) city = sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
-                let street = sdk.DataModel.Streets.getStreet({ streetName: addr.name, cityId: city.id });
-                if (!street) street = sdk.DataModel.Streets.addStreet({ streetName: addr.name, cityId: city.id });
+                let city = await sdk.DataModel.Cities.getCity({ cityName, countryId: country.id, stateId: state.id });
+                if (!city) city = await sdk.DataModel.Cities.addCity({ cityName, countryId: country.id, stateId: state.id });
+                let street = await sdk.DataModel.Streets.getStreet({ streetName: addr.name, cityId: city.id });
+                if (!street) street = await sdk.DataModel.Streets.addStreet({ streetName: addr.name, cityId: city.id });
                 altIds.push(street.id);
             }
         }
-        sdk.DataModel.Segments.updateAddress({
+        await sdk.DataModel.Segments.updateAddress({
             segmentId,
             addressData: { streetName: proposal.kind === 'name' ? proposal.name : addr.name, cityName: primary, countryId: country.id, stateId: state.id, alternateStreetIds: altIds }
         });
@@ -7424,14 +7430,14 @@
     // A name correction also corrects the city: once the new name is written, the primary city is checked against the city and CDP limits
     // and fixed in the same step, so it does not have to be found after saving. Returns a short note ('' when the city needed nothing).
     async function ccApplyNameAndCity(segmentId, proposal) {
-        ccApply(segmentId, proposal);
+        await ccApply(segmentId, proposal);
         cityCheckCache.clear();
         if (proposal.kind !== 'name') return '';
         try {
             const analysis = await ccAnalyze(segmentId, false);
             const primary = (analysis.proposals || []).find((p) => p.kind === 'primary' && p.city);
             if (!primary) return '';
-            ccApply(segmentId, primary);
+            await ccApply(segmentId, primary);
             cityCheckCache.clear();
             return ` ${primary.label}.`;
         } catch (err) {
@@ -7602,7 +7608,7 @@
             ccShowPanel(true);
             return;
         }
-        const ids = ccSelection();
+        const ids = await ccSelection();
         if (!ids) {
             cityCheckLastKey = '';
             cityCheckIndicatorFor = '';
@@ -7618,7 +7624,7 @@
         }
         let sig;
         try {
-            sig = ccSignature(ids);
+            sig = await ccSignature(ids);
         } catch (err) {
             return;
         }
@@ -7659,11 +7665,11 @@
         }
 
         const id = ids[0];
-        const segment = sdk.DataModel.Segments.getById({ segmentId: id });
+        const segment = await sdk.DataModel.Segments.getById({ segmentId: id });
         const isNew = !!segment && isNewSegment(segment);
         const full = scanLevel === 'full';
         ccShowPanel(true);
-        p.title.textContent = `${streetNameOf(id) || 'Unnamed road'}${isNew ? ' (new segment)' : ''}`;
+        p.title.textContent = `${await streetNameOf(id) || 'Unnamed road'}${isNew ? ' (new segment)' : ''}`;
         p.verdict.textContent = full ? 'Checking (full)...' : 'Checking...';
         paintStatus(p.verdict, 'info');
 
@@ -7697,7 +7703,7 @@
 
     function ccRequestCheck(delay = 250, force = false) {
         clearTimeout(cityCheckTimer);
-        cityCheckTimer = setTimeout(() => {
+        cityCheckTimer = setTimeout(async () => {
             ccRun(force).catch((err) => console.warn(`[${SCRIPT_NAME}] City check error:`, err));
         }, delay);
     }
@@ -7707,15 +7713,15 @@
         clearInterval(cityCheckPollTimer);
         cityCheckPollTimer = null;
         if (scanLevel === 'off') return;
-        cityCheckPollTimer = setInterval(() => {
-            const ids = ccSelection();
+        cityCheckPollTimer = setInterval(async () => {
+            const ids = await ccSelection();
             if (!ids) {
                 if (cityCheckLastKey) ccRequestCheck(0);
                 return;
             }
             let sig = '';
             try {
-                sig = ccSignature(ids);
+                sig = await ccSignature(ids);
             } catch (err) {
                 return;
             }
@@ -7724,7 +7730,7 @@
     }
 
     // The master scan button: Off -> Light -> Full -> Off.
-    function setScanLevel(level) {
+    async function setScanLevel(level) {
         scanLevel = level === 'full' ? 'full' : level === 'light' ? 'light' : 'off';
         try {
             localStorage.setItem(STORAGE_KEY_SCAN, scanLevel);
@@ -7737,7 +7743,7 @@
         if (scanLevel === 'off') {
             clearInterval(cityCheckPollTimer);
             cityCheckPollTimer = null;
-            clearGaps();
+            await clearGaps();
             ccSetIndicator('off');
         } else {
             ccPoll();
@@ -7750,7 +7756,7 @@
         console.log(`[${SCRIPT_NAME}] scan ${scanLevel}.`);
     }
 
-    btnScan.addEventListener('click', () => setScanLevel(scanLevel === 'off' ? 'light' : scanLevel === 'light' ? 'full' : 'off'));
+    btnScan.addEventListener('click', async () => await setScanLevel(scanLevel === 'off' ? 'light' : scanLevel === 'light' ? 'full' : 'off'));
     cityCheckPanel.closeBtn.addEventListener('click', () => {
         cityCheckPanelOpen = false;
         ccShowPanel(false);
@@ -7766,11 +7772,11 @@
             ccShowPanel(false);
         }
     });
-    cityCheckPanel.prevBtn.addEventListener('click', () => stepGaps(true));
-    cityCheckPanel.nextBtn.addEventListener('click', () => stepGaps(false));
+    cityCheckPanel.prevBtn.addEventListener('click', async () => await stepGaps(true));
+    cityCheckPanel.nextBtn.addEventListener('click', async () => await stepGaps(false));
 
     try {
-        sdk.Events.on({ eventName: 'wme-selection-changed', eventHandler: () => ccRequestCheck(150) });
+        await sdk.Events.on({ eventName: 'wme-selection-changed', eventHandler: () => ccRequestCheck(150) });
     } catch (err) { /* this WME version does not announce it; the poll covers it */ }
 
     ccPaintMode();
@@ -7806,19 +7812,19 @@
         autofillRunning = true;
         try {
             const places = await loadCityBoundaries();
-            const { country, state } = regionOf(ids[0]);
+            const { country, state } = await regionOf(ids[0]);
             if (!country || !state) return;
             const done = [];
             for (const id of ids) {
                 if (importerMadeIds.has(id)) continue;
-                const segment = sdk.DataModel.Segments.getById({ segmentId: id });
+                const segment = await sdk.DataModel.Segments.getById({ segmentId: id });
                 if (!segment || !isLiveSegment(segment) || !segment.geometry || !AUTOFILL_ROAD_TYPES.has(segment.roadType)) continue;
-                const addr = ccAddressOf(id);
+                const addr = await ccAddressOf(id);
                 if (!addr || addr.primary) continue;
                 const coords = segment.geometry.coordinates;
                 const names = [0.25, 0.5, 0.75].map((f) => placeAt(places, pointAlongLine(coords, f)));
                 if (!names[1] || names.some((n) => n !== names[1])) continue; // outside every limit, or crossing one: left for you
-                sdk.DataModel.Segments.updateAddress({
+                await sdk.DataModel.Segments.updateAddress({
                     segmentId: id,
                     addressData: { streetName: addr.name, cityName: names[1], countryId: country.id, stateId: state.id, alternateStreetIds: addr.altStreets.map((x) => x.street.id) }
                 });
@@ -7841,8 +7847,8 @@
     }
 
     try {
-        sdk.Events.trackDataModelEvents({ dataModelName: 'segments' });
-        sdk.Events.on({
+        await sdk.Events.trackDataModelEvents({ dataModelName: 'segments' });
+        await sdk.Events.on({
             eventName: 'wme-data-model-objects-added',
             eventHandler: (e) => {
                 if (!autofillEnabled || !e || e.dataModelName !== 'segments') return;
@@ -7946,7 +7952,7 @@
     // The same check the triangle panel runs (Light or Full), sharing its cache.
     async function hoverAnalyze(id) {
         const full = scanLevel === 'full';
-        const cacheKey = `${id}|${full ? 'f' : 'l'}|${ccSignature([id])}`;
+        const cacheKey = `${id}|${full ? 'f' : 'l'}|${await ccSignature([id])}`;
         let result = cityCheckCache.get(cacheKey);
         if (!result) {
             result = await ccAnalyze(id, full);
@@ -7961,15 +7967,15 @@
             if (hoverId !== null) hideHoverTip();
             return;
         }
-        const here = sdk.Map.getLonLatFromPixel({ x: hoverLast.x, y: hoverLast.y });
-        const beside = sdk.Map.getLonLatFromPixel({ x: hoverLast.x + HOVER_TOLERANCE_PX, y: hoverLast.y });
+        const here = await sdk.Map.getLonLatFromPixel({ x: hoverLast.x, y: hoverLast.y });
+        const beside = await sdk.Map.getLonLatFromPixel({ x: hoverLast.x + HOVER_TOLERANCE_PX, y: hoverLast.y });
         const toleranceM = distanceMeters(here.lat, here.lon, beside.lat, beside.lon);
         let best = null;
         for (const item of gapList) {
             const d = distanceToLine(here, item.coords);
             if (d <= toleranceM && (!best || d < best.d)) best = { item, d };
         }
-        const selected = ccSelection();
+        const selected = await ccSelection();
         if (best && selected && selected.includes(best.item.id)) best = null; // the panel already covers the selected segment
         if (!best) {
             if (hoverId !== null) hideHoverTip();
@@ -8002,7 +8008,7 @@
             ccRequestCheck(150, true);
             scheduleGapScan(200);
             // the scan drops the segment if that was its last fix; otherwise the tip comes back with the next one
-            setTimeout(() => hoverEvaluate().catch((err) => console.warn(`[${SCRIPT_NAME}] Hover check failed:`, err)), HOVER_RECHECK_MS);
+            setTimeout(async () => hoverEvaluate().catch((err) => console.warn(`[${SCRIPT_NAME}] Hover check failed:`, err)), HOVER_RECHECK_MS);
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Hover apply failed:`, err);
             setStatus(`${label}: could not apply (${err.message || err}).`, 'error');
@@ -8011,7 +8017,7 @@
         }
     }
 
-    mapDiv.addEventListener('mousemove', (e) => {
+    mapDiv.addEventListener('mousemove', async (e) => {
         hoverLast = { x: e.clientX, y: e.clientY };
         if (e.buttons || !hoverWanted()) { // a drag or pan is in progress, or the tip is not wanted
             if (hoverId !== null) hideHoverTip();
@@ -8034,13 +8040,13 @@
         if (e.key === 'Escape' && hoverId !== null) hideHoverTip();
     });
     // Right-click applies the fix the tip is showing. Only while a fix is showing: everywhere else WME's right-click is left alone.
-    mapDiv.addEventListener('contextmenu', (e) => {
+    mapDiv.addEventListener('contextmenu', async (e) => {
         if (hoverId === null || !hoverResult || !hoverWanted()) return;
         const proposal = hoverProposal(hoverResult);
         if (!proposal) return;
         e.preventDefault();
         e.stopPropagation();
-        hoverApply(hoverId, hoverResult, proposal);
+        await hoverApply(hoverId, hoverResult, proposal);
     }, true);
 
     console.log(`[${SCRIPT_NAME}] loaded.`);
