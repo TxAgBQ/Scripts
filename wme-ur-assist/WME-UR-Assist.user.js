@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.10.28.01
+// @version      2026.10.31.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -566,6 +566,7 @@
       const ur = await sdk.DataModel.MapUpdateRequests.getById({ mapUpdateRequestId: id });
       Header.desc = ur?.description || '';
       Header.type = ur?.updateRequestType || '';
+      if (ur) Meta.note(id, { desc: ur.description, type: ur.updateRequestType, reported: ur.reportedOn });
       Header.reportedOn = ur?.reportedOn || 0;
       if (ur) reportedTimes.set(id, ur.reportedOn);
       const details = await sdk.DataModel.MapUpdateRequests.getUpdateRequestDetails({ mapUpdateRequestId: id });
@@ -898,6 +899,46 @@ ${list}`;
     }));
   }
  
+  // ===== REPORT DETAILS FOR THE SHEET (who filed it, what it said, its type, when) =====
+  // Collected as you work (the reporter's name when you open a report; description, type and time from WME and UR-MP's
+  // list) and sent along with the sync in a separate `meta` block, so it can never replace a status or note on the sheet.
+  // The sheet only fills empty cells. Sent once per report (again if more of it becomes known), and only counted as sent
+  // when the web app says it understood (an older web app ignores it, and nothing is lost).
+  const META_BATCH = 150;
+  const metaHash = f => { const t = JSON.stringify([f.reporter || '', f.desc || '', f.type || '', f.reported || 0]); let h = 5381; for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0; return h; };
+  const Meta = {
+    pending: GM_getValue('metaPending', {}),   // id -> { reporter, desc, type, reported } not on the sheet yet
+    sent: GM_getValue('metaSent', {}),         // id -> hash of what was last sent
+    save() { GM_setValue('metaPending', this.pending); GM_setValue('metaSent', this.sent); },
+    note(id, f) {
+      id = String(id);
+      const cur = { ...(this.pending[id] || {}) };
+      let add = false;
+      for (const [k, v] of Object.entries({ reporter: f.reporter, desc: f.desc ? String(f.desc).slice(0, 1000) : '', type: f.type, reported: Number(f.reported) > 0 ? Number(f.reported) : 0 })) {
+        if (v && cur[k] !== v) { cur[k] = v; add = true; }
+      }
+      if (!add) return;
+      const known = this.sent[id];
+      if (known !== undefined && known === metaHash(cur)) return; // sent already
+      this.pending[id] = cur;
+      this.save();
+    },
+    batch() {
+      const items = {};
+      let n = 0;
+      for (const [id, f] of Object.entries(this.pending)) {
+        if (this.sent[id] === metaHash(f)) { delete this.pending[id]; continue; }
+        items[id] = f;
+        if (++n >= META_BATCH) break;
+      }
+      return n ? items : null;
+    },
+    confirm(items) {
+      for (const [id, f] of Object.entries(items || {})) { this.sent[id] = metaHash(f); if (this.pending[id] && metaHash(this.pending[id]) === metaHash(f)) delete this.pending[id]; }
+      this.save();
+    },
+  };
+
   const Sync = {
     timer: null,
     busy: false,
@@ -932,7 +973,8 @@ ${list}`;
         const ids = since ? Object.keys(GM_getValue('syncDirty', {})) : Object.keys(urStore); // first sync sends everything
         const changes = {};
         for (const id of ids) if (urStore[id]) changes[id] = urStore[id];
-        const res = await gmPostJson(settings.syncUrl, { secret: settings.syncSecret, since, changes });
+        const metaItems = Meta.batch();
+        const res = await gmPostJson(settings.syncUrl, { secret: settings.syncSecret, since, changes, ...(metaItems ? { meta: metaItems } : {}) });
         if (res.error) throw new Error(res.error);
         let n = 0;
         const blArrived = []; // UR-MP blacklist changes from your other laptop, to apply here
@@ -967,6 +1009,8 @@ ${list}`;
         if (changed) { GM_setValue('urData', urStore); if (started) Strip.update(); }
         if (resend.length) { clearTimeout(this.timer); this.timer = setTimeout(() => this.run(), 3000); }
         if (blArrived.length) UrmpBL.addPending(blArrived);
+        if (metaItems && res.metaOk) { Meta.confirm(metaItems); LOG(`Saved details of ${Object.keys(metaItems).length} report(s) to the sheet (who filed it, description, type, time).`); }
+        else if (metaItems) LOG('The sync web app is the old version and ignored the report details; update its code (Apps Script) to save them.');
         this.lastOk = Date.now();
         ReadSync.status();
         this.status(`Synced ${new Date().toLocaleTimeString()}${n ? ` – ${n} update(s) from your other laptop` : ''}`);
@@ -1327,6 +1371,16 @@ ${list}`;
         Strip.update();
 
         // Visited marks and read counts (see UR-MP VISITED AND NEW-COMMENTS SYNC)
+        // Report details for every open report in UR-MP's list (see REPORT DETAILS FOR THE SHEET)
+        for (const u of list) {
+          if (!u?.data?.open) continue;
+          Meta.note(u.id, { desc: u.data.description, type: typeof u.data.type === 'string' ? u.data.type : '', reported: Number(u.data.driveDate) });
+        }
+        if (!this.loggedSample) {
+          this.loggedSample = true;
+          const u = list.find(x => x?.data?.open);
+          if (u) LOG(`Report details sample from UR-MP's list: type=${JSON.stringify(u.data.type)}, driveDate=${JSON.stringify(u.data.driveDate)}.`);
+        }
         ReadSync.haveRead = true;
         ReadSync.scan(list);
         ReadSync.behind = ReadSync.countBehind(list);
@@ -2366,6 +2420,26 @@ ${list}`;
     },
   };
 
+  // The submitter's name as the panel shows it ("DRail_100(5)", or "#1234567" when there is only a Waze user number),
+  // read once it has stayed the same for a few checks in a row, then saved to the sheet's report details.
+  const ReporterName = {
+    cand: null,
+    done: new Set(),
+    check(card, id) {
+      if (this.done.has(id)) return;
+      const nameEl = card.querySelector('[data-testid="issue-panel-header-username"]');
+      const r = nameEl ? parseReporter(nameEl.textContent) : null;
+      const num = card.querySelector('.ua-userno')?.dataset.n;
+      const shown = r ? `${r.name} (${r.rank})` : (nameEl ? String(nameEl.textContent || '').replace(/^\s*Username:\s*/, '').replace(/\s+/g, ' ').trim() : (num ? `#${num}` : ''));
+      if (!shown) { this.cand = null; return; }
+      if (!this.cand || this.cand.id !== id || this.cand.shown !== shown) { this.cand = { id, shown, count: 1 }; return; }
+      if (++this.cand.count < 3) return;
+      this.done.add(id);
+      this.cand = null;
+      Meta.note(id, { reporter: shown });
+    },
+  };
+
   // ===== UR PANEL HEADER (not SDK — status buttons and sticky note added to WME's UR panel) =====
   const Header = {
     urId: null,
@@ -2386,6 +2460,7 @@ ${list}`;
       }
       this.refresh(bar, Next.openId);
       this.reporter(card, Next.openId);
+      ReporterName.check(card, Next.openId);
       if (this.loadedId === Next.openId) EditorReport.check(card, Next.openId);
       this.autoInsert(card, Next.openId);
       Seen.check(Next.openId);
