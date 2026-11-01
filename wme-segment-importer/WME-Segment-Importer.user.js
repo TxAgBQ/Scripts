@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110104
+// @version      2026110105
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -2405,9 +2405,14 @@
     // ------------------------------------------------------------------
     // Same boundary file the WME Cities Overlay script draws (cities and Census Designated Places).
     // Texas only for now; other states use their own file in the same folder.
-    const CITY_KML_URL = 'https://raw.githubusercontent.com/WazeDev/WME-Cities-Overlay/master/KMLs/US/TX_Cities.kml';
+    // City and CDP limits come from the WME Cities Overlay KMLs, one file per state. To add a state, add its two-letter code here
+    // (the file must exist at KMLs/US/<code>_Cities.kml in that repository).
+    const CITY_KML_STATES = ['TX', 'AR'];
+    const cityKmlUrl = (st) => `https://raw.githubusercontent.com/WazeDev/WME-Cities-Overlay/master/KMLs/US/${st}_Cities.kml`;
+    const CITY_KML_RETRY_MS = 60000;
 
-    let cityLoadPromise = null;
+    const cityKmlCache = new Map();   // state code -> promise of its places
+    const cityKmlFailedAt = new Map(); // state code -> when its last download failed (not retried for a minute)
 
     function downloadText(url) {
         return new Promise((resolve, reject) => {
@@ -2460,16 +2465,31 @@
     }
 
     // Downloads and parses the boundaries once; a failure is not cached, so the next import retries.
-    function loadCityBoundaries() {
-        if (!cityLoadPromise) {
-            cityLoadPromise = downloadText(CITY_KML_URL)
+    function loadStateCities(st) {
+        if (!cityKmlCache.has(st)) {
+            const failed = cityKmlFailedAt.get(st);
+            if (failed && Date.now() - failed < CITY_KML_RETRY_MS) return Promise.reject(new Error(`the ${st} city limits could not be downloaded a moment ago`));
+            cityKmlCache.set(st, downloadText(cityKmlUrl(st))
                 .then(parseCityKml)
                 .catch((err) => {
-                    cityLoadPromise = null;
+                    cityKmlCache.delete(st);
+                    cityKmlFailedAt.set(st, Date.now());
                     throw err;
-                });
+                }));
         }
-        return cityLoadPromise;
+        return cityKmlCache.get(st);
+    }
+
+    // All the states' city limits together. One state failing to download does not stop the others (it is tried again after a minute);
+    // only when none can be loaded is it an error.
+    async function loadCityBoundaries() {
+        const results = await Promise.allSettled(CITY_KML_STATES.map(loadStateCities));
+        const loaded = results.filter((r) => r.status === 'fulfilled');
+        if (!loaded.length) throw results[0].reason || new Error('download failed');
+        results.forEach((r, i) => {
+            if (r.status === 'rejected') console.warn(`[${SCRIPT_NAME}] City limits for ${CITY_KML_STATES[i]} not loaded:`, r.reason && r.reason.message ? r.reason.message : r.reason);
+        });
+        return loaded.length === 1 ? loaded[0].value : loaded.flatMap((r) => r.value);
     }
 
     // Name of the city / CDP containing the point, or '' if none (smallest wins if they overlap).
