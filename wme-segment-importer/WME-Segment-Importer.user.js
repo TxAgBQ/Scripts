@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110101
+// @version      2026110102
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -2665,7 +2665,18 @@
         }
         let best = null;
         for (const v of votes.values()) if (!best || v.n > best.n) best = v;
-        return best && allowed(best.country) ? { country: best.country, state: best.state } : none;
+        if (best) return allowed(best.country) ? { country: best.country, state: best.state } : none;
+
+        // 3. a new segment with no addressed neighbours loaded (a road drawn in open country): WME still has the state and country it
+        // loaded for this area. Used only when exactly one state is loaded (checked in the console: Texas, with no segments loaded);
+        // with two or more (near a state line) it is a guess, so it is left to the error message.
+        try {
+            const states = sdk.DataModel.States.getAll();
+            const country = sdk.DataModel.Countries.getAll().find((c) => ok(c) && c.abbr === ONLY_COUNTRY);
+            const loaded = states.filter(ok);
+            if (country && loaded.length === 1) return { country, state: loaded[0] };
+        } catch (err) { /* not available */ }
+        return none;
     }
     const REGION_ERROR = 'The script could not work out which United States state this segment is in (it only edits US addresses); pan or zoom the map a little so the area loads, then try again';
 
