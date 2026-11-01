@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.01.01
+// @version      2026.11.01.02
 // @description  Finds Waze places on screen whose linked Google places are permanently closed, and stages their deletion in bulk.
 // @author       TxAgBQ
+// @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
+// @supportURL   https://github.com/TxAgBQ/Scripts/issues
+// @updateURL    https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-Place-Assist/WME-Place-Assist.user.js
+// @downloadURL  https://raw.githubusercontent.com/TxAgBQ/Scripts/main/WME-Place-Assist/WME-Place-Assist.user.js
 // @match        https://beta.waze.com/editor*
 // @match        https://beta.waze.com/*/editor*
 // @match        https://www.waze.com/editor*
@@ -21,7 +25,7 @@
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.01.01';
+  const VERSION = '2026.11.01.02';
   const LOOKUP_CONCURRENCY = 4;
 
   // ---------------------------------------------------------------------------
