@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110106
+// @version      2026110201
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -152,6 +152,8 @@
     // there may not be loaded yet, so the import is refused rather than creating a stray node.
     const REQUIRE_ENDS_ON_SCREEN = true;
     const ROAD_TYPE_STREET = 1;
+    const ROAD_TYPE_PRIVATE = 17;
+    const DRIVEWAY_LOCK_RANK = 1; // SDK lockRank is 0-based: 1 = lock level 2 (to be confirmed in the console)
 
     // Postal city for each ZIP in Kendall County (the county layer has no postal city field).
     // Add to this list whenever the panel reports a ZIP that is missing.
@@ -1164,6 +1166,9 @@
             const n = String(name || '').trim();
             if (!n) return { ok: true, note: '' };
             if (/^(unknown|unnamed|n\/a|null|undefined)(\s+[a-z]{1,6}\.?)?$/i.test(n)) return { ok: false, note: '' };
+            // Some county layers name every driveway "Driveway". That is a kind of road, not a street name: the importer maps it as an
+            // unnamed Private Road (importFeature checks the driveway flag).
+            if (/^(private\s+)?drive\s?way$/i.test(n)) return { ok: false, note: '', driveway: true };
             if (/^\d+[a-z]?(\s+(n|s|e|w|ne|nw|se|sw))?$/i.test(n)) return { ok: false, note: `"${n}" is only a number, so it was not used as a street name.` };
             return { ok: true, note: '' };
         }
@@ -1171,7 +1176,7 @@
         function buildStreetName(parts) {
             const built = buildStreetNameRaw(parts);
             const check = checkStreetName(built.name);
-            return check.ok ? built : { name: '', note: built.note || check.note };
+            return check.ok ? built : { name: '', note: built.note || check.note, driveway: !!check.driveway };
         }
 
         const isUsableStreetName = (name) => checkStreetName(name).ok && !!String(name || '').trim();
@@ -3961,6 +3966,7 @@
 
         const nameInfo = buildStreetName(source.nameParts(feature.properties || {}));
         name = nameInfo.name;
+        const driveway = !!nameInfo.driveway; // a GIS "Driveway": Private Road, no name, lock 2
 
         // Both ends must be visible so nearby existing nodes are loaded and can be joined.
         if (REQUIRE_ENDS_ON_SCREEN) {
@@ -4000,10 +4006,10 @@
         // 2. Create the segment, attaching snap info so WME joins nodes / splits segments
         let created;
         try {
-            created = await addSegmentWithSnaps(coords, snappedFeatures);
+            created = await addSegmentWithSnaps(coords, snappedFeatures, driveway ? ROAD_TYPE_PRIVATE : ROAD_TYPE_STREET);
         } catch (err) {
             console.error(`[${SCRIPT_NAME}] addSegment failed:`, err);
-            return say('failed', 'error', `${name || 'New road'}: could not create segment: ${err.message || err}`);
+            return say('failed', 'error', `${name || (driveway ? 'Driveway' : 'New road')}: could not create segment: ${err.message || err}`);
         }
         const { segmentId, patched } = created;
         if (feature.id !== undefined) importedFeatureIds.add(featureKey);
@@ -4069,6 +4075,36 @@
             }
             if (cityInfo.warn) level = 'warn';
             messages.push(...cityInfo.notes);
+        } else if (driveway) {
+            // No street name, but inside city limits it still gets the primary city (no alternate: an alternate needs a street name).
+            messages[0] = `Driveway: created as a Private Road with no name (${source.label}).`;
+            try {
+                await sdk.DataModel.Segments.updateSegment({ segmentId, lockRank: DRIVEWAY_LOCK_RANK });
+            } catch (err) {
+                level = 'warn';
+                messages.push(`Could not set the lock to level ${DRIVEWAY_LOCK_RANK + 1}: ${err.message || err}.`);
+                console.warn(`[${SCRIPT_NAME}] driveway lock failed:`, err);
+            }
+            try {
+                const cityInfo = await resolveCities(coords, { cities: [], notes: [] });
+                if (cityInfo.skipCity) {
+                    level = 'warn';
+                    messages.push('City limits could not be loaded, so no city was set.');
+                } else if (cityInfo.primaryCity) {
+                    await applyAddress(segmentId, '', cityInfo.primaryCity, []);
+                    messages.push(`City: ${cityInfo.primaryCity}.`);
+                    if (cityInfo.notes.some((n) => /crosses a city limit/.test(n))) {
+                        level = 'warn';
+                        messages.push(cityInfo.notes.find((n) => /crosses a city limit/.test(n)));
+                    }
+                } else {
+                    messages.push('Outside city limits, so no city.');
+                }
+            } catch (err) {
+                level = 'warn';
+                messages.push(`Could not set the city: ${err.message || err}.`);
+                console.warn(`[${SCRIPT_NAME}] driveway city failed:`, err);
+            }
         } else {
             level = 'warn';
             messages.push('GIS road has no street name.');
