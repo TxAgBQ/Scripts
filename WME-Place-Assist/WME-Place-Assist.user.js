@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.02.03
+// @version      2026.11.02.04
 // @description  Floating bar that flags Waze places on screen linked to permanently closed Google places, with a one-click list and staged delete.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
@@ -25,7 +25,7 @@
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.02.03';
+  const VERSION = '2026.11.02.04';
   const LOOKUP_CONCURRENCY = 4;
   const MIN_ZOOM = 17;            // WME only loads places at zoom 17 and closer
   const SCAN_DEBOUNCE_MS = 700;   // wait for the map to settle before scanning
@@ -97,10 +97,13 @@
     return closed === statuses.length ? 'remove' : 'review';
   }
 
+  // WME keeps a staged-for-deletion place in its data until you save, so remember what we staged.
+  const stagedIds = new Set();
+
   async function findClosedOnScreen(sdk) {
     const extent = await sdk.Map.getMapExtent();
     const all = await sdk.DataModel.Venues.getAll();
-    const linked = all.filter((v) => v.externalProviderIds && v.externalProviderIds.length)
+    const linked = all.filter((v) => !stagedIds.has(v.id) && v.externalProviderIds && v.externalProviderIds.length)
       .filter((v) => { const p = venuePoint(v); return p && inExtent(p, extent); });
 
     const placeIds = [...new Set(linked.flatMap((v) => v.externalProviderIds))];
@@ -289,6 +292,7 @@
       if (!ids.length || app.busy) return;
       app.busy = true; app.message = 'Staging deletions…'; emit();
       const { deleted, failed } = await stageDeletions(sdk, ids);
+      deleted.forEach((id) => stagedIds.add(id));
       app.rows = app.rows.filter((r) => !deleted.includes(r.id));
       deleted.forEach((id) => app.checked.delete(id));
       if (deleted.length) addToTotal(deleted.length);
@@ -612,7 +616,11 @@
     }
     // After a save, the staged deletions are final: dismiss the popup and rescan.
     try {
-      await sdk.Events.on({ eventName: 'wme-save-finished', eventHandler: () => { ctrl.closePopup(); ctrl.schedule(1200); } });
+      await sdk.Events.on({ eventName: 'wme-save-finished', eventHandler: () => { stagedIds.clear(); ctrl.closePopup(); ctrl.schedule(1200); } });
+      // If everything staged was undone, those places are live again and may be listed.
+      await sdk.Events.on({ eventName: 'wme-after-undo', eventHandler: async () => {
+        try { if ((await sdk.Editing.getUnsavedChangesCount()) === 0) { stagedIds.clear(); ctrl.schedule(600); } } catch (e) { /* ignore */ }
+      } });
     } catch (e) { console.warn(`${SCRIPT_NAME}: save event not available`, e); }
     ctrl.schedule(800);
     console.log(`${SCRIPT_NAME} v${VERSION} loaded`);
