@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.01.02
+// @version      2026.11.02.01
 // @description  Finds Waze places on screen whose linked Google places are permanently closed, and stages their deletion in bulk.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
@@ -25,8 +25,9 @@
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.01.02';
+  const VERSION = '2026.11.02.01';
   const LOOKUP_CONCURRENCY = 4;
+  const TOTAL_KEY = 'wme-place-assist.deleted-total';
 
   // ---------------------------------------------------------------------------
   // 1. Google status lookup
@@ -155,6 +156,27 @@
     return { deleted, failed };
   }
 
+  // Running total of places deleted with this tool. Counted when the deletion is
+  // staged. Stored in this site's localStorage, so beta and production keep
+  // separate totals.
+  function readTotal() {
+    try {
+      const n = parseInt(localStorage.getItem(TOTAL_KEY), 10);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function addToTotal(count) {
+    try { localStorage.setItem(TOTAL_KEY, String(readTotal() + count)); } catch (e) { /* storage unavailable */ }
+    return readTotal();
+  }
+
+  function resetTotal() {
+    try { localStorage.removeItem(TOTAL_KEY); } catch (e) { /* storage unavailable */ }
+  }
+
   // ---------------------------------------------------------------------------
   // 4. Sidebar UI
   // ---------------------------------------------------------------------------
@@ -171,7 +193,9 @@
     .wpa-row.review { background: #fff8e1; }
     .wpa-name { background: none; border: 0; padding: 0; color: #0366d6; text-align: left; cursor: pointer; font-size: 13px; }
     .wpa-meta { color: #666; font-size: 11px; }
-    .wpa-version { margin-top: 8px; color: #999; font-size: 10px; }
+    .wpa-total { margin-top: 8px; color: #555; }
+    .wpa-total button { cursor: pointer; padding: 1px 6px; margin-left: 4px; }
+    .wpa-version { margin-top: 4px; color: #999; font-size: 10px; }
   `;
 
   function el(tag, props, ...children) {
@@ -188,7 +212,7 @@
   }
 
   function buildUi(sdk, pane) {
-    const state = { rows: [], checked: new Set(), confirm: null, busy: false, message: 'Pan/zoom to an area, then press Scan screen.' };
+    const state = { rows: [], checked: new Set(), confirm: null, confirmReset: false, busy: false, message: 'Pan/zoom to an area, then press Scan screen.' };
     const root = el('div', { class: 'wpa' });
     pane.append(el('style', { text: CSS }), root);
 
@@ -224,6 +248,7 @@
       const { deleted, failed } = await stageDeletions(sdk, ids);
       state.rows = state.rows.filter((r) => !deleted.includes(r.id));
       deleted.forEach((id) => state.checked.delete(id));
+      if (deleted.length) addToTotal(deleted.length);
       let unsaved = '?';
       try { unsaved = await sdk.Editing.getUnsavedChangesCount(); } catch (e) { /* ignore */ }
       state.message = `Staged ${deleted.length} deletion(s)${failed.length ? `, ${failed.length} failed (${failed[0].error})` : ''}. ` +
@@ -250,10 +275,9 @@
 
       const list = state.rows.map((r) => {
         const total = r.links.length;
-        const meta = r.kind === 'remove'
-          ? `All ${total} Google link${total > 1 ? 's' : ''} permanently closed`
-          : `Review: ${r.closedCount} of ${total} Google links closed`;
-        const tags = [`L${(r.lockRank || 0) + 1}`];
+        // Link counts only matter for yellow review rows; red rows show just the tags.
+        const tags = r.kind === 'review' ? [`${r.closedCount} of ${total} Google links closed`] : [];
+        tags.push(`L${(r.lockRank || 0) + 1}`);
         if (r.urCount) tags.push(`${r.urCount} UR`);
         if (!r.canDelete) tags.push('no permission');
         return el('div', { class: `wpa-row ${r.kind}` },
@@ -263,8 +287,17 @@
           }),
           el('div', {},
             el('button', { class: 'wpa-name', text: r.name, title: r.links.map((l) => l.status).join(', '), onclick: () => showVenue(sdk, r) }),
-            el('div', { class: 'wpa-meta', text: `${meta} · ${tags.join(' · ')}` })));
+            el('div', { class: 'wpa-meta', text: tags.join(' · ') })));
       });
+
+      const totalLine = el('div', { class: 'wpa-total' },
+        el('span', { text: `Deleted with Place Assist: ${readTotal()} (this site)` }),
+        state.confirmReset
+          ? el('span', {},
+            el('span', { text: ' Reset to 0?' }),
+            el('button', { text: 'Yes', onclick: () => { resetTotal(); state.confirmReset = false; render(); } }),
+            el('button', { text: 'Cancel', onclick: () => { state.confirmReset = false; render(); } }))
+          : el('button', { text: 'Reset', disabled: state.busy, onclick: () => { state.confirmReset = true; render(); } }));
 
       root.replaceChildren(...[
         el('div', { class: 'wpa-title', text: 'Closed places on screen' }),
@@ -272,6 +305,7 @@
         confirmBox,
         el('div', { class: 'wpa-status', text: state.message }),
         ...list,
+        totalLine,
         el('div', { class: 'wpa-version', text: `${SCRIPT_NAME} v${VERSION}` }),
       ].filter(Boolean));
     }
