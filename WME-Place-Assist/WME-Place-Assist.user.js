@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.02.02
+// @version      2026.11.02.03
 // @description  Floating bar that flags Waze places on screen linked to permanently closed Google places, with a one-click list and staged delete.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
@@ -25,7 +25,7 @@
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.02.02';
+  const VERSION = '2026.11.02.03';
   const LOOKUP_CONCURRENCY = 4;
   const MIN_ZOOM = 17;            // WME only loads places at zoom 17 and closer
   const SCAN_DEBOUNCE_MS = 700;   // wait for the map to settle before scanning
@@ -298,6 +298,7 @@
         `Unsaved changes: ${unsaved}. Save in WME to apply.`;
       app.status = statusFromRows();
       app.busy = false;
+      app.popupOpen = false; // list is done once staged; no second click needed
       emit();
       schedule(400); // auto-rescan after a delete
     }
@@ -609,6 +610,10 @@
     for (const eventName of ['wme-map-move-end', 'wme-map-data-loaded', 'wme-map-zoom-changed']) {
       await sdk.Events.on({ eventName, eventHandler: () => ctrl.schedule() });
     }
+    // After a save, the staged deletions are final: dismiss the popup and rescan.
+    try {
+      await sdk.Events.on({ eventName: 'wme-save-finished', eventHandler: () => { ctrl.closePopup(); ctrl.schedule(1200); } });
+    } catch (e) { console.warn(`${SCRIPT_NAME}: save event not available`, e); }
     ctrl.schedule(800);
     console.log(`${SCRIPT_NAME} v${VERSION} loaded`);
   }
