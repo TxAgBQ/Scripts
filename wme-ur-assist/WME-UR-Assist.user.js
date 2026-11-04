@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME UR Assist
 // @namespace    https://greasyfork.org/users/820296-txagbq
-// @version      2026.11.01.01
+// @version      2026.11.04.01
 // @description  Status icons and sticky notes on the UR panel and in the UR-MP list, automatic red X after 72 hours with no Wazer reply, reporter user number, Next-UR tracking, automatic replies to camera reports, and UR-MP blacklist / visited / new-comments sync between laptops.
 // @author       TxAgBQ
 // @updateURL    https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-ur-assist/WME-UR-Assist.user.js
@@ -1604,6 +1604,50 @@ ${list}`;
     return document.documentElement;
   }
  
+  // ===== KEEP THE UR-MP LIST WHERE YOU WERE =====
+  // UR-MP throws its whole table away and builds a new one whenever a report is opened or closed, and the new table
+  // starts back at the top. This remembers where the list was scrolled to and puts it back as soon as the new table appears.
+  const ListScroll = {
+    scroller: null,
+    table: null,
+    observer: null,
+    stable: 0,       // last position you left the list at (not counting jumps caused by a rebuild)
+    swapAt: 0,
+    getTable() { return document.querySelector('tr[id^="urt-tr-"]')?.closest('table') || null; },
+    restore(why) {
+      const sp = this.scroller;
+      if (!sp || !sp.isConnected) return;
+      if (sp.scrollTop < this.stable - 5) sp.scrollTop = this.stable;
+    },
+    ensure() {
+      const table = this.getTable();
+      if (!table) return;
+      const sp = scrollParent(table);
+      if (sp === document.documentElement) return; // no list scroller found: leave it alone
+      if (sp !== this.scroller) {
+        this.observer?.disconnect();
+        this.scroller = sp;
+        this.table = table;
+        this.stable = sp.scrollTop;
+        // Remember where you scroll to — but ignore the jump a rebuild causes, so it can't overwrite the saved spot
+        sp.addEventListener('scroll', () => {
+          if (Date.now() - this.swapAt > 1500) this.stable = sp.scrollTop;
+        }, { passive: true });
+        this.observer = new MutationObserver(() => {
+          const tb = this.getTable();
+          if (tb && tb !== this.table) {
+            this.table = tb;
+            this.swapAt = Date.now();
+            this.restore('rebuilt');
+            setTimeout(() => this.restore('rebuilt, late'), 120); // once more in case rows finished filling in after
+          }
+        });
+        this.observer.observe(sp, { childList: true, subtree: true });
+      }
+    },
+    start() { setInterval(() => { try { this.ensure(); } catch (e) { /* UR-MP not on screen yet */ } }, 1500); },
+  };
+
   const TRANSPARENT = /^(transparent|rgba\(0, 0, 0, 0\))$/;
   const border = (cs, side) => `${cs[`border${side}Width`]} ${cs[`border${side}Style`]} ${cs[`border${side}Color`]}`;
  
@@ -3233,7 +3277,8 @@ ${list}`;
     buildUi(tabPane);
     UrmpBL.start();
     FullScan.start();
- 
+    ListScroll.start();
+
     sdk.Events.on({ eventName: 'wme-update-request-panel-opened', eventHandler: onUrOpened });
     publish('uaApi', '1'); // ready: other scripts can now use the open-next API
     setInterval(() => Next.refresh(), 1000);
