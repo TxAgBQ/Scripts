@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Tasks Layer Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.11.05.01
+// @version      2026.11.05.02
 // @description  Adds per-type visibility checkboxes (Update requests, Map suggestions) under the Tasks layer in the WME Map layers panel.
 // @author       TxAgBQ
 // @match        https://*.waze.com/*/editor*
@@ -24,7 +24,6 @@
     const SCRIPT_ID = 'wme-tasks-layer-assist';
     const SCRIPT_NAME = 'WME Tasks Layer Assist';
     const STORAGE_KEY = 'wme-tasks-layer-assist';
-    const GROUP_LABEL = 'Task types';
     const TASKS_TOGGLE_ID = 'layer-switcher-group_issues_tracker';
     const GROUP_ATTR = 'data-wta-group';
     const NUDGE_DEG = 0.0002;          // ~20 m; used to make WME redraw a layer that was switched back on
@@ -43,7 +42,7 @@
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     // ---------- saved state (localStorage, like WME's own layer settings) ----------
-    const state = { collapsed: false };
+    const state = {};
     TYPES.forEach((t) => { state[t.key] = true; });
 
     function loadState() {
@@ -115,27 +114,35 @@
         return x !== null && x < window.innerWidth && x > 0 && document.getElementById(TASKS_TOGGLE_ID).getBoundingClientRect().width > 0;
     }
 
-    // If the panel was open before the nudge, reopen it each time WME closes it (the shift and the
-    // restore each trigger a data load). A close must be seen on two checks in a row, so a click never
-    // lands in the middle of the slide animation. At most 3 reopens.
+    // If the panel was open before the nudge, reopen it each time WME closes it (the map move triggers a data load). A close must be seen on two checks in a row, so a click never
+    // lands in the middle of the slide animation. At most 2 reopens.
     async function watchPanel(openX) {
         if (openX === null) return;
         const btn = () => document.querySelector('wz-button.layer-switcher-button');
-        const until = Date.now() + 20000;
+        const until = Date.now() + 18000;
         let stable = 0;
         let clicks = 0;
-        while (Date.now() < until && clicks < 3) {
-            await sleep(250);
-            const x = tasksSwitchLeft();
-            stable = x !== null && x > openX + 150 ? stable + 1 : 0;
-            if (stable >= 2) {
-                const b = btn();
-                if (!b) return;
-                b.click();
-                clicks++;
-                stable = 0;
-                await sleep(1500);
+        // If the user clicks the layers button themselves, stop; never fight a real click.
+        let userClicked = false;
+        const onClick = (e) => { if (e.isTrusted && e.target && e.target.closest && e.target.closest('wz-button.layer-switcher-button')) userClicked = true; };
+        document.addEventListener('click', onClick, true);
+        try {
+            while (Date.now() < until && clicks < 2 && !userClicked) {
+                await sleep(250);
+                if (userClicked) break;
+                const x = tasksSwitchLeft();
+                stable = x !== null && x > openX + 150 ? stable + 1 : 0;
+                if (stable >= 2) {
+                    const b = btn();
+                    if (!b) return;
+                    b.click();
+                    clicks++;
+                    stable = 0;
+                    await sleep(1500);
+                }
             }
+        } finally {
+            document.removeEventListener('click', onClick, true);
         }
     }
 
@@ -144,7 +151,7 @@
         const start = await sdk.Map.getMapCenter();
         const shifted = { lon: start.lon + NUDGE_DEG, lat: start.lat };
         await sdk.Map.setMapCenter({ lonLat: shifted });
-        await sleep(1200);
+        await sleep(150);
         const now = await sdk.Map.getMapCenter();
         if (Math.abs(now.lon - shifted.lon) < NUDGE_DEG / 4 && Math.abs(now.lat - shifted.lat) < NUDGE_DEG / 4) {
             await sdk.Map.setMapCenter({ lonLat: start });
@@ -165,7 +172,7 @@
         saveKey(type.key);
         enqueue(async () => {
             const changed = await setLayer(type, checked);
-            if (changed && checked) await nudgeMap();
+            if (changed && checked) { showBusy(type, 9000); await nudgeMap(); }
         });
     }
 
@@ -193,6 +200,16 @@
         return fallback;
     }
 
+    const labelEls = {};
+
+    // Redrawing takes several seconds; show that the click registered.
+    function showBusy(type, ms) {
+        const el = labelEls[type.key];
+        if (!el) return;
+        el.textContent = type.label + ' (loading\u2026)';
+        setTimeout(() => { el.textContent = type.label; }, ms);
+    }
+
     function buildGroup(tpl) {
         const group = tpl.group.cloneNode(true);
         group.setAttribute(GROUP_ATTR, '1');
@@ -205,17 +222,11 @@
         group.querySelectorAll('[id]').forEach((e) => e.removeAttribute('id'));
         group.querySelectorAll('[data-testid]').forEach((e) => e.removeAttribute('data-testid'));
 
-        // Header: chevron + label only (no group toggle; the Tasks switch above stays the master).
-        const toggle = cat.querySelector('wz-toggle-switch');
-        if (toggle) toggle.remove();
-        const label = cat.querySelector('label');
-        label.removeAttribute('for');
-        label.textContent = GROUP_LABEL;
-        label.style.cursor = 'pointer';
-        const chevron = cat.querySelector('wz-button');
-        const chevronIcon = chevron.querySelector('i');
-        // Always start from the "expanded" caret, whatever state the template group was in.
-        if (chevronIcon) chevronIcon.className = chevronIcon.className.replace(/w-icon-caret-\w+/, 'w-icon-caret-down');
+        // Sub-section: no header or arrow of its own; the checkboxes sit directly under Tasks, indented.
+        cat.style.display = 'none';
+        area.setAttribute('aria-expanded', 'true');
+        area.style.display = '';
+        area.style.paddingInlineStart = '16px';
 
         // Body: one checkbox per type, each cloned from a native checkbox row.
         const list = area.querySelector('ul');
@@ -228,26 +239,12 @@
             const cb = li.querySelector('wz-checkbox');
             cb.setAttribute('name', 'wta-' + t.key);
             cb.textContent = t.label;
+            labelEls[t.key] = cb;
             if (state[t.key]) cb.setAttribute('checked', ''); else cb.removeAttribute('checked');
             cb.checked = state[t.key];
             cb.addEventListener('change', () => onTypeChanged(t, !!cb.checked));
             list.appendChild(li);
         });
-
-        const applyCollapsed = () => {
-            area.setAttribute('aria-expanded', String(!state.collapsed));
-            area.style.display = state.collapsed ? 'none' : '';
-            const icon = chevron.querySelector('i');
-            if (icon) icon.style.transform = state.collapsed ? 'rotate(-90deg)' : '';
-        };
-        const toggleCollapsed = () => {
-            state.collapsed = !state.collapsed;
-            saveKey('collapsed');
-            applyCollapsed();
-        };
-        chevron.addEventListener('click', toggleCollapsed);
-        label.addEventListener('click', toggleCollapsed);
-        applyCollapsed();
 
         return group;
     }
