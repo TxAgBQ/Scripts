@@ -1,0 +1,53 @@
+# WME Tasks Layer Assist
+
+A Tampermonkey userscript for the Waze Map Editor (works in beta and production).
+
+WME's **Tasks** layer is all on or all off. This script adds a **Task types** group right under it in the
+**Map layers** panel, with a checkbox per issue type, so you can show or hide each type on the current screen:
+
+- Update requests
+- Map suggestions (existing segments / editor suggestions)
+
+Hidden types are not drawn and cannot be clicked.
+
+## How it works with the Issue Tracker filter
+
+The Issue Tracker filter still decides which issues are *available* (for example, URs open and closed, Map
+suggestions open only). The checkboxes only hide a subset of those on the map. The script never changes the
+Issue Tracker filter.
+
+## Behavior
+
+- The group has an expand/collapse arrow like the other layer groups. Collapsing it does not change any checkbox.
+- Checkbox and collapse state are remembered between sessions (browser `localStorage`, separately for beta and
+  production). A new tab starts from the last saved state. Tabs that are already open are not changed when you
+  toggle something in another tab, so one tab can show URs while another shows Map suggestions.
+- If you switch the Tasks layer off and on again, unchecked types stay hidden.
+- Switching a type back on nudges the map about 20 m and back, because WME only redraws that layer's icons
+  after a real map move. If you move the map yourself during the nudge, the script leaves it where you put it.
+  WME also closes the Map layers panel when the redrawn data arrives; if the panel was open, the script
+  reopens it (up to 3 times, within about 20 seconds).
+
+## Not included (yet)
+
+- **New-segment Map suggestions** (Google-sourced): the WME SDK has no layer switch for these, so they cannot be
+  hidden separately.
+- **Open-only / closed-only** per type: the SDK has no way to filter inside a layer. Use the Issue Tracker filter.
+- **Place update requests** and **Map problems**: not in the first version.
+
+## Technical notes
+
+- Uses the WME SDK in `async` mode only. No `W` or OpenLayers internals, so it is not affected by their removal.
+- The Task types group is built by cloning an existing native group in the panel at runtime (WME's panel class
+  names are hashed and change between builds). If WME's panel markup changes and the group cannot be built, the
+  script falls back to two checkboxes in the shared **Userscripts** group of the Map layers panel.
+
+## Install
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/).
+2. Open the raw script link: `https://github.com/TxAgBQ/Scripts/raw/refs/heads/main/wme-tasks-layer-assist/WME-Tasks-Layer-Assist.user.js`
+3. Click **Install**. Tampermonkey checks this link for updates.
+
+## Version history
+
+- **2026.11.05.01** - First version: Update requests and Map suggestions (existing) checkboxes under Tasks.
