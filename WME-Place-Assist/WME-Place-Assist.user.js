@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.02.04
-// @description  Floating bar that flags Waze places on screen linked to permanently closed Google places, with a one-click list and staged delete.
+// @version      2026.11.06.01
+// @description  Floating bar that flags Waze places on screen linked to permanently closed Google places, with one-click staged delete or removal of just the closed link.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
 // @supportURL   https://github.com/TxAgBQ/Scripts/issues
@@ -19,13 +19,14 @@
 // ==/UserScript==
 
 /* global google */
+/* The only non-SDK access is link removal (see removeClosedLinks). */
 
 (function () {
   'use strict';
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.02.04';
+  const VERSION = '2026.11.06.01';
   const LOOKUP_CONCURRENCY = 4;
   const MIN_ZOOM = 17;            // WME only loads places at zoom 17 and closer
   const SCAN_DEBOUNCE_MS = 700;   // wait for the map to settle before scanning
@@ -127,6 +128,7 @@
         kind,
         links,
         closedCount: links.filter((l) => l.status === 'CLOSED_PERMANENTLY').length,
+        closedIds: links.filter((l) => l.status === 'CLOSED_PERMANENTLY').map((l) => l.id),
         canDelete,
         lockRank: v.lockRank,
         urCount: (v.venueUpdateRequests || []).length,
@@ -147,6 +149,30 @@
     if (!inExtent([row.lon, row.lat], ext)) {
       await sdk.Map.setMapCenter({ lonLat: { lon: row.lon, lat: row.lat } });
     }
+  }
+
+  // The SDK has no method for editing a place's external provider links (checked: updateVenue ignores
+  // them), so removing a closed link uses WME's own edit action. This is the only non-SDK code in the
+  // script, kept in these two functions. If WME changes it, link removal is switched off, nothing else.
+  function linkRemovalAvailable() {
+    try {
+      return !!(window.W && window.W.model && window.W.model.actionManager && window.W.model.venues &&
+        typeof window.require === 'function' && window.require('Waze/Action/UpdateObject'));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function removeClosedLinks(venueId, closedIds) {
+    const UpdateObject = window.require('Waze/Action/UpdateObject');
+    const venue = window.W.model.venues.getObjectById(venueId);
+    if (!venue) throw new Error('place not found');
+    const links = venue.getAttributes().externalProviderIDs || [];
+    const uuidOf = (l) => (l && l.attributes ? l.attributes.uuid : l && l.uuid);
+    const keep = links.filter((l) => !closedIds.includes(uuidOf(l)));
+    if (keep.length === links.length) throw new Error('closed link not found');
+    if (!keep.length) throw new Error('would remove every link'); // that case is a delete, not an unlink
+    window.W.model.actionManager.add(new UpdateObject(venue, { externalProviderIDs: keep }));
   }
 
   async function stageDeletions(sdk, venueIds) {
@@ -266,14 +292,14 @@
         if (myToken === token && !app.minimized) {
           const prev = new Map(app.rows.map((r) => [r.id, app.checked.has(r.id)]));
           app.rows = result.rows;
-          // keep the user's earlier choices; new red rows start checked, new amber rows do not
+          // keep the user's earlier choices; every new row starts checked (red = delete, amber = remove closed link)
           app.checked = new Set(result.rows
-            .filter((r) => r.canDelete && (prev.has(r.id) ? prev.get(r.id) : r.kind === 'remove'))
+            .filter((r) => r.canDelete && (prev.has(r.id) ? prev.get(r.id) : true))
             .map((r) => r.id));
           const nRemove = result.rows.filter((r) => r.kind === 'remove').length;
           const nReview = result.rows.length - nRemove;
           app.message = result.rows.length
-            ? `${nRemove} closed-only, ${nReview} to review.`
+            ? `${nRemove} to delete, ${nReview} to unlink a closed link.`
             : `Checked ${result.linkedChecked} linked places: none permanently closed.`;
           if (result.lookupErrors) app.message += ` ${result.lookupErrors} lookup(s) failed and will be retried on the next scan.`;
           app.status = statusFromRows();
@@ -288,23 +314,41 @@
     }
 
     async function deleteChecked() {
-      const ids = app.rows.filter((r) => app.checked.has(r.id) && r.canDelete).map((r) => r.id);
-      if (!ids.length || app.busy) return;
-      app.busy = true; app.message = 'Staging deletions…'; emit();
-      const { deleted, failed } = await stageDeletions(sdk, ids);
+      const picked = app.rows.filter((r) => app.checked.has(r.id) && r.canDelete);
+      const delRows = picked.filter((r) => r.kind === 'remove');
+      const linkRows = picked.filter((r) => r.kind === 'review');
+      if (!picked.length || app.busy) return;
+      app.busy = true; app.message = 'Staging changes…'; emit();
+
+      const { deleted, failed } = await stageDeletions(sdk, delRows.map((r) => r.id));
       deleted.forEach((id) => stagedIds.add(id));
-      app.rows = app.rows.filter((r) => !deleted.includes(r.id));
-      deleted.forEach((id) => app.checked.delete(id));
-      if (deleted.length) addToTotal(deleted.length);
+
+      const unlinked = [];
+      let linkNote = '';
+      if (linkRows.length && !linkRemovalAvailable()) {
+        linkNote = ` Could not remove links on ${linkRows.length} place(s): WME's edit action is not available.`;
+      } else {
+        for (const r of linkRows) {
+          try { removeClosedLinks(r.id, r.closedIds); unlinked.push(r.id); } catch (e) {
+            failed.push({ venueId: r.id, error: String((e && e.message) || e) });
+          }
+        }
+      }
+
+      const done = [...deleted, ...unlinked];
+      app.rows = app.rows.filter((r) => !done.includes(r.id));
+      done.forEach((id) => app.checked.delete(id));
+      if (done.length) addToTotal(done.length);
       let unsaved = '?';
       try { unsaved = await sdk.Editing.getUnsavedChangesCount(); } catch (e) { /* ignore */ }
-      app.message = `Staged ${deleted.length} deletion(s)${failed.length ? `, ${failed.length} failed (${failed[0].error})` : ''}. ` +
+      app.message = `Staged ${deleted.length} deletion(s) and ${unlinked.length} link removal(s)` +
+        `${failed.length ? `, ${failed.length} failed (${failed[0].error})` : ''}.${linkNote} ` +
         `Unsaved changes: ${unsaved}. Save in WME to apply.`;
       app.status = statusFromRows();
       app.busy = false;
       app.popupOpen = false; // list is done once staged; no second click needed
       emit();
-      schedule(400); // auto-rescan after a delete
+      schedule(400); // auto-rescan after the changes
     }
 
     return {
@@ -468,7 +512,7 @@
 
     function tooltip(count) {
       if (app.status === 'red') return `${count} closed place(s) to delete. Click to review.`;
-      if (app.status === 'amber') return `${count} place(s) with a closed Google link. Click to review.`;
+      if (app.status === 'amber') return `${count} place(s) with a closed Google link to remove. Click to review.`;
       if (app.status === 'scanning') return 'Scanning…';
       if (app.status === 'zoom') return `Zoom in to level ${MIN_ZOOM} or closer to scan`;
       if (app.status === 'nogoogle') return 'Google Places library not available';
@@ -482,7 +526,7 @@
       const allChecked = deletable.length > 0 && deletable.every((r) => app.checked.has(r.id));
 
       const rows = app.rows.map((r) => {
-        const tags = r.kind === 'review' ? [`${r.closedCount} of ${r.links.length} Google links closed`] : [];
+        const tags = r.kind === 'review' ? [`remove ${r.closedCount} closed link(s), keep ${r.links.length - r.closedCount}`] : [];
         tags.push(`L${(r.lockRank || 0) + 1}`);
         if (r.urCount) tags.push(`${r.urCount} UR`);
         if (!r.canDelete) tags.push('no permission');
@@ -498,12 +542,12 @@
         el('label', {},
           el('input', { type: 'checkbox', checked: allChecked, disabled: app.busy, onchange: (ev) => ctrl.setAllChecked(ev.target.checked) }),
           document.createTextNode(' Select all')),
-        el('button', { class: 'wpa-del', type: 'button', text: selected ? `Delete ${selected}` : 'Delete', disabled: app.busy || !selected, onclick: () => ctrl.deleteChecked() }));
+        el('button', { class: 'wpa-del', type: 'button', text: selected ? `Fix ${selected}` : 'Fix', title: 'Delete the all-closed places and remove only the closed link from the rest', disabled: app.busy || !selected, onclick: () => ctrl.deleteChecked() }));
 
       const scanNow = !app.autoScan && el('button', { class: 'wpa-btn', type: 'button', text: 'Scan now', disabled: app.busy, onclick: () => ctrl.scanNow() });
 
       popup.replaceChildren(...[
-        el('div', { class: 'wpa-head', text: 'Closed places on screen' }),
+        el('div', { class: 'wpa-head', text: 'Closed Google links on screen' }),
         el('div', { class: 'wpa-msg', text: app.message }),
         scanNow,
         ...rows,
@@ -560,7 +604,7 @@
 
     function render() {
       const totalLine = el('div', {},
-        el('span', { text: `Deleted with Place Assist: ${readTotal()} (this site)` }),
+        el('span', { text: `Places fixed with Place Assist: ${readTotal()} (this site)` }),
         confirmReset
           ? el('span', {},
             document.createTextNode(' Reset to 0?'),
