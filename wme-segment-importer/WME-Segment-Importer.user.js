@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110606
+// @version      2026110607
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1251,7 +1251,7 @@
     let gapList = [];
     let gapHistory = [];
     // The review list under the Segment check buttons: the flagged segments in view whose fix is a city, to check, uncheck and apply.
-    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null, typeNames: null, failed: new Set(), layerSig: '' };
+    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null, typeNames: null, failed: new Set(), layerSig: '', stop: false };
     let gapSignature = '';
     let gapScanBusy = false;
     const gapCityCache = new Map();
@@ -4618,6 +4618,7 @@
             }
         }
 
+        if (opts.dryRun) return { dryRun: true, message: filled.length ? `Would fill in ${filled.join('; ')}.` : 'Nothing to fill in.', filled, primary, newAltCities, blankAltFix, match, postalCities: postal.cities || [], skipCity: !!cityInfo.skipCity };
         if (!filled.length) {
             // a named road with no city at all is not "nothing missing": say that no city could be found, and why
             if (!cityInfo.skipCity && !currentCity && !currentAlts.some((x) => cityOf(x))) {
@@ -4630,7 +4631,6 @@
             return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match, mismatch: mismatchInfo };
         }
 
-        if (opts.dryRun) return { dryRun: true, message: `Would fill in ${filled.join('; ')}.`, filled, primary, newAltCities, blankAltFix, match };
         const { country, state } = await regionOf(segmentId);
         if (!country || !state) return { message: `Could not fill in the address: ${REGION_ERROR}.`, warn: true, match };
         const alternateStreetIds = [];
@@ -5678,6 +5678,15 @@
 
         const analysis = await ccAnalyze(id, false);
         const primary = (analysis.proposals || []).find((p) => p.kind === 'primary');
+        // Replacing a primary city (Kingwood -> Houston) can make the old one the right alternate city (Kingwood is the postal city). That is
+        // only known from the postal lookup, so without one the row is left alone rather than losing the old city.
+        const replacing = !!(primary && primary.city && originalPrimary && !ccSameCity(originalPrimary, primary.city) && before && before.name);
+        if (replacing) {
+            const dry = await fillSegmentInfo(id, { cityOnly: true, dryRun: true, assumePrimary: primary.city });
+            if (!dry.dryRun || dry.skipCity || !dry.postalCities.length) {
+                return { outcome: 'review', changed: false, renamed: false, message: `Not changed: the primary city would go from ${originalPrimary} to ${primary.city}, but no postal city could be found to say whether ${originalPrimary} should become the alternate. ${dry.dryRun ? 'Turn on a GIS road layer for this area and try again.' : (dry.message || '')}`.trim() };
+            }
+        }
         if (primary && primary.city) {
             await ccApply(id, primary);
             changed = true;
@@ -7799,10 +7808,16 @@
                         const lines = [];
                         if (prim) lines.push(prim.city ? `primary city \u2192 ${prim.city}` : 'clear the primary city');
                         const dry = await fillSegmentInfo(h.id, { cityOnly: true, dryRun: true, assumePrimary: prim ? prim.city : undefined });
-                        if (dry.dryRun) {
+                        const replacing = !!(prim && prim.city && h.primary && h.name && !ccSameCity(h.primary, prim.city));
+                        if (replacing && (!dry.dryRun || dry.skipCity || !dry.postalCities.length)) {
+                            fixList.failed.add(h.id);
+                            lines.length = 0;
+                            lines.push(`will be skipped: ${h.primary} \u2192 ${prim.city} needs a postal city first (is a GIS road layer on?)`);
+                        } else if (dry.dryRun) {
                             if (dry.newAltCities.length) lines.push(`alternate city \u2192 ${dry.newAltCities.map(formatCityName).join(' / ')}`);
                             if (dry.blankAltFix) lines.push(`alternate street ${dry.blankAltFix.names.join(' / ')} \u2192 city ${formatCityName(dry.blankAltFix.city)}`);
-                            if (!prim && !lines.length && !dry.filled.length) lines.push('nothing to add');
+                            if (!lines.length) lines.push(dry.postalCities.length ? 'nothing to add' : 'no postal city found, so no alternate to add (is a GIS road layer on?)');
+                            if (!dry.postalCities.length) fixList.failed.add(h.id);
                             if (!prim && dry.primary && dry.filled.some((f) => f.startsWith('city '))) lines.unshift(`primary city \u2192 ${dry.primary}`);
                         } else if (dry.warn && !prim) {
                             fixList.failed.add(h.id);
@@ -7835,8 +7850,10 @@
         p.listTitle.textContent = (items.length ? `${items.length} with a city to fix in view` : 'No cities to fix in view')
             + (other ? ` (${other} other flag${other === 1 ? '' : 's'}, such as names, are not in this list yet)` : '');
         p.listButtons.style.display = items.length ? 'flex' : 'none';
-        p.applyBtn.textContent = fixList.busy ? 'Working...' : `Apply to ${picked.length} checked`;
-        p.applyBtn.disabled = fixList.busy || !picked.length;
+        p.applyBtn.textContent = fixList.busy ? (fixList.stop ? 'Stopping...' : 'Stop (Esc)') : `Apply to ${picked.length} checked`;
+        p.applyBtn.disabled = fixList.busy ? !!fixList.stop : !picked.length;
+        p.applyBtn.style.background = fixList.busy ? '#d93025' : '#1a73e8';
+        p.applyBtn.style.borderColor = fixList.busy ? '#d93025' : '#1a73e8';
         p.allBtn.disabled = fixList.busy || !items.length;
         p.noneBtn.disabled = fixList.busy || !items.length;
         p.recheckBtn.disabled = fixList.busy || !items.length;
@@ -7878,11 +7895,13 @@
         if (!picks.length) return;
         fixList.busy = true;
         fixList.note = '';
-        const results = { fixed: 0, unchanged: 0, review: [], failed: 0 };
+        const results = { fixed: 0, unchanged: 0, review: [], failed: 0, notDone: 0 };
+        fixList.stop = false;
         try {
             const places = await areaPlaces();
             let n = 0;
             for (const h of picks) {
+                if (fixList.stop) { results.notDone = picks.length - n; break; }
                 fixList.note = `Working: ${++n} of ${picks.length}...`;
                 fixList.noteLevel = 'info';
                 renderFixList(true);
@@ -7903,8 +7922,9 @@
         if (results.unchanged) parts.push(`${results.unchanged} already fine`);
         if (results.review.length) parts.push(`${results.review.length} still need a look (${results.review.slice(0, 4).join(', ')}${results.review.length > 4 ? ', ...' : ''})`);
         if (results.failed) parts.push(`${results.failed} could not be changed`);
-        fixList.note = `Done: ${parts.join('; ')}. Nothing is saved yet: check them and save. Ctrl+Z undoes a change.`;
-        fixList.noteLevel = results.failed || results.review.length ? 'warn' : 'ok';
+        if (results.notDone) parts.push(`stopped, ${results.notDone} not touched`);
+        fixList.note = `${results.notDone ? 'Stopped' : 'Done'}: ${parts.join('; ')}. Nothing is saved yet: check them and save. Ctrl+Z undoes a change.`;
+        fixList.noteLevel = results.failed || results.review.length || results.notDone ? 'warn' : 'ok';
         clearTimeout(fixList.noteTimer);
         fixList.noteTimer = setTimeout(() => { fixList.note = ''; renderFixList(true); }, 45000);
         cityCheckCache.clear();
@@ -7916,7 +7936,16 @@
     cityCheckPanel.allBtn.addEventListener('click', () => { fixList.unchecked.clear(); renderFixList(true); });
     cityCheckPanel.noneBtn.addEventListener('click', () => { fixListItems().forEach((h) => fixList.unchecked.add(h.id)); renderFixList(true); });
     cityCheckPanel.recheckBtn.addEventListener('click', () => { fixList.proposal.clear(); fixList.failed.clear(); renderFixList(); });
-    cityCheckPanel.applyBtn.addEventListener('click', () => { applyFixList(); });
+    // While the batch runs the Apply button is a Stop button, and Escape stops it too. The segment being worked on finishes first.
+    function stopFixList() {
+        if (!fixList.busy || fixList.stop) return;
+        fixList.stop = true;
+        fixList.note = 'Stopping after the segment being worked on...';
+        fixList.noteLevel = 'warn';
+        renderFixList(true);
+    }
+    cityCheckPanel.applyBtn.addEventListener('click', () => { if (fixList.busy) stopFixList(); else applyFixList(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && fixList.busy) stopFixList(); }, true);
 
     function ccRenderRows(result) {
         const p = cityCheckPanel;
