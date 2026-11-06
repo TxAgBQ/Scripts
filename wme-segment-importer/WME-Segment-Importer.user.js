@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110602
+// @version      2026110603
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1250,6 +1250,8 @@
     let gapPollMs = 3000;
     let gapList = [];
     let gapHistory = [];
+    // The review list under the Segment check buttons: the flagged segments in view whose fix is a city, to check, uncheck and apply.
+    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null };
     let gapSignature = '';
     let gapScanBusy = false;
     const gapCityCache = new Map();
@@ -7660,7 +7662,18 @@
         const nextBtn = el('button', smallBtn, 'Next ▶');
         nav.append(prevBtn, counter, nextBtn);
         const foot = el('div', 'font-size: 10px; color: #5f6368; line-height: 1.3;', 'Nothing changes until you press Apply. Ctrl+Z undoes it.');
-        body.append(title, verdict, rows, actions, nav, foot);
+        // the review list (see renderFixList)
+        const listWrap = el('div', 'display: none; flex-direction: column; gap: 6px; border-top: 1px solid #dadce0; padding-top: 6px;');
+        const listTitle = el('div', 'font-weight: bold; font-size: 12px; user-select: text;');
+        const listButtons = el('div', 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;');
+        const allBtn = el('button', smallBtn, 'Select all');
+        const noneBtn = el('button', smallBtn, 'Select none');
+        const applyBtn = el('button', 'border: 1px solid #1a73e8; background: #1a73e8; color: #ffffff; border-radius: 5px; padding: 3px 10px; font-size: 12px; font-weight: bold; cursor: pointer;', 'Apply');
+        listButtons.append(allBtn, noneBtn, applyBtn);
+        const listNote = el('div', 'display: none; font-size: 11px; line-height: 1.3; padding: 4px 6px; border-radius: 3px; user-select: text;');
+        const listRows = el('div', 'display: flex; flex-direction: column; gap: 3px; max-height: 38vh; overflow-y: auto;');
+        listWrap.append(listTitle, listButtons, listNote, listRows);
+        body.append(title, verdict, rows, actions, listWrap, nav, foot);
         panel.appendChild(body);
         document.body.appendChild(panel);
 
@@ -7698,7 +7711,7 @@
             e.preventDefault();
         });
 
-        return { panel, title, verdict, rows, actions, nav, counter, prevBtn, nextBtn, levelLabel, closeBtn, place, el, smallBtn };
+        return { panel, title, verdict, rows, actions, nav, counter, prevBtn, nextBtn, levelLabel, closeBtn, place, el, smallBtn, listWrap, listTitle, listButtons, allBtn, noneBtn, applyBtn, listNote, listRows };
     })();
 
     function ccPaintMode() {
@@ -7721,17 +7734,140 @@
 
     // Next and Prev step through the segments flagged in view (the same list the map highlights).
     function ccRenderNav() {
+        // The Prev / Next stepping is replaced by the review list below (the toolbar's Segment check button still steps with stepGaps)
+        cityCheckPanel.nav.style.display = 'none';
+        renderFixList();
+    }
+
+    // ----- the review list: flagged segments in view whose fix is a city -----
+    function fixListItems() {
+        return scanLevel === 'off' ? [] : gapList.filter((h) => CITY_ONLY_KINDS.has(h.kind));
+    }
+
+    async function gotoGapHit(hit) {
+        try { await sdk.Map.setMapCenter({ lonLat: { lon: hit.mid[0], lat: hit.mid[1] } }); } catch (err) { console.warn(`[${SCRIPT_NAME}] Could not move the map to the segment:`, err); }
+        try { await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.id] } }); } catch (err) { console.warn(`[${SCRIPT_NAME}] Could not select the segment:`, err); }
+    }
+
+    // What the city fix would do, as a short text; worked out one row at a time in the background (limits only, no GIS queries).
+    async function fillFixProposals() {
+        if (fixList.proposing) return;
+        fixList.proposing = true;
+        try {
+            let done = 0;
+            for (const h of fixListItems()) {
+                if (fixList.proposal.has(h.id)) continue;
+                if (++done > 150) break;
+                let text = '';
+                try {
+                    if (h.kind === 'exemptcity') {
+                        text = 'clear the primary city';
+                    } else {
+                        const a = await ccAnalyze(h.id, false);
+                        const prim = (a.proposals || []).find((x) => x.kind === 'primary');
+                        text = prim ? (prim.city ? `primary city \u2192 ${prim.city}` : 'clear the primary city') : 'alternate city only';
+                    }
+                } catch (err) { text = ''; }
+                fixList.proposal.set(h.id, text);
+                if (done % 5 === 0) renderFixList(true);
+            }
+        } finally {
+            fixList.proposing = false;
+            renderFixList(true);
+        }
+    }
+
+    function renderFixList(fromProposals) {
         const p = cityCheckPanel;
-        if (scanLevel === 'off') {
-            p.nav.style.display = 'none';
+        const items = fixListItems();
+        if (!items.length && !fixList.note) {
+            p.listWrap.style.display = 'none';
             return;
         }
-        p.nav.style.display = 'flex';
-        const n = gapList.length;
-        p.counter.textContent = gapZoomNote || (n ? `${n} flagged in view` : 'None flagged in view');
-        p.prevBtn.disabled = !n;
-        p.nextBtn.disabled = !n;
+        p.listWrap.style.display = 'flex';
+        const picked = items.filter((h) => !fixList.unchecked.has(h.id));
+        const other = gapList.length - items.length;
+        p.listTitle.textContent = (items.length ? `${items.length} with a city to fix in view` : 'No cities to fix in view')
+            + (other ? ` (${other} other flag${other === 1 ? '' : 's'}, such as names, are not in this list yet)` : '');
+        p.listButtons.style.display = items.length ? 'flex' : 'none';
+        p.applyBtn.textContent = fixList.busy ? 'Working...' : `Apply to ${picked.length} checked`;
+        p.applyBtn.disabled = fixList.busy || !picked.length;
+        p.allBtn.disabled = fixList.busy || !items.length;
+        p.noneBtn.disabled = fixList.busy || !items.length;
+        p.listNote.style.display = fixList.note ? 'block' : 'none';
+        p.listNote.textContent = fixList.note;
+        if (fixList.note) paintStatus(p.listNote, fixList.noteLevel || 'info');
+        p.listRows.textContent = '';
+        for (const h of items) {
+            const row = p.el('label', 'display: flex; gap: 6px; align-items: flex-start; padding: 3px 4px; border-radius: 3px; background: #f8f9fa; cursor: pointer;');
+            const box = p.el('input');
+            box.type = 'checkbox';
+            box.checked = !fixList.unchecked.has(h.id);
+            box.disabled = fixList.busy;
+            box.addEventListener('change', () => {
+                if (box.checked) fixList.unchecked.delete(h.id); else fixList.unchecked.add(h.id);
+                renderFixList();
+            });
+            const text = p.el('div', 'flex: 1; line-height: 1.3; min-width: 0;');
+            text.appendChild(p.el('div', 'font-weight: bold; overflow-wrap: anywhere;', h.name || 'Unnamed road'));
+            text.appendChild(p.el('div', 'font-size: 11px; color: #5f6368;', h.detail));
+            const prop = fixList.proposal.get(h.id);
+            if (prop) text.appendChild(p.el('div', 'font-size: 11px; color: #0d652d;', prop));
+            const go = p.el('button', `${p.smallBtn} padding: 1px 6px;`, '\u2316');
+            go.type = 'button';
+            go.title = 'Go to this segment and select it';
+            go.addEventListener('click', async (e) => { e.preventDefault(); e.stopPropagation(); await gotoGapHit(h); });
+            row.append(box, text, go);
+            p.listRows.appendChild(row);
+        }
+        if (!fromProposals) fillFixProposals();
     }
+
+    // Applies the city fix to the checked rows: the same rules as the Area panel's "Fix cities only". Nothing is saved; you save.
+    async function applyFixList() {
+        if (fixList.busy) return;
+        const picks = fixListItems().filter((h) => !fixList.unchecked.has(h.id));
+        if (!picks.length) return;
+        fixList.busy = true;
+        fixList.note = '';
+        const results = { fixed: 0, unchanged: 0, review: [], failed: 0 };
+        try {
+            const places = await areaPlaces();
+            let n = 0;
+            for (const h of picks) {
+                fixList.note = `Working: ${++n} of ${picks.length}...`;
+                fixList.noteLevel = 'info';
+                renderFixList(true);
+                try {
+                    const r = await areaFixSegment({ id: h.id, kind: h.kind }, places, { cityOnly: true });
+                    if (r.outcome === 'fixed') results.fixed++;
+                    else if (r.outcome === 'unchanged') results.unchanged++;
+                    else results.review.push(h.name || 'unnamed road');
+                } catch (err) {
+                    results.failed++;
+                    console.warn(`[${SCRIPT_NAME}] City fix failed for ${h.id}:`, err);
+                }
+            }
+        } finally {
+            fixList.busy = false;
+        }
+        const parts = [`${results.fixed} fixed`];
+        if (results.unchanged) parts.push(`${results.unchanged} already fine`);
+        if (results.review.length) parts.push(`${results.review.length} still need a look (${results.review.slice(0, 4).join(', ')}${results.review.length > 4 ? ', ...' : ''})`);
+        if (results.failed) parts.push(`${results.failed} could not be changed`);
+        fixList.note = `Done: ${parts.join('; ')}. Nothing is saved yet: check them and save. Ctrl+Z undoes a change.`;
+        fixList.noteLevel = results.failed || results.review.length ? 'warn' : 'ok';
+        clearTimeout(fixList.noteTimer);
+        fixList.noteTimer = setTimeout(() => { fixList.note = ''; renderFixList(true); }, 45000);
+        cityCheckCache.clear();
+        fixList.proposal.clear();
+        renderFixList(true);
+        scheduleGapScan(200);
+    }
+
+    cityCheckPanel.allBtn.addEventListener('click', () => { fixList.unchecked.clear(); renderFixList(true); });
+    cityCheckPanel.noneBtn.addEventListener('click', () => { fixListItems().forEach((h) => fixList.unchecked.add(h.id)); renderFixList(true); });
+    cityCheckPanel.applyBtn.addEventListener('click', () => { applyFixList(); });
 
     function ccRenderRows(result) {
         const p = cityCheckPanel;
