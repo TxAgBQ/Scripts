@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Segment Turnaround Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.11.06.04
+// @version      2026.11.06.05
 // @description  Finds Texas segments named "Turnaround" and matches them to the frontage road (road type, lock, +1 routing). Review a checklist, apply, then save in WME yourself.
 // @author       TxAgBQ
 // @match        https://www.waze.com/editor*
@@ -22,7 +22,7 @@
  * WME Segment Turnaround Assist
  *
  * What it does
- *   - Looks at segments in view whose primary street is "Turnaround" and whose state is Texas.
+ *   - Looks at segments in the visible part of the map whose primary street is "Turnaround" and whose state is Texas.
  *     Several Turnaround segments in a row are handled as ONE turnaround (one row, one checkbox).
  *   - The frontage road is the NAMED segments at the two outer ends of the turnaround. Names may differ
  *     per end (I-10 W Frontage Rd / I-10 E Frontage Rd, Grand Pkwy, ...). Unnamed segments there are
@@ -51,7 +51,7 @@
 
     const SCRIPT_ID = 'wme-segment-turnaround-assist';
     const SCRIPT_NAME = 'WME Segment Turnaround Assist';
-    const VERSION = '2026.11.06.04'; // keep in sync with @version
+    const VERSION = '2026.11.06.05'; // keep in sync with @version
     const LOG = '[WSTA]';
 
     const CFG = {
@@ -166,6 +166,20 @@
         return !(maxX < ext[0] || minX > ext[2] || maxY < ext[1] || minY > ext[3]);
     }
 
+    // The area you can actually see. Map.getMapExtent() runs about a sidebar-width past the right edge of the
+    // screen, so it would list turnarounds that are off screen. Use the viewport element's real corners instead.
+    async function visibleBox() {
+        try {
+            const r = (await sdk.Map.getMapViewportElement()).getBoundingClientRect();
+            const tl = await sdk.Map.getLonLatFromPixel({ x: Math.max(r.left, 0), y: Math.max(r.top, 0) });
+            const br = await sdk.Map.getLonLatFromPixel({ x: Math.min(r.right, window.innerWidth), y: Math.min(r.bottom, window.innerHeight) });
+            return [tl.lon, br.lat, br.lon, tl.lat]; // [minLon, minLat, maxLon, maxLat]
+        } catch (e) {
+            console.warn(LOG, 'visibleBox fallback to getMapExtent', e);
+            return sdk.Map.getMapExtent();
+        }
+    }
+
     // Street names are cached for one scan / one apply so we do not ask the SDK twice.
     const nameCache = new Map();
     async function streetNameOf(seg) {
@@ -223,7 +237,7 @@
         const me = await sdk.State.getUserInfo();
         userRank = me && typeof me.rank === 'number' ? me.rank : 0;
 
-        const ext = await sdk.Map.getMapExtent();
+        const ext = await visibleBox();
         const segments = await sdk.DataModel.Segments.getAll();
         const seen = new Set();
         const found = [];
@@ -552,9 +566,32 @@
         renderTitles();
     }
 
-    function selectSegments(ids) {
-        Promise.resolve(sdk.Editing.setSelection({ selection: { ids, objectType: 'segment' } }))
-            .catch((e) => console.warn(LOG, 'select failed', e));
+    // Select the turnaround's segments and put them in the middle of the part of the map you can see
+    // (the map's own center sits behind the sidebar, so a plain "center map" lands off to one side).
+    async function showOnMap(ids) {
+        try {
+            await sdk.Editing.setSelection({ selection: { ids, objectType: 'segment' } });
+            const members = await loadMembers(ids);
+            if (!members) return;
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const m of members) {
+                for (const c of m.geometry.coordinates) {
+                    if (c[0] < minX) minX = c[0];
+                    if (c[0] > maxX) maxX = c[0];
+                    if (c[1] < minY) minY = c[1];
+                    if (c[1] > maxY) maxY = c[1];
+                }
+            }
+            const target = { lon: (minX + maxX) / 2, lat: (minY + maxY) / 2 };
+            await sdk.Map.setMapCenter({ lonLat: target });
+            const r = (await sdk.Map.getMapViewportElement()).getBoundingClientRect();
+            const vis = { x: (r.left + Math.min(r.right, window.innerWidth)) / 2, y: (r.top + Math.min(r.bottom, window.innerHeight)) / 2 };
+            const p = await sdk.Map.getPixelFromLonLat({ lonLat: target });
+            const shifted = await sdk.Map.getLonLatFromPixel({ x: p.x + (p.x - vis.x), y: p.y + (p.y - vis.y) });
+            await sdk.Map.setMapCenter({ lonLat: shifted });
+        } catch (e) {
+            console.warn(LOG, 'show on map failed', e);
+        }
     }
 
     function updateApplyButton() {
@@ -611,8 +648,8 @@
                 box.disabled = true;
             }
             const link = el('a', null, r.ids.length > 1 ? r.ids[0] + ' +' + (r.ids.length - 1) : String(r.ids[0]));
-            link.title = r.ids.length > 1 ? 'Select all ' + r.ids.length + ' segments of this turnaround' : 'Select this segment';
-            link.addEventListener('click', () => selectSegments(r.ids));
+            link.title = r.ids.length > 1 ? 'Show and select all ' + r.ids.length + ' segments of this turnaround' : 'Show and select this segment';
+            link.addEventListener('click', () => showOnMap(r.ids));
             const text = el('span', 'wsta-note', r.status === 'fix' ? r.summary : 'Review: ' + r.note);
             row.append(box, link, text);
             ui.list.appendChild(row);
