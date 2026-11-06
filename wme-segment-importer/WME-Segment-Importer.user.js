@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110603
+// @version      2026110604
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1251,7 +1251,7 @@
     let gapList = [];
     let gapHistory = [];
     // The review list under the Segment check buttons: the flagged segments in view whose fix is a city, to check, uncheck and apply.
-    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null };
+    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null, typeNames: null };
     let gapSignature = '';
     let gapScanBusy = false;
     const gapCityCache = new Map();
@@ -6973,7 +6973,7 @@
         // trails, railroads and the other exempt types need no city and no name; the only problem is a primary city they should not have
         if (CITY_EXEMPT_TYPES.has(segment.roadType)) {
             if (!primary) return null;
-            return { id: segment.id, kind: 'exemptcity', name, primary, detail: `primary city ${primary}, but this road type is mapped with no city` };
+            return { id: segment.id, roadType: segment.roadType, kind: 'exemptcity', name, primary, detail: `primary city ${primary}, but this road type is mapped with no city` };
         }
         const hasCity = !!primary || (address.altStreets || []).some((x) => cityOf(x));
         // Short unnamed segments (the curved at-grade connectors) are fine without a name; they still need a city.
@@ -7020,7 +7020,7 @@
             }
         }
         if (!kind) return null;
-        return { id: segment.id, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' || kind === 'altnocity' ? detail : GAP_KINDS[kind].label };
+        return { id: segment.id, roadType: segment.roadType, kind, name, primary, detail: kind === 'badcity' || kind === 'duptype' || kind === 'altnocity' ? detail : GAP_KINDS[kind].label };
     }
 
     // A roundabout segment has a junctionId (checked in the console on a real roundabout). Roundabouts are not given street names.
@@ -7215,7 +7215,7 @@
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not select the segment:`, err);
         }
-        setStatus(`${hit.name || 'Unnamed road'}: ${hit.detail}. (${gapHistory.length} of ${gapList.length})`, 'warn');
+        setStatus(`${hit.name || unnamedLabel(hit.roadType)}: ${hit.detail}. (${gapHistory.length} of ${gapList.length})`, 'warn');
     }
 
     for (const eventName of ['wme-map-move-end', 'wme-map-zoom-changed', 'wme-map-data-loaded']) {
@@ -7744,6 +7744,23 @@
         return scanLevel === 'off' ? [] : gapList.filter((h) => CITY_ONLY_KINDS.has(h.kind));
     }
 
+    // "Unnamed <road type>", so an unnamed row says what kind of road it is. The names are WME's own (Segments.getRoadTypes), loaded once.
+    const ROAD_TYPE_SHORT = { 20: 'PLR' };
+    function unnamedLabel(roadType) {
+        const known = fixList.typeNames && fixList.typeNames.get(roadType);
+        return `Unnamed ${ROAD_TYPE_SHORT[roadType] || known || `road (type ${roadType})`}`;
+    }
+    async function loadRoadTypeNames() {
+        if (fixList.typeNames) return;
+        fixList.typeNames = new Map();
+        try {
+            for (const t of await sdk.DataModel.Segments.getRoadTypes()) fixList.typeNames.set(t.id, t.localizedName || t.name);
+            renderFixList(true);
+        } catch (err) {
+            console.warn(`[${SCRIPT_NAME}] Could not read the road type names:`, err);
+        }
+    }
+
     async function gotoGapHit(hit) {
         try { await sdk.Map.setMapCenter({ lonLat: { lon: hit.mid[0], lat: hit.mid[1] } }); } catch (err) { console.warn(`[${SCRIPT_NAME}] Could not move the map to the segment:`, err); }
         try { await sdk.Editing.setSelection({ selection: { objectType: 'segment', ids: [hit.id] } }); } catch (err) { console.warn(`[${SCRIPT_NAME}] Could not select the segment:`, err); }
@@ -7809,7 +7826,7 @@
                 renderFixList();
             });
             const text = p.el('div', 'flex: 1; line-height: 1.3; min-width: 0;');
-            text.appendChild(p.el('div', 'font-weight: bold; overflow-wrap: anywhere;', h.name || 'Unnamed road'));
+            text.appendChild(p.el('div', 'font-weight: bold; overflow-wrap: anywhere;', h.name || unnamedLabel(h.roadType)));
             text.appendChild(p.el('div', 'font-size: 11px; color: #5f6368;', h.detail));
             const prop = fixList.proposal.get(h.id);
             if (prop) text.appendChild(p.el('div', 'font-size: 11px; color: #0d652d;', prop));
@@ -7821,6 +7838,7 @@
             p.listRows.appendChild(row);
         }
         if (!fromProposals) fillFixProposals();
+        loadRoadTypeNames();
     }
 
     // Applies the city fix to the checked rows: the same rules as the Area panel's "Fix cities only". Nothing is saved; you save.
@@ -7842,7 +7860,7 @@
                     const r = await areaFixSegment({ id: h.id, kind: h.kind }, places, { cityOnly: true });
                     if (r.outcome === 'fixed') results.fixed++;
                     else if (r.outcome === 'unchanged') results.unchanged++;
-                    else results.review.push(h.name || 'unnamed road');
+                    else results.review.push(h.name || unnamedLabel(h.roadType));
                 } catch (err) {
                     results.failed++;
                     console.warn(`[${SCRIPT_NAME}] City fix failed for ${h.id}:`, err);
