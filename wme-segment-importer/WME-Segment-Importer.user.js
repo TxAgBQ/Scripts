@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110604
+// @version      2026110605
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -4452,6 +4452,8 @@
     }
 
     // opts.cityOnly: the street name is never changed, added or compared with the GIS; the primary and alternate cities follow the usual rules.
+    // opts.dryRun: works out what would be filled in and returns it ({ dryRun: true, filled, primary, newAltCities, blankAltFix }) without writing.
+    // opts.assumePrimary: the primary city to compare the alternates with when the primary is about to change (the review list).
     async function fillSegmentInfo(segmentId, opts = {}) {
         const cityOnly = !!opts.cityOnly;
         const segment = await sdk.DataModel.Segments.getById({ segmentId });
@@ -4583,6 +4585,7 @@
                 warn = true;
                 notes.push(`Its city is ${currentCity}, but it lies outside city and CDP limits (left as is).`);
             }
+            if (opts.assumePrimary !== undefined) primary = opts.assumePrimary;
             const wantedAlts = cityInfo.alternateCities.filter((c) => c.toLowerCase() !== primary.toLowerCase());
             const haveAlts = currentAlts.map(cityOf).filter(Boolean);
             // An alternate street with no city is never right: it gets the postal city (or the primary city when the postal city is the
@@ -4627,6 +4630,7 @@
             return { message: `Nothing missing.${notes.length ? ` ${notes.join(' ')}` : ''}`, warn, info: !warn, match, mismatch: mismatchInfo };
         }
 
+        if (opts.dryRun) return { dryRun: true, message: `Would fill in ${filled.join('; ')}.`, filled, primary, newAltCities, blankAltFix, match };
         const { country, state } = await regionOf(segmentId);
         if (!country || !state) return { message: `Could not fill in the address: ${REGION_ERROR}.`, warn: true, match };
         const alternateStreetIds = [];
@@ -7780,9 +7784,23 @@
                     if (h.kind === 'exemptcity') {
                         text = 'clear the primary city';
                     } else {
+                        // the same lookups Apply will use, without writing anything: the primary city from the limits, then the alternate
                         const a = await ccAnalyze(h.id, false);
                         const prim = (a.proposals || []).find((x) => x.kind === 'primary');
-                        text = prim ? (prim.city ? `primary city \u2192 ${prim.city}` : 'clear the primary city') : 'alternate city only';
+                        const lines = [];
+                        if (prim) lines.push(prim.city ? `primary city \u2192 ${prim.city}` : 'clear the primary city');
+                        const dry = await fillSegmentInfo(h.id, { cityOnly: true, dryRun: true, assumePrimary: prim ? prim.city : undefined });
+                        if (dry.dryRun) {
+                            if (dry.newAltCities.length) lines.push(`alternate city \u2192 ${dry.newAltCities.map(formatCityName).join(' / ')}`);
+                            if (dry.blankAltFix) lines.push(`alternate street ${dry.blankAltFix.names.join(' / ')} \u2192 city ${formatCityName(dry.blankAltFix.city)}`);
+                            if (!prim && !lines.length && !dry.filled.length) lines.push('nothing to add');
+                            if (!prim && dry.primary && dry.filled.some((f) => f.startsWith('city '))) lines.unshift(`primary city \u2192 ${dry.primary}`);
+                        } else if (dry.warn && !prim) {
+                            lines.push(`no change found: ${String(dry.message || '').split('. ')[0].slice(0, 120)}`);
+                        } else if (!prim && !lines.length) {
+                            lines.push('no alternate city to add');
+                        }
+                        text = lines.join('\n');
                     }
                 } catch (err) { text = ''; }
                 fixList.proposal.set(h.id, text);
@@ -7829,7 +7847,8 @@
             text.appendChild(p.el('div', 'font-weight: bold; overflow-wrap: anywhere;', h.name || unnamedLabel(h.roadType)));
             text.appendChild(p.el('div', 'font-size: 11px; color: #5f6368;', h.detail));
             const prop = fixList.proposal.get(h.id);
-            if (prop) text.appendChild(p.el('div', 'font-size: 11px; color: #0d652d;', prop));
+            if (prop) text.appendChild(p.el('div', 'font-size: 11px; color: #0d652d; white-space: pre-line;', prop));
+            else if (fixList.proposing) text.appendChild(p.el('div', 'font-size: 11px; color: #9aa0a6;', 'looking up the city...'));
             const go = p.el('button', `${p.smallBtn} padding: 1px 6px;`, '\u2316');
             go.type = 'button';
             go.title = 'Go to this segment and select it';
