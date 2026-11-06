@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110605
+// @version      2026110606
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1251,7 +1251,7 @@
     let gapList = [];
     let gapHistory = [];
     // The review list under the Segment check buttons: the flagged segments in view whose fix is a city, to check, uncheck and apply.
-    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null, typeNames: null };
+    const fixList = { unchecked: new Set(), proposal: new Map(), busy: false, proposing: false, note: '', noteTimer: null, typeNames: null, failed: new Set(), layerSig: '' };
     let gapSignature = '';
     let gapScanBusy = false;
     const gapCityCache = new Map();
@@ -7672,8 +7672,10 @@
         const listButtons = el('div', 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;');
         const allBtn = el('button', smallBtn, 'Select all');
         const noneBtn = el('button', smallBtn, 'Select none');
+        const recheckBtn = el('button', smallBtn, 'Recheck');
+        recheckBtn.title = 'Work out what each row would change again (after turning a GIS layer on, for example)';
         const applyBtn = el('button', 'border: 1px solid #1a73e8; background: #1a73e8; color: #ffffff; border-radius: 5px; padding: 3px 10px; font-size: 12px; font-weight: bold; cursor: pointer;', 'Apply');
-        listButtons.append(allBtn, noneBtn, applyBtn);
+        listButtons.append(allBtn, noneBtn, recheckBtn, applyBtn);
         const listNote = el('div', 'display: none; font-size: 11px; line-height: 1.3; padding: 4px 6px; border-radius: 3px; user-select: text;');
         const listRows = el('div', 'display: flex; flex-direction: column; gap: 3px; max-height: 38vh; overflow-y: auto;');
         listWrap.append(listTitle, listButtons, listNote, listRows);
@@ -7715,7 +7717,7 @@
             e.preventDefault();
         });
 
-        return { panel, title, verdict, rows, actions, nav, counter, prevBtn, nextBtn, levelLabel, closeBtn, place, el, smallBtn, listWrap, listTitle, listButtons, allBtn, noneBtn, applyBtn, listNote, listRows };
+        return { panel, title, verdict, rows, actions, nav, counter, prevBtn, nextBtn, levelLabel, closeBtn, place, el, smallBtn, listWrap, listTitle, listButtons, allBtn, noneBtn, recheckBtn, applyBtn, listNote, listRows };
     })();
 
     function ccPaintMode() {
@@ -7773,6 +7775,13 @@
     // What the city fix would do, as a short text; worked out one row at a time in the background (limits only, no GIS queries).
     async function fillFixProposals() {
         if (fixList.proposing) return;
+        // a preview that could not be worked out (no GIS road layer on, ...) is tried again when the checked GIS layers change
+        const layerSig = [...gislVisibleIds()].sort().join(',');
+        if (layerSig !== fixList.layerSig) {
+            fixList.layerSig = layerSig;
+            fixList.failed.forEach((id) => fixList.proposal.delete(id));
+            fixList.failed.clear();
+        }
         fixList.proposing = true;
         try {
             let done = 0;
@@ -7796,6 +7805,7 @@
                             if (!prim && !lines.length && !dry.filled.length) lines.push('nothing to add');
                             if (!prim && dry.primary && dry.filled.some((f) => f.startsWith('city '))) lines.unshift(`primary city \u2192 ${dry.primary}`);
                         } else if (dry.warn && !prim) {
+                            fixList.failed.add(h.id);
                             lines.push(`no change found: ${String(dry.message || '').split('. ')[0].slice(0, 120)}`);
                         } else if (!prim && !lines.length) {
                             lines.push('no alternate city to add');
@@ -7829,6 +7839,7 @@
         p.applyBtn.disabled = fixList.busy || !picked.length;
         p.allBtn.disabled = fixList.busy || !items.length;
         p.noneBtn.disabled = fixList.busy || !items.length;
+        p.recheckBtn.disabled = fixList.busy || !items.length;
         p.listNote.style.display = fixList.note ? 'block' : 'none';
         p.listNote.textContent = fixList.note;
         if (fixList.note) paintStatus(p.listNote, fixList.noteLevel || 'info');
@@ -7904,6 +7915,7 @@
 
     cityCheckPanel.allBtn.addEventListener('click', () => { fixList.unchecked.clear(); renderFixList(true); });
     cityCheckPanel.noneBtn.addEventListener('click', () => { fixListItems().forEach((h) => fixList.unchecked.add(h.id)); renderFixList(true); });
+    cityCheckPanel.recheckBtn.addEventListener('click', () => { fixList.proposal.clear(); fixList.failed.clear(); renderFixList(); });
     cityCheckPanel.applyBtn.addEventListener('click', () => { applyFixList(); });
 
     function ccRenderRows(result) {
