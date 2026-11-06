@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.06.01
-// @description  Floating bar that flags Waze places on screen linked to permanently closed Google places, with one-click staged delete or removal of just the closed link.
+// @version      2026.11.06.02
+// @description  Floating bar that flags Waze places on screen with permanently closed or far-away Google links, with one-click staged delete or removal of just the bad link.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
 // @supportURL   https://github.com/TxAgBQ/Scripts/issues
@@ -19,15 +19,17 @@
 // ==/UserScript==
 
 /* global google */
-/* The only non-SDK access is link removal (see removeClosedLinks). */
+/* The only non-SDK access is link removal (see removeBadLinks). */
 
 (function () {
   'use strict';
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.06.01';
+  const VERSION = '2026.11.06.02';
   const LOOKUP_CONCURRENCY = 4;
+  const FAR_METERS = 400;         // a Google link farther than this from the Waze place is a likely wrong match
+  const FAR_CHECKED_METERS = 1000; // review rows whose only problem is a far link start checked beyond this
   const MIN_ZOOM = 17;            // WME only loads places at zoom 17 and closer
   const SCAN_DEBOUNCE_MS = 700;   // wait for the map to settle before scanning
   const POPUP_WIDTH = 300;        // keep in sync with .wpa-popup width in the CSS
@@ -40,22 +42,27 @@
   //    Uses only the Google Maps library WME has already loaded on the page.
   //    This script never loads Google itself and never uses an API key.
   // ---------------------------------------------------------------------------
-  const statusCache = new Map(); // placeId -> businessStatus (errors are not cached)
+  const placeCache = new Map(); // placeId -> { status, lon, lat } (errors are not cached)
 
   function googlePlacesAvailable() {
     return !!(window.google && google.maps && google.maps.places && google.maps.places.Place);
   }
 
-  async function lookupBusinessStatus(placeId) {
-    if (statusCache.has(placeId)) return statusCache.get(placeId);
+  async function lookupPlace(placeId) {
+    if (placeCache.has(placeId)) return placeCache.get(placeId);
     try {
       const place = new google.maps.places.Place({ id: placeId });
-      await place.fetchFields({ fields: ['businessStatus'] });
-      const status = place.businessStatus || 'UNKNOWN';
-      statusCache.set(placeId, status);
-      return status;
+      await place.fetchFields({ fields: ['businessStatus', 'location'] });
+      const loc = place.location;
+      const info = {
+        status: place.businessStatus || 'UNKNOWN',
+        lon: loc ? loc.lng() : null,
+        lat: loc ? loc.lat() : null,
+      };
+      placeCache.set(placeId, info);
+      return info;
     } catch (e) {
-      return 'ERROR';
+      return { status: 'ERROR', lon: null, lat: null };
     }
   }
 
@@ -91,11 +98,48 @@
     return pt[0] >= ext[0] && pt[0] <= ext[2] && pt[1] >= ext[1] && pt[1] <= ext[3];
   }
 
-  // 'remove' = every Google link is permanently closed; 'review' = only some are.
-  function classify(statuses) {
-    const closed = statuses.filter((s) => s === 'CLOSED_PERMANENTLY').length;
-    if (!closed) return null;
-    return closed === statuses.length ? 'remove' : 'review';
+  // Meters from a Google point to a Waze place: to the point itself, or to the outline (0 if inside) for areas.
+  function distanceMeters(lon, lat, geometry) {
+    const kx = Math.cos((lat * Math.PI) / 180) * 111320;
+    const ky = 110574;
+    const to = (c) => [(c[0] - lon) * kx, (c[1] - lat) * ky];
+    if (geometry.type === 'Point') { const [x, y] = to(geometry.coordinates); return Math.hypot(x, y); }
+    if (geometry.type !== 'Polygon') return null;
+    const ring = geometry.coordinates[0].map(to);
+    let inside = false;
+    let best = Infinity;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [x1, y1] = ring[j];
+      const [x2, y2] = ring[i];
+      if ((y1 > 0) !== (y2 > 0) && 0 < ((x2 - x1) * (0 - y1)) / (y2 - y1) + x1) inside = !inside;
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 ? Math.max(0, Math.min(1, (-x1 * dx - y1 * dy) / len2)) : 0;
+      best = Math.min(best, Math.hypot(x1 + t * dx, y1 + t * dy));
+    }
+    return inside ? 0 : best;
+  }
+
+  // links: [{ id, status, dist }]. Returns null (nothing wrong) or how to fix the place:
+  //   kind 'remove' (delete the place): every link is permanently closed, or its only link is far away.
+  //   kind 'review' (remove just the bad links, keep the place): some links are closed and/or far.
+  function classifyPlace(links) {
+    const closed = links.filter((l) => l.status === 'CLOSED_PERMANENTLY');
+    const far = links.filter((l) => l.dist != null && l.dist > FAR_METERS);
+    const bad = links.filter((l) => closed.includes(l) || far.includes(l));
+    if (!bad.length) return null;
+    const farMax = far.length ? Math.max(...far.map((l) => l.dist)) : 0;
+    const base = { closedIds: closed.map((l) => l.id), farCount: far.length, farMax, badIds: bad.map((l) => l.id) };
+    if (closed.length === links.length || (links.length === 1 && far.length === 1)) {
+      return { ...base, kind: 'remove', removeAll: false, checked: true };
+    }
+    const removeAll = bad.length === links.length; // nothing would be left linked: leave it for a human
+    return { ...base, kind: 'review', removeAll, checked: !removeAll && (closed.length > 0 || farMax > FAR_CHECKED_METERS) };
+  }
+
+  function fmtDistance(m) {
+    return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
   }
 
   // WME keeps a staged-for-deletion place in its data until you save, so remember what we staged.
@@ -108,27 +152,35 @@
       .filter((v) => { const p = venuePoint(v); return p && inExtent(p, extent); });
 
     const placeIds = [...new Set(linked.flatMap((v) => v.externalProviderIds))];
-    const statusById = new Map();
+    const infoById = new Map();
     await mapPool(placeIds, LOOKUP_CONCURRENCY, async (id) => {
-      statusById.set(id, await lookupBusinessStatus(id));
+      infoById.set(id, await lookupPlace(id));
     });
-    const lookupErrors = [...statusById.values()].filter((s) => s === 'ERROR').length;
+    const lookupErrors = [...infoById.values()].filter((i) => i.status === 'ERROR').length;
 
     const rows = [];
     for (const v of linked) {
-      const links = v.externalProviderIds.map((id) => ({ id, status: statusById.get(id) || 'ERROR' }));
-      const kind = classify(links.map((l) => l.status));
-      if (!kind) continue;
+      const links = v.externalProviderIds.map((id) => {
+        const info = infoById.get(id) || { status: 'ERROR', lon: null, lat: null };
+        const dist = info.lon == null ? null : distanceMeters(info.lon, info.lat, v.geometry);
+        return { id, status: info.status, dist };
+      });
+      const verdict = classifyPlace(links);
+      if (!verdict) continue;
       let canDelete = false;
       try { canDelete = !!(await sdk.DataModel.Venues.hasPermissions({ venueId: v.id })); } catch (e) { /* leave false */ }
       const pt = venuePoint(v);
       rows.push({
         id: v.id,
         name: v.name || '(no name)',
-        kind,
+        kind: verdict.kind,
         links,
-        closedCount: links.filter((l) => l.status === 'CLOSED_PERMANENTLY').length,
-        closedIds: links.filter((l) => l.status === 'CLOSED_PERMANENTLY').map((l) => l.id),
+        closedCount: verdict.closedIds.length,
+        farCount: verdict.farCount,
+        farMax: verdict.farMax,
+        badIds: verdict.badIds,
+        removeAll: verdict.removeAll,
+        defaultChecked: verdict.checked,
         canDelete,
         lockRank: v.lockRank,
         urCount: (v.venueUpdateRequests || []).length,
@@ -152,7 +204,7 @@
   }
 
   // The SDK has no method for editing a place's external provider links (checked: updateVenue ignores
-  // them), so removing a closed link uses WME's own edit action. This is the only non-SDK code in the
+  // them), so removing a bad link uses WME's own edit action. This is the only non-SDK code in the
   // script, kept in these two functions. If WME changes it, link removal is switched off, nothing else.
   function linkRemovalAvailable() {
     try {
@@ -163,15 +215,15 @@
     }
   }
 
-  function removeClosedLinks(venueId, closedIds) {
+  function removeBadLinks(venueId, badIds, allowEmpty) {
     const UpdateObject = window.require('Waze/Action/UpdateObject');
     const venue = window.W.model.venues.getObjectById(venueId);
     if (!venue) throw new Error('place not found');
     const links = venue.getAttributes().externalProviderIDs || [];
     const uuidOf = (l) => (l && l.attributes ? l.attributes.uuid : l && l.uuid);
-    const keep = links.filter((l) => !closedIds.includes(uuidOf(l)));
-    if (keep.length === links.length) throw new Error('closed link not found');
-    if (!keep.length) throw new Error('would remove every link'); // that case is a delete, not an unlink
+    const keep = links.filter((l) => !badIds.includes(uuidOf(l)));
+    if (keep.length === links.length) throw new Error('link not found');
+    if (!keep.length && !allowEmpty) throw new Error('would remove every link');
     window.W.model.actionManager.add(new UpdateObject(venue, { externalProviderIDs: keep }));
   }
 
@@ -292,14 +344,14 @@
         if (myToken === token && !app.minimized) {
           const prev = new Map(app.rows.map((r) => [r.id, app.checked.has(r.id)]));
           app.rows = result.rows;
-          // keep the user's earlier choices; every new row starts checked (red = delete, amber = remove closed link)
+          // keep the user's earlier choices; new rows start checked unless they need a human look (all links bad, or a far link under 1 km)
           app.checked = new Set(result.rows
-            .filter((r) => r.canDelete && (prev.has(r.id) ? prev.get(r.id) : true))
+            .filter((r) => r.canDelete && (prev.has(r.id) ? prev.get(r.id) : r.defaultChecked))
             .map((r) => r.id));
           const nRemove = result.rows.filter((r) => r.kind === 'remove').length;
           const nReview = result.rows.length - nRemove;
           app.message = result.rows.length
-            ? `${nRemove} to delete, ${nReview} to unlink a closed link.`
+            ? `${nRemove} to delete, ${nReview} to remove a bad link.`
             : `Checked ${result.linkedChecked} linked places: none permanently closed.`;
           if (result.lookupErrors) app.message += ` ${result.lookupErrors} lookup(s) failed and will be retried on the next scan.`;
           app.status = statusFromRows();
@@ -329,7 +381,7 @@
         linkNote = ` Could not remove links on ${linkRows.length} place(s): WME's edit action is not available.`;
       } else {
         for (const r of linkRows) {
-          try { removeClosedLinks(r.id, r.closedIds); unlinked.push(r.id); } catch (e) {
+          try { removeBadLinks(r.id, r.badIds, r.removeAll); unlinked.push(r.id); } catch (e) {
             failed.push({ venueId: r.id, error: String((e && e.message) || e) });
           }
         }
@@ -415,6 +467,7 @@
     .wpa-row.review .wpa-dot { background: #f29900; }
     .wpa-name { background: none; border: 0; padding: 0; color: #0366d6; text-align: left; cursor: pointer; font-size: 13px; }
     .wpa-meta { color: #666; font-size: 11px; }
+    .wpa-meta.wpa-far { background: #00ffff; color: #004d4d; border-radius: 3px; padding: 0 3px; }
     .wpa-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 6px; border-top: 1px solid #eee; }
     .wpa-btn { cursor: pointer; padding: 3px 10px; }
     .wpa-del { cursor: pointer; padding: 4px 12px; border: 0; border-radius: 6px; background: #d93025; color: #fff; font-weight: 600; }
@@ -512,7 +565,7 @@
 
     function tooltip(count) {
       if (app.status === 'red') return `${count} closed place(s) to delete. Click to review.`;
-      if (app.status === 'amber') return `${count} place(s) with a closed Google link to remove. Click to review.`;
+      if (app.status === 'amber') return `${count} place(s) with a closed or far Google link to remove. Click to review.`;
       if (app.status === 'scanning') return 'Scanning…';
       if (app.status === 'zoom') return `Zoom in to level ${MIN_ZOOM} or closer to scan`;
       if (app.status === 'nogoogle') return 'Google Places library not available';
@@ -526,7 +579,15 @@
       const allChecked = deletable.length > 0 && deletable.every((r) => app.checked.has(r.id));
 
       const rows = app.rows.map((r) => {
-        const tags = r.kind === 'review' ? [`remove ${r.closedCount} closed link(s), keep ${r.links.length - r.closedCount}`] : [];
+        const tags = r.kind === 'review' ? [] : [];
+        if (r.kind === 'review') {
+          const parts = [];
+          if (r.closedCount) parts.push(`${r.closedCount} closed`);
+          if (r.farCount) parts.push(`${r.farCount} far (${fmtDistance(r.farMax)})`);
+          tags.push(r.removeAll ? `all ${r.links.length} links bad: ${parts.join(', ')}` : `remove ${parts.join(' + ')}, keep ${r.links.length - r.badIds.length}`);
+        } else if (r.farCount) {
+          tags.push(`only link is ${fmtDistance(r.farMax)} away`);
+        }
         tags.push(`L${(r.lockRank || 0) + 1}`);
         if (r.urCount) tags.push(`${r.urCount} UR`);
         if (!r.canDelete) tags.push('no permission');
@@ -535,19 +596,19 @@
           el('span', { class: 'wpa-dot' }),
           el('div', {},
             el('button', { class: 'wpa-name', type: 'button', text: r.name, title: r.links.map((l) => l.status).join(', '), onclick: () => ctrl.show(r) }),
-            el('div', { class: 'wpa-meta', text: tags.join(' · ') })));
+            el('div', { class: `wpa-meta${r.farCount ? ' wpa-far' : ''}`, text: tags.join(' · ') })));
       });
 
       const foot = app.rows.length && el('div', { class: 'wpa-foot' },
         el('label', {},
           el('input', { type: 'checkbox', checked: allChecked, disabled: app.busy, onchange: (ev) => ctrl.setAllChecked(ev.target.checked) }),
           document.createTextNode(' Select all')),
-        el('button', { class: 'wpa-del', type: 'button', text: selected ? `Fix ${selected}` : 'Fix', title: 'Delete the all-closed places and remove only the closed link from the rest', disabled: app.busy || !selected, onclick: () => ctrl.deleteChecked() }));
+        el('button', { class: 'wpa-del', type: 'button', text: selected ? `Fix ${selected}` : 'Fix', title: 'Delete the red places and remove only the bad link(s) from the rest', disabled: app.busy || !selected, onclick: () => ctrl.deleteChecked() }));
 
       const scanNow = !app.autoScan && el('button', { class: 'wpa-btn', type: 'button', text: 'Scan now', disabled: app.busy, onclick: () => ctrl.scanNow() });
 
       popup.replaceChildren(...[
-        el('div', { class: 'wpa-head', text: 'Closed Google links on screen' }),
+        el('div', { class: 'wpa-head', text: 'Google link problems on screen' }),
         el('div', { class: 'wpa-msg', text: app.message }),
         scanNow,
         ...rows,
