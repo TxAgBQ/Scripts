@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Segment Turnaround Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.11.06.02
+// @version      2026.11.06.03
 // @description  Finds Texas segments named "Turnaround" and matches them to the frontage road (road type, lock, +1 routing). Review a checklist, apply, then save in WME yourself.
 // @author       TxAgBQ
 // @match        https://www.waze.com/editor*
@@ -26,9 +26,12 @@
  *   - The segments at BOTH ends must be the same highway type (Minor or Major Highway).
  *     Anything else is listed as "needs review" and never changed.
  *   - A turnaround needs fixing when its road type differs from the frontage road, its lock is
- *     below target (currently L5 for both Minor and Major), or its routing differs from the +1 routing that
- *     every neighbor shares.
- *   - Apply changes the checked rows only. It does NOT save; you save in WME.
+ *     below the lock goal, or its routing differs from the +1 routing that every neighbor shares.
+ *   - Lock goal is L5, or the editor's own maximum rank if that is lower. It never lowers a lock.
+ *   - Apply changes the checked rows only, then closes the list. It does NOT save; you save in WME.
+ *
+ * Look and feel copies WME Place Assist / WME Segment Importer: a draggable top-bar card with a
+ * round status button, and when minimized a round icon in the right-hand stack of map buttons.
  *
  * SDK notes (all verified in the console before writing this)
  *   - Uses getWmeSdk({ ..., mode: 'async' }) only. No W.*, no OpenLayers, no sync mode.
@@ -44,15 +47,17 @@
 
     const SCRIPT_ID = 'wme-segment-turnaround-assist';
     const SCRIPT_NAME = 'WME Segment Turnaround Assist';
-    const VERSION = '2026.11.06.02'; // keep in sync with @version
+    const VERSION = '2026.11.06.03'; // keep in sync with @version
     const LOG = '[WSTA]';
 
     const CFG = {
         streetName: 'turnaround',       // compared case-insensitively against the primary street name
         stateName: 'Texas',
         typeNames: { 6: 'Major Hwy', 7: 'Minor Hwy' },
-        lockForType: { 6: 4, 7: 4 },    // zero-based lockRank: 4 = L5 for both types (was Major L4 / Minor L3)
+        allowedTypes: [6, 7],           // frontage road types we are willing to copy
+        targetLockRank: 4,              // zero-based: 4 = L5. Capped to the editor's own rank.
         rescanDelayMs: 500,
+        noteMs: 20000,                  // how long the "Applied..." note stays in the button tooltip
     };
 
     // ---------- small helpers ----------
@@ -79,6 +84,7 @@
     let dirty = false;
     let scanTimer = null;
     let applying = false;
+    let note = { text: '', until: 0 };
     const ui = {};
 
     // ---------- SDK start-up ----------
@@ -182,9 +188,9 @@
     }
 
     // ---------- the rules ----------
-    function review(res, note) {
+    function review(res, text) {
         res.status = 'review';
-        res.note = note;
+        res.note = text;
         return res;
     }
 
@@ -208,12 +214,14 @@
         }
 
         const types = new Set(neighbors.map((n) => n.roadType));
-        if (types.size !== 1 || !CFG.lockForType[[...types][0]]) {
+        if (types.size !== 1 || !CFG.allowedTypes.includes([...types][0])) {
             const found = [...types].map(typeName).join(' / ');
             return review(res, 'Ends disagree or are not Minor/Major Highway (found: ' + found + ').');
         }
         const targetType = [...types][0];
-        const targetLock = CFG.lockForType[targetType];
+
+        // Lock goal: L5, or this editor's own maximum if lower.
+        const lockGoal = Math.min(CFG.targetLockRank, userRank);
 
         // +1 routing is copied only when every neighbor has the same one.
         const routes = new Set(neighbors.map((n) => n.routingRoadType));
@@ -225,9 +233,9 @@
             changes.roadType = targetType;
             parts.push('Type: ' + typeName(targetType));
         }
-        if (seg.lockRank < targetLock) {
-            changes.lockRank = targetLock;
-            parts.push('Lock: L' + (targetLock + 1));
+        if (seg.lockRank < lockGoal) {
+            changes.lockRank = lockGoal;
+            parts.push('Lock: L' + (lockGoal + 1) + (lockGoal < CFG.targetLockRank ? ' (your max)' : ''));
         }
         if (targetRoute !== null && targetRoute !== undefined && targetRoute !== targetType && seg.routingRoadType !== targetRoute) {
             changes.routingRoadType = targetRoute;
@@ -242,9 +250,6 @@
         res.summary = parts.join(' · ');
         const allowed = await sdk.DataModel.Segments.hasPermissions({ segmentId: seg.id });
         if (!allowed) return review(res, 'You cannot edit this segment (' + res.summary + ' needed).');
-        if (changes.lockRank !== undefined && changes.lockRank > userRank) {
-            return review(res, 'Needs L' + (targetLock + 1) + ' to lock; your rank is L' + (userRank + 1) + '.');
-        }
 
         res.status = 'fix';
         res.changes = changes;
@@ -277,7 +282,7 @@
         const ids = results.filter((r) => r.status === 'fix' && !excluded.has(r.id)).map((r) => r.id);
         if (!ids.length) return;
         if (!(await sdk.Editing.isEditingAllowed())) {
-            setStatus('Editing is not allowed right now.', true);
+            setNote('Editing is not allowed right now.');
             return;
         }
         applying = true;
@@ -293,36 +298,52 @@
             }
         }
         applying = false;
-        let msg = 'Applied ' + done + ' of ' + ids.length + '. Not saved yet. Save in WME when you are ready.';
-        if (problems.length) msg += ' Problems: ' + problems.join('; ');
-        setStatus(msg, problems.length > 0);
+        closePanel(); // the list goes away once the changes are applied
+        let msg = 'Applied ' + done + ' of ' + ids.length + ' turnaround segment(s). Not saved yet: save in WME.';
+        if (problems.length) {
+            msg += ' Problems: ' + problems.join('; ');
+            console.warn(LOG, 'problems', problems);
+        }
+        setNote(msg);
         scheduleScan(300);
     }
 
-    // ---------- UI ----------
-    const ICON_SVG =
-        '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" ' +
-        'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-        '<rect x="2.5" y="2.5" width="19" height="19" rx="3.5"/>' +
-        '<path d="M8.5 18V10a3.5 3.5 0 0 1 7 0v5"/><path d="M13.2 12.8l2.3 2.5 2.3-2.5"/></svg>';
+    // ---------- UI (modelled on WME Place Assist / Segment Importer) ----------
+    // A U-turn sign: rounded sign edge, inner border, thick U arrow whose stem is on the right and
+    // whose arrowhead points down on the left (a left-hand U-turn).
+    function iconSvg(w, h) {
+        return '<svg viewBox="0 0 22 24" width="' + w + '" height="' + h + '" fill="none" stroke="currentColor" ' +
+            'stroke-linecap="butt" stroke-linejoin="round" aria-hidden="true">' +
+            '<rect x="0.9" y="0.9" width="20.2" height="22.2" rx="3" stroke-width="1.6"/>' +
+            '<rect x="3.4" y="3.4" width="15.2" height="17.2" rx="1.8" stroke-width="1.1"/>' +
+            '<path d="M14.6 18.6V10.6A3.6 3.6 0 0 0 7.4 10.6V13.4" stroke-width="3"/>' +
+            '<path d="M4.4 12.8H10.4L7.4 18.2Z" fill="currentColor" stroke="none"/></svg>';
+    }
 
     const CSS = `
-    .wsta-root{position:fixed;z-index:1050;font:12px/1.35 "Helvetica Neue",Arial,sans-serif;color:#22303a}
-    .wsta-bar{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid #b9c4cc;border-radius:20px;
-      padding:3px 6px 3px 3px;box-shadow:0 2px 6px rgba(0,0,0,.25);cursor:move;user-select:none}
-    .wsta-icon{position:relative;width:30px;height:30px;border-radius:50%;border:0;background:#e3e8ec;color:#56646e;
-      cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
-    .wsta-hot .wsta-icon{background:#f5a623;color:#1d1300;animation:wsta-pulse 1.6s infinite}
-    .wsta-warn .wsta-icon{background:#fde2e0;color:#a61b13}
-    .wsta-badge{position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;border-radius:8px;background:#d93025;
-      color:#fff;font-size:10px;font-weight:700;line-height:16px;text-align:center;padding:0 3px;display:none}
+    .wsta-bar{position:fixed;z-index:999990;display:flex;align-items:center;gap:4px;padding:3px 6px 3px 2px;
+      background:#fff;border-radius:10px;box-shadow:0 3px 12px rgba(0,0,0,.35);color:#333;user-select:none;
+      font:13px/1.3 "Rubik","Helvetica Neue",Arial,sans-serif}
+    .wsta-bar.wsta-hidden{display:none}
+    .wsta-grip{cursor:grab;padding:4px;color:#999;font-size:16px;line-height:1;touch-action:none}
+    .wsta-grip:active{cursor:grabbing}
+    .wsta-status{position:relative;width:34px;height:34px;padding:0;border-radius:50%;border:2px solid #c4c8cc;
+      background:#fff;color:#6b7280;display:flex;align-items:center;justify-content:center;cursor:pointer}
+    .wsta-status.amber{border-color:#f29900;color:#c77700;animation:wsta-pulse 1.6s ease-out infinite}
+    .wsta-status.red{border-color:#d93025;color:#d93025}
+    .wsta-badge{position:absolute;top:-6px;right:-6px;min-width:16px;height:16px;padding:0 3px;border-radius:8px;
+      box-sizing:border-box;background:#d93025;color:#fff;font-size:10px;font-weight:700;line-height:16px;
+      text-align:center;display:none}
     .wsta-badge.wsta-on{display:block}
-    .wsta-title{font-weight:600;white-space:nowrap}
-    .wsta-min{border:0;background:transparent;font-size:16px;line-height:1;cursor:pointer;color:#56646e;padding:0 4px}
-    .wsta-minimized .wsta-title,.wsta-minimized .wsta-min,.wsta-minimized .wsta-panel{display:none}
-    .wsta-minimized .wsta-bar{padding:3px}
-    .wsta-panel{display:none;margin-top:6px;width:340px;background:#fff;border:1px solid #b9c4cc;border-radius:8px;
-      box-shadow:0 2px 8px rgba(0,0,0,.28);padding:8px}
+    .wsta-min{border:0;background:none;cursor:pointer;font-size:18px;line-height:1;color:#666;padding:2px 6px}
+    .wsta-fab{position:relative;width:40px;height:40px;border-radius:50%;background:#fff;color:#6b7280;
+      box-shadow:0 2px 6px rgba(0,0,0,.3);display:none;align-items:center;justify-content:center;cursor:pointer}
+    .wsta-fab.show{display:flex}
+    .wsta-fab.floating{position:fixed;right:12px;top:66%;z-index:999990}
+    .wsta-fab.amber{color:#c77700}
+    .wsta-fab.red{color:#d93025}
+    .wsta-panel{position:absolute;top:calc(100% + 6px);left:0;width:320px;display:none;background:#fff;
+      border:1px solid #dadce0;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.35);padding:8px;cursor:default}
     .wsta-panel.wsta-open{display:block}
     .wsta-summary{font-weight:600;margin-bottom:6px}
     .wsta-list{max-height:42vh;overflow:auto;border-top:1px solid #e3e8ec}
@@ -332,12 +353,10 @@
     .wsta-note{color:#8a5b00}
     .wsta-review .wsta-note{color:#a61b13}
     .wsta-actions{display:flex;gap:6px;margin-top:8px}
-    .wsta-actions button{border:1px solid #b9c4cc;background:#f4f6f8;border-radius:4px;padding:3px 8px;cursor:pointer}
+    .wsta-actions button{border:1px solid #dadce0;background:#f4f6f8;border-radius:4px;padding:3px 8px;cursor:pointer}
     .wsta-actions .wsta-primary{margin-left:auto;background:#1a73e8;border-color:#1a73e8;color:#fff;font-weight:600}
     .wsta-actions button:disabled{opacity:.5;cursor:default}
-    .wsta-status{margin-top:6px;color:#22303a}
-    .wsta-status.wsta-err{color:#a61b13}
-    @keyframes wsta-pulse{0%,100%{box-shadow:0 0 0 0 rgba(245,166,35,.6)}50%{box-shadow:0 0 0 6px rgba(245,166,35,0)}}
+    @keyframes wsta-pulse{0%{box-shadow:0 0 0 0 rgba(242,153,0,.5)}70%,100%{box-shadow:0 0 0 7px rgba(242,153,0,0)}}
     `;
 
     function el(tag, className, text) {
@@ -353,22 +372,21 @@
         style.textContent = CSS;
         document.head.appendChild(style);
 
-        ui.root = el('div', 'wsta-root');
+        // Top-bar card: grip, round status button, minimize, drop-down list.
         ui.bar = el('div', 'wsta-bar');
-        ui.icon = el('button', 'wsta-icon');
-        ui.icon.type = 'button';
-        ui.icon.innerHTML = ICON_SVG; // static markup only
-        ui.icon.title = 'Segment Turnaround Assist';
+        ui.grip = el('span', 'wsta-grip', '⋮');
+        ui.grip.title = 'Drag to move';
+        ui.status = el('button', 'wsta-status');
+        ui.status.type = 'button';
+        ui.status.innerHTML = iconSvg(18, 20); // static markup only
         ui.badge = el('span', 'wsta-badge');
-        ui.icon.appendChild(ui.badge);
-        ui.title = el('span', 'wsta-title', 'Turnaround Assist');
-        ui.minBtn = el('button', 'wsta-min', '–');
+        ui.status.appendChild(ui.badge);
+        ui.minBtn = el('button', 'wsta-min', '−');
         ui.minBtn.type = 'button';
-        ui.minBtn.title = 'Minimize to an icon';
-        ui.bar.append(ui.icon, ui.title, ui.minBtn);
+        ui.minBtn.title = 'Minimize to an icon in the stack of buttons on the right of the map';
 
         ui.panel = el('div', 'wsta-panel');
-        ui.summary = el('div', 'wsta-summary', 'Scanning...');
+        ui.summary = el('div', 'wsta-summary');
         ui.list = el('div', 'wsta-list');
         const actions = el('div', 'wsta-actions');
         ui.allBtn = el('button', null, 'All');
@@ -376,29 +394,32 @@
         ui.applyBtn = el('button', 'wsta-primary', 'Apply checked');
         for (const b of [ui.allBtn, ui.noneBtn, ui.applyBtn]) b.type = 'button';
         actions.append(ui.allBtn, ui.noneBtn, ui.applyBtn);
-        ui.status = el('div', 'wsta-status');
-        ui.panel.append(ui.summary, ui.list, actions, ui.status);
+        ui.panel.append(ui.summary, ui.list, actions);
 
-        ui.root.append(ui.bar, ui.panel);
-        document.body.appendChild(ui.root);
+        ui.bar.append(ui.grip, ui.status, ui.minBtn, ui.panel);
+        document.body.appendChild(ui.bar);
 
-        const pos = store.get('pos', { left: 400, top: 80 });
-        placeRoot(pos.left, pos.top);
-        ui.root.classList.toggle('wsta-minimized', !!store.get('minimized', false));
+        // Minimized state: a round icon in WME's right-hand stack of map buttons (or floating if not found).
+        ui.fab = el('div', 'wsta-fab');
+        ui.fab.setAttribute('role', 'button');
+        ui.fab.innerHTML = iconSvg(22, 24);
+        ui.fabBadge = el('span', 'wsta-badge');
+        ui.fab.appendChild(ui.fabBadge);
+        const stack = document.querySelector('.overlay-buttons-container.top');
+        if (stack) {
+            stack.appendChild(ui.fab);
+        } else {
+            ui.fab.classList.add('floating');
+            document.body.appendChild(ui.fab);
+        }
 
-        ui.icon.addEventListener('click', () => {
-            if (ui.root.classList.contains('wsta-minimized')) {
-                ui.root.classList.remove('wsta-minimized');
-                store.set('minimized', false);
-            } else {
-                ui.panel.classList.toggle('wsta-open');
-            }
-        });
-        ui.minBtn.addEventListener('click', () => {
-            ui.panel.classList.remove('wsta-open');
-            ui.root.classList.add('wsta-minimized');
-            store.set('minimized', true);
-        });
+        const pos = store.get('pos', { left: Math.max(0, window.innerWidth - 380), top: 0 });
+        placeBar(pos.left, pos.top);
+        setMinimized(!!store.get('minimized', false));
+
+        ui.status.addEventListener('click', () => ui.panel.classList.toggle('wsta-open'));
+        ui.fab.addEventListener('click', () => setMinimized(false));
+        ui.minBtn.addEventListener('click', () => setMinimized(true));
         ui.allBtn.addEventListener('click', () => { excluded.clear(); persistExcluded(); render(); });
         ui.noneBtn.addEventListener('click', () => {
             results.filter((r) => r.status === 'fix').forEach((r) => excluded.add(r.id));
@@ -409,28 +430,38 @@
         enableDrag();
     }
 
-    function placeRoot(left, top) {
-        const l = Math.max(0, Math.min(left, window.innerWidth - 60));
-        const t = Math.max(0, Math.min(top, window.innerHeight - 60));
-        ui.root.style.left = l + 'px';
-        ui.root.style.top = t + 'px';
+    function setMinimized(flag) {
+        closePanel();
+        ui.bar.classList.toggle('wsta-hidden', flag);
+        ui.fab.classList.toggle('show', flag);
+        store.set('minimized', flag);
+    }
+
+    function closePanel() {
+        if (ui.panel) ui.panel.classList.remove('wsta-open');
+    }
+
+    function placeBar(left, top) {
+        const maxLeft = Math.max(0, window.innerWidth - (ui.bar.offsetWidth || 90));
+        const maxTop = Math.max(0, window.innerHeight - 50);
+        ui.bar.style.left = Math.max(0, Math.min(left, maxLeft)) + 'px';
+        ui.bar.style.top = Math.max(0, Math.min(top, maxTop)) + 'px';
     }
 
     function enableDrag() {
         let start = null;
-        ui.bar.addEventListener('mousedown', (e) => {
-            if (e.target.closest('button')) return;
-            start = { x: e.clientX, y: e.clientY, left: ui.root.offsetLeft, top: ui.root.offsetTop };
+        ui.grip.addEventListener('mousedown', (e) => {
+            start = { x: e.clientX, y: e.clientY, left: ui.bar.offsetLeft, top: ui.bar.offsetTop };
             e.preventDefault();
         });
         document.addEventListener('mousemove', (e) => {
             if (!start) return;
-            placeRoot(start.left + e.clientX - start.x, start.top + e.clientY - start.y);
+            placeBar(start.left + e.clientX - start.x, start.top + e.clientY - start.y);
         });
         document.addEventListener('mouseup', () => {
             if (!start) return;
             start = null;
-            store.set('pos', { left: ui.root.offsetLeft, top: ui.root.offsetTop });
+            store.set('pos', { left: ui.bar.offsetLeft, top: ui.bar.offsetTop });
         });
     }
 
@@ -438,9 +469,9 @@
         store.set('excluded', [...excluded].slice(-200));
     }
 
-    function setStatus(text, isError) {
-        ui.status.textContent = text;
-        ui.status.classList.toggle('wsta-err', !!isError);
+    function setNote(text) {
+        note = { text, until: Date.now() + CFG.noteMs };
+        renderTitles();
     }
 
     function selectSegment(id) {
@@ -454,19 +485,35 @@
         ui.applyBtn.disabled = applying || n === 0;
     }
 
+    function renderTitles() {
+        if (!ui.bar) return;
+        const fix = results.filter((r) => r.status === 'fix').length;
+        const rev = results.filter((r) => r.status === 'review').length;
+        let base;
+        if (fix) base = fix + ' turnaround segment(s) need changing. Click to review.';
+        else if (rev) base = 'Turnaround segments need review. Click to open.';
+        else base = 'No turnaround segments need changing in view.';
+        const text = (note.text && Date.now() < note.until) ? note.text + ' | ' + base : base;
+        ui.status.title = text;
+        ui.fab.title = text;
+    }
+
     function render() {
-        if (!ui.root) return;
+        if (!ui.bar) return;
         const fix = results.filter((r) => r.status === 'fix');
         const rev = results.filter((r) => r.status === 'review');
         const ok = results.filter((r) => r.status === 'ok');
 
-        ui.badge.textContent = fix.length ? String(fix.length) : (rev.length ? '!' : '');
-        ui.badge.classList.toggle('wsta-on', fix.length > 0 || rev.length > 0);
-        ui.root.classList.toggle('wsta-hot', fix.length > 0);
-        ui.root.classList.toggle('wsta-warn', fix.length === 0 && rev.length > 0);
-        ui.icon.title = fix.length
-            ? fix.length + ' turnaround segment(s) need changing'
-            : 'No turnaround segments need changing in view';
+        const badgeText = fix.length ? String(fix.length) : (rev.length ? '!' : '');
+        for (const b of [ui.badge, ui.fabBadge]) {
+            b.textContent = badgeText;
+            b.classList.toggle('wsta-on', badgeText !== '');
+        }
+        for (const b of [ui.status, ui.fab]) {
+            b.classList.toggle('amber', fix.length > 0);
+            b.classList.toggle('red', fix.length === 0 && rev.length > 0);
+        }
+        renderTitles();
 
         ui.summary.textContent = fix.length + ' to fix · ' + rev.length + ' need review · ' + ok.length + ' already match';
 
