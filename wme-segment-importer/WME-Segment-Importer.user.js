@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110201
+// @version      2026110601
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -153,7 +153,7 @@
     const REQUIRE_ENDS_ON_SCREEN = true;
     const ROAD_TYPE_STREET = 1;
     const ROAD_TYPE_PRIVATE = 17;
-    const DRIVEWAY_LOCK_RANK = 1; // SDK lockRank is 0-based: 1 = lock level 2 (to be confirmed in the console)
+    const DRIVEWAY_LOCK_RANK = 1; // SDK lockRank is 0-based: 1 = lock level 2 (confirmed in the console on a lock 2 segment)
 
     // Postal city for each ZIP in Kendall County (the county layer has no postal city field).
     // Add to this list whenever the panel reports a ZIP that is missing.
@@ -1832,6 +1832,22 @@
         cursorRing.style.width = cursorRing.style.height = working ? '30px' : '24px';
         cursorRing.style.marginLeft = cursorRing.style.marginTop = working ? '-15px' : '-12px';
     }, 120);
+
+    // Press feedback for every button in the importer's own panels (sidebar, Area panel, Segment check panel): an inset shadow while the
+    // mouse is down, kept for a moment after the click so a fast action (Fix cities only, Check flagged) still shows it was pressed.
+    const PRESS_ROOTS = ['#wme-gis-importer-container', '#wme-gis-importer-area-panel', '#wme-gis-importer-check-panel'];
+    const PRESS_FLASH_MS = 550;
+    const pressStyle = document.createElement('style');
+    pressStyle.textContent = PRESS_ROOTS.map((r) => `${r} button:active:not(:disabled), ${r} button.wmesi-pressed`).join(',\n')
+        + ' { box-shadow: inset 0 3px 7px rgba(0,0,0,0.5) !important; transform: translateY(1px); filter: brightness(0.88); }';
+    document.head.appendChild(pressStyle);
+    document.addEventListener('click', (e) => {
+        const button = e.target instanceof Element ? e.target.closest('button') : null;
+        if (!button || button.disabled || !PRESS_ROOTS.some((r) => button.closest(r))) return;
+        button.classList.add('wmesi-pressed');
+        clearTimeout(button._pressTimer);
+        button._pressTimer = setTimeout(() => button.classList.remove('wmesi-pressed'), PRESS_FLASH_MS);
+    }, true);
 
     function paintToggleButton(button, on, colour) {
         button.style.background = on ? colour : '#ffffff';
@@ -7521,6 +7537,7 @@
             font-family: sans-serif; font-size: 12px; color: #202124;`);
         const header = el('div', `display: flex; align-items: center; gap: 6px; padding: 8px 10px; cursor: move; user-select: none;
             border-bottom: 3px solid ${COLOUR}; border-radius: 8px 8px 0 0;`);
+        panel.id = 'wme-gis-importer-check-panel';
         header.appendChild(el('span', 'font-weight: bold; font-size: 13px; flex: 1;', 'Segment check'));
         const levelLabel = el('span', 'font-size: 11px; font-weight: bold; padding: 2px 7px; border-radius: 9px; color: #ffffff; background: #9aa0a6;', 'Off');
         levelLabel.title = 'The scan level. Change it with the scan button on the toolbar.';
