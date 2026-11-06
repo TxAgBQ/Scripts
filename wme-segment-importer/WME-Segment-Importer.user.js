@@ -2,7 +2,7 @@
 // @name         WME Segment Importer
 // @namespace    wme-segment-importer
 // @author       TxAgBQ
-// @version      2026110601
+// @version      2026110602
 // @description  Imports roads from county GIS into WME (joins nodes, extends stubs, names streets and cities), imports everything inside an outlined area in one run (and fixes the flagged segments there), adds house numbers, and highlights segments missing a street name or city, and checks the city info of the segment you are editing. Uses WME GIS Layers outside Kendall County, TX. Can name an unnamed road from a Google Maps right-click.
 // @match        https://beta.waze.com/*editor*
 // @match        https://www.waze.com/*editor*
@@ -1219,6 +1219,7 @@
     // GIS feature ids already imported this session (prevents duplicate overlapping segments)
     const importedFeatureIds = new Set();
     const importerMadeIds = new Set(); // segments this script creates (autofill leaves those to the importer)
+    const addedHouseNumbers = new Map(); // segment id -> house numbers this script added (the SDK does not list unsaved house numbers)
     let busy = false;
     let areaDrawing = false; // the Area outline is being drawn: map clicks add corners instead of importing
     let areaRunning = false; // an Area run is in progress: the status strip stays out of the way of its panel
@@ -2317,7 +2318,7 @@
     // existing segment (which WME then splits). The endpoint is moved onto that exact spot and a
     // "snapped feature" record is built, the same record WME's own drawing tool hands to its
     // AddSegment action.
-    async function snapEndpoints(coords, tolerances = {}) {
+    async function snapEndpoints(coords, tolerances = {}, nativeEdges = false) {
         const last = coords.length - 1;
         const snaps = {};
         const snappedFeatures = [];
@@ -2344,7 +2345,9 @@
 
             coords[index] = snap.coord;
             snaps[key] = snap;
-            if (nativeFeature) {
+            // Only a join onto an existing intersection needs WME's native action. A join onto the middle of a road is done
+            // through the SDK after the segment is created (joinEdgesViaSdk below), so it does not depend on W.
+            if (nativeFeature && (snap.kind === 'node' || nativeEdges)) {
                 snappedFeatures.push({
                     feature: nativeFeature,
                     point: { type: 'Point', coordinates: [...snap.coord] },
@@ -2387,6 +2390,91 @@
         } finally {
             actionManager.add = originalAdd;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Joining an end onto the middle of an existing road, through the SDK only
+    // ------------------------------------------------------------------
+    // The SDK has no "connect to this node" option, but Segments.addIntersection splits two crossing segments at the crossing and joins
+    // them there (checked in the console). So a road that ends on the middle of another is drawn a few metres past it, the two are
+    // split at the crossing, and the piece sticking out past the road is deleted. The new segment's id changes, so joinEdgesViaSdk
+    // returns the id of the piece that is kept. A join at an existing intersection can not be done this way ("does not have a split
+    // point"), so that one still uses WME's native action while W exists.
+    const EDGE_JOIN_OVERSHOOT_M = 3;
+
+    // The point `extra` metres beyond `to`, on the line from `from` through `to` (lon/lat).
+    function extendPast(from, to, extra) {
+        const a = makeProjector(to)(from);
+        const len = Math.hypot(a[0], a[1]) || 1;
+        return [to[0] + ((-a[0] / len) * extra) / (111320 * Math.cos(to[1] * RAD)), to[1] + ((-a[1] / len) * extra) / 110540];
+    }
+
+    // True if the straight leg a->b crosses the polyline (a proper crossing: both ways round).
+    function legCrossesLine(a, b, line) {
+        const proj = makeProjector(a);
+        const p = proj(a);
+        const q = proj(b);
+        const side = (o, u, v) => (u[0] - o[0]) * (v[1] - o[1]) - (u[1] - o[1]) * (v[0] - o[0]);
+        for (let i = 0; i < line.length - 1; i++) {
+            const r = proj(line[i]);
+            const s = proj(line[i + 1]);
+            if (side(p, q, r) * side(p, q, s) < 0 && side(r, s, p) * side(r, s, q) < 0) return true;
+        }
+        return false;
+    }
+
+    // For each end snapped onto the middle of a road: the target road and the point to draw to (past it), if the last leg really crosses it.
+    async function planEdgeJoins(coords, snaps) {
+        const plan = {};
+        if (coords.length < 2) return plan;
+        for (const key of ['from', 'to']) {
+            const snap = snaps[key];
+            if (!snap || snap.kind !== 'edge') continue;
+            const target = await sdk.DataModel.Segments.getById({ segmentId: snap.targetId });
+            if (!target) continue;
+            const tipIndex = key === 'from' ? 0 : coords.length - 1;
+            const inner = coords[key === 'from' ? 1 : coords.length - 2];
+            const past = extendPast(inner, coords[tipIndex], EDGE_JOIN_OVERSHOOT_M);
+            if (legCrossesLine(inner, past, target.geometry.coordinates)) plan[key] = { targetId: snap.targetId, tipIndex, past };
+        }
+        return plan;
+    }
+
+    // The coordinates to create the segment with: the planned ends drawn past the road they meet.
+    function coordsWithOvershoot(coords, plan) {
+        const out = coords.map((c) => [...c]);
+        for (const step of Object.values(plan)) out[step.tipIndex] = [...step.past];
+        return out;
+    }
+
+    // Splits the new segment and each road it ends on at the crossing, then deletes the overshoot. Returns { segmentId (the piece kept),
+    // joined: {from, to}, error }. On an error the new segment is left as it is (the caller decides what to do).
+    async function joinEdgesViaSdk(segmentId, plan) {
+        const out = { segmentId, joined: {}, error: '' };
+        for (const key of ['from', 'to']) {
+            const step = plan[key];
+            if (!step) continue;
+            try {
+                const seg = await sdk.DataModel.Segments.getById({ segmentId: out.segmentId });
+                if (!seg) throw new Error('the new segment could not be read');
+                const tailNode = key === 'from' ? seg.fromNodeId : seg.toNodeId;
+                const split = await sdk.DataModel.Segments.addIntersection({ segmentIds: [out.segmentId, step.targetId] });
+                const pieces = [];
+                for (const id of split.sourceSplits) pieces.push(await sdk.DataModel.Segments.getById({ segmentId: id }));
+                const tail = pieces.find((p) => p && (p.fromNodeId === tailNode || p.toNodeId === tailNode));
+                const keep = pieces.find((p) => p && p !== tail);
+                if (!tail || !keep) throw new Error('could not tell which piece is the overshoot');
+                await sdk.DataModel.Segments.deleteSegment({ segmentId: tail.id });
+                out.segmentId = keep.id;
+                importerMadeIds.add(keep.id);
+                out.joined[key] = true;
+            } catch (err) {
+                out.error = `end ${key === 'from' ? 'A' : 'B'}: ${err.message || err}`;
+                console.warn(`[${SCRIPT_NAME}] Join onto a road failed (${out.error}):`, err);
+                break;
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------
@@ -2999,7 +3087,7 @@
             const pieceCoords = plan.end.label === 'B'
                 ? plan.outward.map((c) => [...c])
                 : [...plan.outward].reverse().map((c) => [...c]);
-            const { snaps, snappedFeatures } = await snapEndpoints(pieceCoords);
+            const { snaps, snappedFeatures } = await snapEndpoints(pieceCoords, {}, true); // extending a stub still joins through the native action (W) for now
             const { segmentId: pieceId, patched } = await addSegmentWithSnaps(pieceCoords, snappedFeatures, stub.roadType);
             finalId = pieceId;
             if (!patched) {
@@ -3266,6 +3354,8 @@
         } catch (err) {
             console.warn(`[${SCRIPT_NAME}] Could not read saved house numbers:`, err);
         }
+        for (const id of segmentIds) (addedHouseNumbers.get(id) || new Set()).forEach((n) => have.add(n));
+        // WME's own store also holds numbers typed in by hand and not saved yet; it is only read while W still exists
         try {
             const store = pageWin.W && pageWin.W.model && pageWin.W.model.segmentHouseNumbers;
             const all = store && typeof store.getObjectArray === 'function' ? store.getObjectArray() : [];
@@ -3657,6 +3747,8 @@
             const target = [origin[0] + tx / mx, origin[1] + ty / my];
             await sdk.DataModel.HouseNumbers.addHouseNumber({ number, point: { type: 'Point', coordinates: target }, segmentId });
             have.add(number.toLowerCase());
+            if (!addedHouseNumbers.has(segmentId)) addedHouseNumbers.set(segmentId, new Set());
+            addedHouseNumbers.get(segmentId).add(number.toLowerCase());
             added.push(number);
         }
 
@@ -4021,13 +4113,22 @@
 
         // 2. Create the segment, attaching snap info so WME joins nodes / splits segments
         let created;
+        const edgePlan = await planEdgeJoins(coords, snaps);
         try {
-            created = await addSegmentWithSnaps(coords, snappedFeatures, driveway ? ROAD_TYPE_PRIVATE : ROAD_TYPE_STREET);
+            created = await addSegmentWithSnaps(coordsWithOvershoot(coords, edgePlan), snappedFeatures, driveway ? ROAD_TYPE_PRIVATE : ROAD_TYPE_STREET);
         } catch (err) {
             console.error(`[${SCRIPT_NAME}] addSegment failed:`, err);
             return say('failed', 'error', `${name || (driveway ? 'Driveway' : 'New road')}: could not create segment: ${err.message || err}`);
         }
-        const { segmentId, patched } = created;
+        let { segmentId } = created;
+        const { patched } = created;
+        const edgeJoin = await joinEdgesViaSdk(segmentId, edgePlan);
+        segmentId = edgeJoin.segmentId;
+        if (edgeJoin.error) {
+            // the road would stick out past the one it meets, so it is not kept; nothing was saved, the click can be repeated
+            try { await sdk.DataModel.Segments.deleteSegment({ segmentId }); } catch (err) { console.warn(`[${SCRIPT_NAME}] Could not remove the segment after a failed join:`, err); }
+            return say('failed', 'error', `${name || 'New road'}: could not join it onto the road it meets (${edgeJoin.error}), so it was not imported.`);
+        }
         if (feature.id !== undefined) importedFeatureIds.add(featureKey);
 
         let segment = await sdk.DataModel.Segments.getById({ segmentId });
@@ -4131,8 +4232,8 @@
         segment = await sdk.DataModel.Segments.getById({ segmentId }) || segment;
 
         const ends = [
-            { label: 'A', snap: snaps.from, actual: segment.fromNodeId },
-            { label: 'B', snap: snaps.to, actual: segment.toNodeId }
+            { label: 'A', key: 'from', snap: snaps.from, actual: segment.fromNodeId },
+            { label: 'B', key: 'to', snap: snaps.to, actual: segment.toNodeId }
         ];
 
         for (const end of ends) {
@@ -4144,7 +4245,8 @@
             // Segment target: the split leaves the two halves plus the new segment on one node.
             const joined = end.snap.kind === 'node'
                 ? end.actual === end.snap.targetId
-                : connectedCount >= 3;
+                // after an SDK join the node's own list of connected segments was seen lagging behind (2 instead of 3), so the join result is trusted
+                : !!edgeJoin.joined[end.key] || connectedCount >= 3;
             const what = end.snap.kind === 'node'
                 ? 'joined an existing intersection'
                 : 'split the road it meets and joined it';
@@ -4163,7 +4265,8 @@
             } else {
                 level = 'warn';
                 const target = end.snap.kind === 'node' ? 'the intersection it should join' : 'the road it meets';
-                messages.push(`End ${end.label} did NOT connect to ${target}.`);
+                const noNative = end.snap.kind === 'node' && !(pageWin.W && pageWin.W.model && pageWin.W.model.actionManager);
+                messages.push(`End ${end.label} did NOT connect to ${target}.${noNative ? ' WME no longer lets scripts join onto an existing intersection, so join it by hand.' : ''}`);
                 console.warn(`[${SCRIPT_NAME}] Connection failed at end ${end.label}: wanted ${end.snap.kind} ${end.snap.targetId}, end node is ${end.actual} with ${connectedCount} segment(s).`);
             }
         }
