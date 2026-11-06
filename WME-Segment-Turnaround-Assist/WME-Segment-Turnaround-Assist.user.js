@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Segment Turnaround Assist
 // @namespace    https://github.com/TxAgBQ/Scripts
-// @version      2026.11.06.03
+// @version      2026.11.06.04
 // @description  Finds Texas segments named "Turnaround" and matches them to the frontage road (road type, lock, +1 routing). Review a checklist, apply, then save in WME yourself.
 // @author       TxAgBQ
 // @match        https://www.waze.com/editor*
@@ -23,10 +23,14 @@
  *
  * What it does
  *   - Looks at segments in view whose primary street is "Turnaround" and whose state is Texas.
- *   - The segments at BOTH ends must be the same highway type (Minor or Major Highway).
+ *     Several Turnaround segments in a row are handled as ONE turnaround (one row, one checkbox).
+ *   - The frontage road is the NAMED segments at the two outer ends of the turnaround. Names may differ
+ *     per end (I-10 W Frontage Rd / I-10 E Frontage Rd, Grand Pkwy, ...). Unnamed segments there are
+ *     at grade connectors and are ignored.
+ *   - All of those frontage segments must be the same highway type (Minor or Major Highway).
  *     Anything else is listed as "needs review" and never changed.
  *   - A turnaround needs fixing when its road type differs from the frontage road, its lock is
- *     below the lock goal, or its routing differs from the +1 routing that every neighbor shares.
+ *     below the lock goal, or its routing differs from the +1 routing that every named frontage segment shares.
  *   - Lock goal is L5, or the editor's own maximum rank if that is lower. It never lowers a lock.
  *   - Apply changes the checked rows only, then closes the list. It does NOT save; you save in WME.
  *
@@ -47,7 +51,7 @@
 
     const SCRIPT_ID = 'wme-segment-turnaround-assist';
     const SCRIPT_NAME = 'WME Segment Turnaround Assist';
-    const VERSION = '2026.11.06.03'; // keep in sync with @version
+    const VERSION = '2026.11.06.04'; // keep in sync with @version
     const LOG = '[WSTA]';
 
     const CFG = {
@@ -162,7 +166,54 @@
         return !(maxX < ext[0] || minX > ext[2] || maxY < ext[1] || minY > ext[3]);
     }
 
+    // Street names are cached for one scan / one apply so we do not ask the SDK twice.
+    const nameCache = new Map();
+    async function streetNameOf(seg) {
+        const sid = seg.primaryStreetId;
+        if (sid === null || sid === undefined) return '';
+        if (!nameCache.has(sid)) {
+            const st = await sdk.DataModel.Streets.getById({ streetId: sid });
+            nameCache.set(sid, st && st.name ? st.name.trim() : '');
+        }
+        return nameCache.get(sid);
+    }
+
+    // A turnaround can be several Turnaround segments in a row. Collect the whole chain.
+    async function collectChain(seed, seen) {
+        const members = [];
+        const queue = [seed];
+        seen.add(seed.id);
+        while (queue.length) {
+            const seg = queue.shift();
+            members.push(seg);
+            for (const key of ['fromNodeId', 'toNodeId']) {
+                const node = await sdk.DataModel.Nodes.getById({ nodeId: seg[key] });
+                for (const sid of (node && node.connectedSegmentIds) || []) {
+                    if (seen.has(sid)) continue;
+                    const other = await sdk.DataModel.Segments.getById({ segmentId: sid });
+                    if (other && turnStreetIds.has(other.primaryStreetId)) {
+                        seen.add(sid);
+                        queue.push(other);
+                    }
+                }
+            }
+        }
+        members.sort((a, b) => a.id - b.id);
+        return members;
+    }
+
+    async function loadMembers(ids) {
+        const list = [];
+        for (const id of ids) {
+            const s = await sdk.DataModel.Segments.getById({ segmentId: id });
+            if (!s) return null;
+            list.push(s);
+        }
+        return list;
+    }
+
     async function scan() {
+        nameCache.clear();
         const streets = await sdk.DataModel.Streets.getAll();
         turnStreetIds = new Set(
             streets.filter((s) => s && s.name && s.name.trim().toLowerCase() === CFG.streetName).map((s) => s.id)
@@ -174,16 +225,22 @@
 
         const ext = await sdk.Map.getMapExtent();
         const segments = await sdk.DataModel.Segments.getAll();
+        const seen = new Set();
         const found = [];
-        for (const seg of segments) {
-            if (!turnStreetIds.has(seg.primaryStreetId)) continue;
-            if (!boxIntersects(seg.geometry, ext)) continue;
-            const addr = await sdk.DataModel.Segments.getAddress({ segmentId: seg.id });
-            if (!addr || !addr.state || addr.state.name !== CFG.stateName) continue;
-            found.push(await evaluate(seg));
+        for (const seed of segments) {
+            if (!turnStreetIds.has(seed.primaryStreetId) || seen.has(seed.id)) continue;
+            if (!boxIntersects(seed.geometry, ext)) continue;
+            const members = await collectChain(seed, seen);
+            let allTexas = true;
+            for (const m of members) {
+                const addr = await sdk.DataModel.Segments.getAddress({ segmentId: m.id });
+                if (!addr || !addr.state || addr.state.name !== CFG.stateName) { allTexas = false; break; }
+            }
+            if (!allTexas) continue;
+            found.push(await evaluateGroup(members));
         }
         const order = { fix: 0, review: 1, ok: 2 };
-        found.sort((a, b) => order[a.status] - order[b.status] || a.id - b.id);
+        found.sort((a, b) => order[a.status] - order[b.status] || a.key - b.key);
         return found;
     }
 
@@ -194,23 +251,35 @@
         return res;
     }
 
-    async function evaluate(seg) {
-        const res = { id: seg.id, status: 'ok', note: '', changes: null, summary: '' };
+    // One result per turnaround (a single segment, or a chain of Turnaround segments).
+    async function evaluateGroup(members) {
+        const ids = members.map((m) => m.id);
+        const res = { key: Math.min(...ids), ids, status: 'ok', note: '', perSegment: [], summary: '' };
 
-        // Neighbors at BOTH ends, from the nodes.
+        // The two outer ends of the chain: nodes touched by exactly one segment of the chain.
+        const touch = new Map();
+        for (const m of members) {
+            for (const k of ['fromNodeId', 'toNodeId']) touch.set(m[k], (touch.get(m[k]) || 0) + 1);
+        }
+        const endNodes = [...touch].filter(([, count]) => count === 1).map(([nodeId]) => nodeId);
+        if (endNodes.length < 2) return review(res, 'Could not find two ends for this turnaround.');
+
+        // Frontage road = NAMED segments at the outer ends. Unnamed ones are at grade connectors; ignore them.
+        const idSet = new Set(ids);
         const neighbors = [];
-        for (const key of ['fromNodeId', 'toNodeId']) {
-            const node = await sdk.DataModel.Nodes.getById({ nodeId: seg[key] });
-            const atThisEnd = [];
+        for (const nodeId of endNodes) {
+            const node = await sdk.DataModel.Nodes.getById({ nodeId });
+            const here = [];
             for (const sid of (node && node.connectedSegmentIds) || []) {
-                if (sid === seg.id) continue;
+                if (idSet.has(sid)) continue;
                 const other = await sdk.DataModel.Segments.getById({ segmentId: sid });
                 if (!other) return review(res, 'A connected segment is not loaded. Pan or zoom and it will rescan.');
-                if (turnStreetIds.has(other.primaryStreetId)) continue; // another turnaround, not the frontage road
-                atThisEnd.push(other);
+                if (turnStreetIds.has(other.primaryStreetId)) continue;
+                if (!(await streetNameOf(other))) continue;
+                here.push(other);
             }
-            if (!atThisEnd.length) return review(res, 'No frontage road segment at one end.');
-            neighbors.push(...atThisEnd);
+            if (!here.length) return review(res, 'No named frontage road segment at one end.');
+            neighbors.push(...here);
         }
 
         const types = new Set(neighbors.map((n) => n.roadType));
@@ -223,64 +292,72 @@
         // Lock goal: L5, or this editor's own maximum if lower.
         const lockGoal = Math.min(CFG.targetLockRank, userRank);
 
-        // +1 routing is copied only when every neighbor has the same one.
+        // +1 routing is copied only when every named frontage segment has the same one.
         const routes = new Set(neighbors.map((n) => n.routingRoadType));
         const targetRoute = routes.size === 1 ? [...routes][0] : null;
+        const copyRoute = targetRoute !== null && targetRoute !== undefined && targetRoute !== targetType;
 
-        const changes = {};
-        const parts = [];
-        if (seg.roadType !== targetType) {
-            changes.roadType = targetType;
-            parts.push('Type: ' + typeName(targetType));
-        }
-        if (seg.lockRank < lockGoal) {
-            changes.lockRank = lockGoal;
-            parts.push('Lock: L' + (lockGoal + 1) + (lockGoal < CFG.targetLockRank ? ' (your max)' : ''));
-        }
-        if (targetRoute !== null && targetRoute !== undefined && targetRoute !== targetType && seg.routingRoadType !== targetRoute) {
-            changes.routingRoadType = targetRoute;
-            parts.push('Routing: ' + typeName(targetRoute));
+        for (const seg of members) {
+            const changes = {};
+            if (seg.roadType !== targetType) changes.roadType = targetType;
+            if (seg.lockRank < lockGoal) changes.lockRank = lockGoal;
+            if (copyRoute && seg.routingRoadType !== targetRoute) changes.routingRoadType = targetRoute;
+            if (Object.keys(changes).length) res.perSegment.push({ id: seg.id, changes });
         }
 
-        if (!parts.length) {
+        if (!res.perSegment.length) {
             res.summary = 'Already matches';
             return res;
         }
 
-        res.summary = parts.join(' · ');
-        const allowed = await sdk.DataModel.Segments.hasPermissions({ segmentId: seg.id });
-        if (!allowed) return review(res, 'You cannot edit this segment (' + res.summary + ' needed).');
+        const parts = [];
+        if (res.perSegment.some((p) => p.changes.roadType !== undefined)) parts.push('Type: ' + typeName(targetType));
+        if (res.perSegment.some((p) => p.changes.lockRank !== undefined)) {
+            parts.push('Lock: L' + (lockGoal + 1) + (lockGoal < CFG.targetLockRank ? ' (your max)' : ''));
+        }
+        if (res.perSegment.some((p) => p.changes.routingRoadType !== undefined)) parts.push('Routing: ' + typeName(targetRoute));
+        res.summary = (ids.length > 1 ? ids.length + ' segments · ' : '') + parts.join(' · ');
+
+        // All or nothing: if any segment of the chain is not editable, flag the whole thing.
+        for (const p of res.perSegment) {
+            const allowed = await sdk.DataModel.Segments.hasPermissions({ segmentId: p.id });
+            if (!allowed) return review(res, 'You cannot edit segment ' + p.id + ' (' + res.summary + ' needed).');
+        }
 
         res.status = 'fix';
-        res.changes = changes;
         return res;
     }
 
     // ---------- applying (never saves) ----------
-    async function applyOne(id) {
-        const seg = await sdk.DataModel.Segments.getById({ segmentId: id });
-        if (!seg) throw new Error('segment not loaded');
-        const res = await evaluate(seg);
-        if (res.status !== 'fix') return { id, skipped: true, note: res.status === 'ok' ? 'already matches' : res.note };
+    async function applyGroup(ids) {
+        nameCache.clear();
+        const members = await loadMembers(ids);
+        if (!members) throw new Error('segment not loaded');
+        const res = await evaluateGroup(members);
+        if (res.status !== 'fix') return { skipped: true, note: res.status === 'ok' ? 'already matches' : res.note };
 
-        await sdk.DataModel.Segments.updateSegment({ segmentId: id, ...res.changes });
+        for (const p of res.perSegment) {
+            await sdk.DataModel.Segments.updateSegment({ segmentId: p.id, ...p.changes });
+        }
 
         // Verify; if a field did not stick, retry the leftovers one at a time.
-        let again = await evaluate(await sdk.DataModel.Segments.getById({ segmentId: id }));
+        let again = await evaluateGroup(await loadMembers(ids));
         if (again.status === 'fix') {
-            for (const [field, value] of Object.entries(again.changes)) {
-                try { await sdk.DataModel.Segments.updateSegment({ segmentId: id, [field]: value }); } catch (e) { console.warn(LOG, id, field, e); }
+            for (const p of again.perSegment) {
+                for (const [field, value] of Object.entries(p.changes)) {
+                    try { await sdk.DataModel.Segments.updateSegment({ segmentId: p.id, [field]: value }); } catch (e) { console.warn(LOG, p.id, field, e); }
+                }
             }
-            again = await evaluate(await sdk.DataModel.Segments.getById({ segmentId: id }));
+            again = await evaluateGroup(await loadMembers(ids));
             if (again.status === 'fix') throw new Error('could not apply: ' + again.summary);
         }
-        return { id, done: true };
+        return { done: true, segments: res.perSegment.length };
     }
 
     async function applyChecked() {
         if (applying) return;
-        const ids = results.filter((r) => r.status === 'fix' && !excluded.has(r.id)).map((r) => r.id);
-        if (!ids.length) return;
+        const rows = results.filter((r) => r.status === 'fix' && !excluded.has(r.key));
+        if (!rows.length) return;
         if (!(await sdk.Editing.isEditingAllowed())) {
             setNote('Editing is not allowed right now.');
             return;
@@ -288,18 +365,19 @@
         applying = true;
         updateApplyButton();
         let done = 0;
+        let segs = 0;
         const problems = [];
-        for (const id of ids) {
+        for (const row of rows) {
             try {
-                const r = await applyOne(id);
-                if (r.done) done += 1; else problems.push(id + ': ' + r.note);
+                const r = await applyGroup(row.ids);
+                if (r.done) { done += 1; segs += r.segments; } else problems.push(row.key + ': ' + r.note);
             } catch (e) {
-                problems.push(id + ': ' + (e && e.message ? e.message : e));
+                problems.push(row.key + ': ' + (e && e.message ? e.message : e));
             }
         }
         applying = false;
         closePanel(); // the list goes away once the changes are applied
-        let msg = 'Applied ' + done + ' of ' + ids.length + ' turnaround segment(s). Not saved yet: save in WME.';
+        let msg = 'Applied ' + done + ' of ' + rows.length + ' turnaround(s), ' + segs + ' segment(s) changed. Not saved yet: save in WME.';
         if (problems.length) {
             msg += ' Problems: ' + problems.join('; ');
             console.warn(LOG, 'problems', problems);
@@ -422,7 +500,7 @@
         ui.minBtn.addEventListener('click', () => setMinimized(true));
         ui.allBtn.addEventListener('click', () => { excluded.clear(); persistExcluded(); render(); });
         ui.noneBtn.addEventListener('click', () => {
-            results.filter((r) => r.status === 'fix').forEach((r) => excluded.add(r.id));
+            results.filter((r) => r.status === 'fix').forEach((r) => excluded.add(r.key));
             persistExcluded();
             render();
         });
@@ -474,13 +552,13 @@
         renderTitles();
     }
 
-    function selectSegment(id) {
-        Promise.resolve(sdk.Editing.setSelection({ selection: { ids: [id], objectType: 'segment' } }))
+    function selectSegments(ids) {
+        Promise.resolve(sdk.Editing.setSelection({ selection: { ids, objectType: 'segment' } }))
             .catch((e) => console.warn(LOG, 'select failed', e));
     }
 
     function updateApplyButton() {
-        const n = results.filter((r) => r.status === 'fix' && !excluded.has(r.id)).length;
+        const n = results.filter((r) => r.status === 'fix' && !excluded.has(r.key)).length;
         ui.applyBtn.textContent = 'Apply checked (' + n + ')';
         ui.applyBtn.disabled = applying || n === 0;
     }
@@ -523,18 +601,18 @@
             const box = el('input');
             box.type = 'checkbox';
             if (r.status === 'fix') {
-                box.checked = !excluded.has(r.id);
+                box.checked = !excluded.has(r.key);
                 box.addEventListener('change', () => {
-                    if (box.checked) excluded.delete(r.id); else excluded.add(r.id);
+                    if (box.checked) excluded.delete(r.key); else excluded.add(r.key);
                     persistExcluded();
                     updateApplyButton();
                 });
             } else {
                 box.disabled = true;
             }
-            const link = el('a', null, String(r.id));
-            link.title = 'Select this segment';
-            link.addEventListener('click', () => selectSegment(r.id));
+            const link = el('a', null, r.ids.length > 1 ? r.ids[0] + ' +' + (r.ids.length - 1) : String(r.ids[0]));
+            link.title = r.ids.length > 1 ? 'Select all ' + r.ids.length + ' segments of this turnaround' : 'Select this segment';
+            link.addEventListener('click', () => selectSegments(r.ids));
             const text = el('span', 'wsta-note', r.status === 'fix' ? r.summary : 'Review: ' + r.note);
             row.append(box, link, text);
             ui.list.appendChild(row);
