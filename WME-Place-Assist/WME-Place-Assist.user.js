@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Place Assist
 // @namespace    https://github.com/TxAgBQ
-// @version      2026.11.06.02
+// @version      2026.11.06.03
 // @description  Floating bar that flags Waze places on screen with permanently closed or far-away Google links, with one-click staged delete or removal of just the bad link.
 // @author       TxAgBQ
 // @homepageURL  https://github.com/TxAgBQ/Scripts/tree/main/WME-Place-Assist
@@ -26,7 +26,7 @@
 
   const SCRIPT_ID = 'wme-place-assist';
   const SCRIPT_NAME = 'WME Place Assist';
-  const VERSION = '2026.11.06.02';
+  const VERSION = '2026.11.06.03';
   const LOOKUP_CONCURRENCY = 4;
   const FAR_METERS = 400;         // a Google link farther than this from the Waze place is a likely wrong match
   const FAR_CHECKED_METERS = 1000; // review rows whose only problem is a far link start checked beyond this
@@ -139,7 +139,8 @@
   }
 
   function fmtDistance(m) {
-    return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+    const miles = m / 1609.344;
+    return miles < 0.2 ? `${Math.round(m * 3.28084)} ft` : `${miles.toFixed(1)} mi`;
   }
 
   // WME keeps a staged-for-deletion place in its data until you save, so remember what we staged.
